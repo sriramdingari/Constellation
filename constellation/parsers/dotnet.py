@@ -194,6 +194,19 @@ class DotNetParser(BaseParser):
                 return self._get_text(child, code)
         return None
 
+    @staticmethod
+    def _qualified_type_name(
+        namespace: str,
+        type_name: str,
+        *,
+        outer_class_entity: CodeEntity | None = None,
+    ) -> str:
+        """Build a stable type name for top-level and nested declarations."""
+        if outer_class_entity is not None and "::" in outer_class_entity.id:
+            outer_full_name = outer_class_entity.id.split("::", 1)[1]
+            return f"{outer_full_name}.{type_name}"
+        return f"{namespace}.{type_name}" if namespace else type_name
+
     # =========================================================================
     # Type Routing
     # =========================================================================
@@ -238,7 +251,11 @@ class DotNetParser(BaseParser):
             return
 
         class_name = self._get_text(name_node, code)
-        full_name = f"{namespace}.{class_name}" if namespace else class_name
+        full_name = self._qualified_type_name(
+            namespace,
+            class_name,
+            outer_class_entity=outer_class_entity,
+        )
 
         modifiers = self._extract_modifiers(node, code)
         docstring = self._extract_docstring(node, code)
@@ -311,7 +328,11 @@ class DotNetParser(BaseParser):
             return
 
         iface_name = self._get_text(name_node, code)
-        full_name = f"{namespace}.{iface_name}" if namespace else iface_name
+        full_name = self._qualified_type_name(
+            namespace,
+            iface_name,
+            outer_class_entity=outer_class_entity,
+        )
 
         modifiers = self._extract_modifiers(node, code)
         docstring = self._extract_docstring(node, code)
@@ -373,6 +394,7 @@ class DotNetParser(BaseParser):
         file_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
+        outer_class_entity: CodeEntity | None = None,
     ) -> None:
         """Process an enum declaration as a CLASS entity with 'enum' stereotype."""
         name_node = node.child_by_field_name("name")
@@ -380,7 +402,11 @@ class DotNetParser(BaseParser):
             return
 
         enum_name = self._get_text(name_node, code)
-        full_name = f"{namespace}.{enum_name}" if namespace else enum_name
+        full_name = self._qualified_type_name(
+            namespace,
+            enum_name,
+            outer_class_entity=outer_class_entity,
+        )
 
         modifiers = self._extract_modifiers(node, code)
         docstring = self._extract_docstring(node, code)
@@ -413,6 +439,13 @@ class DotNetParser(BaseParser):
                 source_id=enum_entity.id,
                 target_id=f"{repository}::{namespace}",
                 relationship_type=RelationshipType.IN_PACKAGE,
+            ))
+
+        if outer_class_entity is not None:
+            result.add_relationship(CodeRelationship(
+                source_id=outer_class_entity.id,
+                target_id=enum_entity.id,
+                relationship_type=RelationshipType.DECLARES,
             ))
 
     # =========================================================================
@@ -448,7 +481,16 @@ class DotNetParser(BaseParser):
                 self._process_interface(child, code, repository, file_path, file_entity, result, namespace, outer_class_entity=class_entity)
             elif child.type == "enum_declaration":
                 # Nested enum
-                self._process_enum(child, code, repository, file_path, file_entity, result, namespace)
+                self._process_enum(
+                    child,
+                    code,
+                    repository,
+                    file_path,
+                    file_entity,
+                    result,
+                    namespace,
+                    outer_class_entity=class_entity,
+                )
 
     # =========================================================================
     # Method Processing

@@ -20,10 +20,12 @@ class TestNodeLabels:
         "Method",
         "Constructor",
         "Field",
+        "Hook",
+        "Reference",
     ]
 
-    def test_all_eight_labels_present(self):
-        assert len(NODE_LABELS) == 8
+    def test_all_ten_labels_present(self):
+        assert len(NODE_LABELS) == 10
 
     def test_contains_expected_labels(self):
         for label in self.EXPECTED_LABELS:
@@ -53,8 +55,8 @@ class TestEmbeddableLabels:
 class TestConstraints:
     """Validate uniqueness constraints."""
 
-    def test_eight_constraints(self):
-        assert len(CONSTRAINTS) == 8
+    def test_ten_constraints(self):
+        assert len(CONSTRAINTS) == 10
 
     def test_each_constraint_creates_uniqueness(self):
         for constraint in CONSTRAINTS:

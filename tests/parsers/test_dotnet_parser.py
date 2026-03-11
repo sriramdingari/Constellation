@@ -548,6 +548,32 @@ class TestDeclaresRelationships:
         )
         assert rel is not None
 
+    def test_nested_class_ids_include_outer_class(self, parser, tmp_path):
+        nested_file = tmp_path / "Nested.cs"
+        nested_file.write_text(
+            "namespace SampleApp.Services {\n"
+            "    public class OuterA {\n"
+            "        public class Inner {}\n"
+            "    }\n"
+            "    public class OuterB {\n"
+            "        public class Inner {}\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(nested_file, repository=REPOSITORY)
+
+        inner_ids = {
+            entity.id
+            for entity in _find_entities(result, EntityType.CLASS)
+            if entity.name == "Inner"
+        }
+
+        assert inner_ids == {
+            f"{REPOSITORY}::SampleApp.Services.OuterA.Inner",
+            f"{REPOSITORY}::SampleApp.Services.OuterB.Inner",
+        }
+
 
 # ===========================================================================
 # Test Stereotype Detection

@@ -15,9 +15,11 @@ class TestEntityType:
         assert EntityType.METHOD == "Method"
         assert EntityType.CONSTRUCTOR == "Constructor"
         assert EntityType.FIELD == "Field"
+        assert EntityType.HOOK == "Hook"
+        assert EntityType.REFERENCE == "Reference"
 
     def test_total_count(self):
-        assert len(EntityType) == 7
+        assert len(EntityType) == 9
 
 
 class TestRelationshipType:

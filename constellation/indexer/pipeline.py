@@ -21,7 +21,7 @@ from constellation.indexer.collector import (
     is_github_url,
     DEFAULT_EXCLUSIONS,
 )
-from constellation.models import CodeEntity, CodeRelationship, EntityType
+from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 from constellation.parsers.base import ParseResult
 from constellation.parsers.registry import ParserRegistry
 
@@ -139,49 +139,71 @@ class IndexingPipeline:
             existing_hashes = await self._graph.get_file_hashes(repo_name)
 
             # Compute hashes and decide which files need processing
-            files_to_process: list[tuple[Path, str]] = []  # (path, hash)
+            file_plans: list[tuple[Path, str, str, bool]] = []
             files_skipped = 0
             discovered_paths_str: set[str] = set()
 
             for fpath in discovered_files:
+                relative_path = self._relative_file_path(source_path, fpath)
                 file_hash = compute_file_hash(fpath)
-                fpath_str = str(fpath)
-                discovered_paths_str.add(fpath_str)
+                discovered_paths_str.add(relative_path)
+                needs_reindex = reindex or existing_hashes.get(relative_path) != file_hash
 
-                if not reindex and existing_hashes.get(fpath_str) == file_hash:
+                if not needs_reindex:
                     files_skipped += 1
-                    continue
 
-                files_to_process.append((fpath, file_hash))
+                file_plans.append((fpath, relative_path, file_hash, needs_reindex))
+
+            stale_paths = [
+                file_path
+                for file_path in existing_hashes
+                if file_path not in discovered_paths_str
+            ]
+            needs_relationship_refresh = bool(
+                stale_paths or any(plan[3] for plan in file_plans)
+            )
 
             # ----------------------------------------------------------
             # 6. Parse files and collect entities/relationships
             # ----------------------------------------------------------
-            all_entities: list[CodeEntity] = []
+            entities_to_upsert: list[CodeEntity] = []
             all_relationships: list[CodeRelationship] = []
             errors: list[str] = []
             files_processed = 0
+            files_examined = 0
+            files_requiring_reindex_prep: list[tuple[str, set[str]]] = []
 
-            for fpath, file_hash in files_to_process:
-                # Create FILE entity
-                file_entity = CodeEntity(
-                    id=f"{repo_name}::{fpath}",
-                    name=fpath.name,
-                    entity_type=EntityType.FILE,
-                    repository=repo_name,
-                    file_path=str(fpath),
-                    line_number=0,
-                    language=fpath.suffix.lstrip(".") or "unknown",
-                    content_hash=file_hash,
-                )
-                all_entities.append(file_entity)
+            for fpath, relative_path, file_hash, needs_reindex in file_plans:
+                if not needs_relationship_refresh and not needs_reindex:
+                    continue
 
-                # Get parser and parse
                 parser = self._registry.get_parser_for_file(fpath)
+                file_entity_id = f"{repo_name}::{relative_path}"
+
                 if parser is None:
-                    files_processed += 1
+                    if needs_reindex:
+                        file_entity = CodeEntity(
+                            id=file_entity_id,
+                            name=fpath.name,
+                            entity_type=EntityType.FILE,
+                            repository=repo_name,
+                            file_path=relative_path,
+                            line_number=1,
+                            language=fpath.suffix.lstrip(".") or "unknown",
+                            content_hash=file_hash,
+                        )
+                        entities_to_upsert.append(file_entity)
+                        files_requiring_reindex_prep.append(
+                            (relative_path, {file_entity_id})
+                        )
+                        files_processed += 1
+                    files_examined += 1
                     if progress_callback:
-                        progress_callback(files_total, files_processed, len(all_entities))
+                        progress_callback(
+                            files_total,
+                            files_processed,
+                            len(entities_to_upsert),
+                        )
                     continue
 
                 try:
@@ -190,9 +212,15 @@ class IndexingPipeline:
                     err_msg = f"Exception parsing {fpath}: {exc}"
                     logger.error(err_msg)
                     errors.append(err_msg)
-                    files_processed += 1
+                    if needs_reindex:
+                        files_processed += 1
+                    files_examined += 1
                     if progress_callback:
-                        progress_callback(files_total, files_processed, len(all_entities))
+                        progress_callback(
+                            files_total,
+                            files_processed,
+                            len(entities_to_upsert),
+                        )
                     continue
 
                 if parse_result.errors:
@@ -200,65 +228,76 @@ class IndexingPipeline:
                         err_msg = f"Parse error in {fpath}: {pe}"
                         logger.warning(err_msg)
                         errors.append(err_msg)
-                    # Still continue processing other files
-                    files_processed += 1
+                    if needs_reindex:
+                        files_processed += 1
+                    files_examined += 1
                     if progress_callback:
-                        progress_callback(files_total, files_processed, len(all_entities))
+                        progress_callback(
+                            files_total,
+                            files_processed,
+                            len(entities_to_upsert),
+                        )
                     continue
 
-                all_entities.extend(parse_result.entities)
-                all_relationships.extend(parse_result.relationships)
-                files_processed += 1
+                normalized_entities, normalized_relationships = self._normalize_parse_result(
+                    parse_result=parse_result,
+                    relative_path=relative_path,
+                    file_entity_id=file_entity_id,
+                    language=parser.language,
+                )
+                all_relationships.extend(normalized_relationships)
+
+                if needs_reindex:
+                    file_entity = CodeEntity(
+                        id=file_entity_id,
+                        name=fpath.name,
+                        entity_type=EntityType.FILE,
+                        repository=repo_name,
+                        file_path=relative_path,
+                        line_number=1,
+                        language=parser.language,
+                        content_hash=file_hash,
+                    )
+                    entities_to_upsert.append(file_entity)
+                    entities_to_upsert.extend(normalized_entities)
+                    files_requiring_reindex_prep.append(
+                        (
+                            relative_path,
+                            {file_entity_id}
+                            | {entity.id for entity in normalized_entities},
+                        )
+                    )
+                    files_processed += 1
+                files_examined += 1
 
                 if progress_callback:
-                    progress_callback(files_total, files_processed, len(all_entities))
+                    progress_callback(
+                        files_total,
+                        files_processed,
+                        len(entities_to_upsert),
+                    )
 
             # ----------------------------------------------------------
             # 7. Embed entities
             # ----------------------------------------------------------
             try:
-                await self._embed_entities(all_entities)
+                await self._embed_entities(entities_to_upsert)
             except Exception as exc:
                 err_msg = f"Embedding failed: {exc}"
                 logger.error(err_msg)
                 errors.append(err_msg)
 
             # ----------------------------------------------------------
-            # 8. Upsert entities to graph (batched)
+            # 8. Apply graph changes atomically
             # ----------------------------------------------------------
-            entities_created = 0
-            for i in range(0, len(all_entities), self._settings.entity_batch_size):
-                batch = all_entities[i : i + self._settings.entity_batch_size]
-                entities_created += await self._graph.upsert_entities(batch)
-
-            # ----------------------------------------------------------
-            # 9. Create relationships
-            # ----------------------------------------------------------
-            relationships_created = await self._graph.create_relationships(
-                all_relationships
-            )
-
-            # ----------------------------------------------------------
-            # 10. Delete stale files
-            # ----------------------------------------------------------
-            stale_paths = [
-                p for p in existing_hashes
-                if p not in discovered_paths_str
-            ]
-            if stale_paths:
-                await self._graph.delete_stale_files(
-                    repository=repo_name,
-                    file_paths=stale_paths,
-                )
-
-            # ----------------------------------------------------------
-            # 11. Upsert repository metadata
-            # ----------------------------------------------------------
-            await self._graph.upsert_repository(
-                name=repo_name,
+            entities_created, relationships_created, _ = await self._graph.apply_indexing_changes(
+                repository=repo_name,
                 source=source,
                 commit_sha=commit_sha,
-                entity_count=entities_created,
+                reindex_preparations=files_requiring_reindex_prep,
+                entities=entities_to_upsert,
+                relationships=all_relationships,
+                stale_file_paths=stale_paths,
             )
 
             return IndexingResult(
@@ -276,6 +315,147 @@ class IndexingPipeline:
             # ----------------------------------------------------------
             if cloned_path is not None:
                 cleanup_clone(cloned_path)
+
+    @staticmethod
+    def _relative_file_path(root: Path, file_path: Path) -> str:
+        """Return a repository-relative path for stable file identity."""
+        return str(file_path.relative_to(root))
+
+    @staticmethod
+    def _normalize_parse_result(
+        parse_result: ParseResult,
+        relative_path: str,
+        file_entity_id: str,
+        language: str,
+    ) -> tuple[list[CodeEntity], list[CodeRelationship]]:
+        """Rewrite parser output to the pipeline's canonical file identity."""
+        parser_file_ids = {
+            entity.id
+            for entity in parse_result.entities
+            if entity.entity_type == EntityType.FILE
+        }
+        id_map: dict[str, str] = {}
+        call_aliases: dict[str, str] = {}
+
+        if language in {"python", "javascript"}:
+            id_map, call_aliases = IndexingPipeline._build_scoped_entity_maps(
+                parse_result=parse_result,
+                parser_file_ids=parser_file_ids,
+                file_entity_id=file_entity_id,
+            )
+
+        normalized_entities: list[CodeEntity] = []
+        for entity in parse_result.entities:
+            if entity.entity_type == EntityType.FILE:
+                continue
+            entity.file_path = relative_path
+            entity.id = id_map.get(entity.id, entity.id)
+            normalized_entities.append(entity)
+
+        normalized_relationships: list[CodeRelationship] = []
+        for relationship in parse_result.relationships:
+            if relationship.source_id in parser_file_ids:
+                relationship.source_id = file_entity_id
+            else:
+                relationship.source_id = id_map.get(
+                    relationship.source_id,
+                    relationship.source_id,
+                )
+
+            if relationship.target_id in parser_file_ids:
+                relationship.target_id = file_entity_id
+            else:
+                relationship.target_id = id_map.get(
+                    relationship.target_id,
+                    relationship.target_id,
+                )
+                if relationship.relationship_type == RelationshipType.CALLS:
+                    relationship.target_id = call_aliases.get(
+                        relationship.target_id,
+                        relationship.target_id,
+                    )
+            normalized_relationships.append(relationship)
+
+        return normalized_entities, normalized_relationships
+
+    @staticmethod
+    def _build_scoped_entity_maps(
+        parse_result: ParseResult,
+        parser_file_ids: set[str],
+        file_entity_id: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        """Build stable per-file IDs for parser-local entities and local call aliases."""
+        local_entities = [
+            entity for entity in parse_result.entities
+            if entity.entity_type != EntityType.FILE
+        ]
+        if not local_entities:
+            return {}, {}
+
+        entity_lookup = {entity.id: entity for entity in local_entities}
+        structural_relationships = {
+            RelationshipType.CONTAINS,
+            RelationshipType.DECLARES,
+            RelationshipType.HAS_METHOD,
+            RelationshipType.HAS_CONSTRUCTOR,
+            RelationshipType.HAS_FIELD,
+        }
+        parent_ids: dict[str, str | None] = {}
+
+        for relationship in parse_result.relationships:
+            if relationship.relationship_type not in structural_relationships:
+                continue
+            if relationship.target_id not in entity_lookup:
+                continue
+            if relationship.source_id in parser_file_ids:
+                parent_ids.setdefault(relationship.target_id, None)
+            elif relationship.source_id in entity_lookup:
+                parent_ids.setdefault(relationship.target_id, relationship.source_id)
+
+        local_paths: dict[str, str] = {}
+        used_paths: set[str] = set()
+        visiting: set[str] = set()
+
+        def assign_local_path(entity_id: str) -> str:
+            if entity_id in local_paths:
+                return local_paths[entity_id]
+
+            entity = entity_lookup[entity_id]
+            if entity_id in visiting:
+                return entity.name
+
+            visiting.add(entity_id)
+            parent_id = parent_ids.get(entity_id)
+            parent_path = ""
+            if parent_id and parent_id in entity_lookup:
+                parent_path = assign_local_path(parent_id)
+
+            candidate = f"{parent_path}.{entity.name}" if parent_path else entity.name
+            unique_candidate = candidate
+            if unique_candidate in used_paths:
+                unique_candidate = f"{candidate}@L{entity.line_number}"
+                duplicate_index = 2
+                while unique_candidate in used_paths:
+                    unique_candidate = f"{candidate}@L{entity.line_number}_{duplicate_index}"
+                    duplicate_index += 1
+
+            local_paths[entity_id] = unique_candidate
+            used_paths.add(unique_candidate)
+            visiting.remove(entity_id)
+            return unique_candidate
+
+        for entity in local_entities:
+            assign_local_path(entity.id)
+
+        id_map = {
+            entity_id: f"{file_entity_id}#{local_paths[entity_id]}"
+            for entity_id in local_paths
+        }
+        call_aliases = {
+            f"{entity.repository}::{local_paths[entity.id]}": id_map[entity.id]
+            for entity in local_entities
+        }
+        return id_map, call_aliases
 
     async def _embed_entities(self, entities: list[CodeEntity]) -> None:
         """Generate embeddings for embeddable entities in batches."""

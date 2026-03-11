@@ -10,6 +10,8 @@ class EntityType(str, Enum):
     METHOD = "Method"
     CONSTRUCTOR = "Constructor"
     FIELD = "Field"
+    HOOK = "Hook"
+    REFERENCE = "Reference"
 
 
 class RelationshipType(str, Enum):

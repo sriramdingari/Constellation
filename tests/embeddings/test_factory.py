@@ -13,6 +13,29 @@ def _make_settings(**overrides):
     settings.openai_api_key = overrides.get("openai_api_key", "sk-test-key")
     settings.openai_base_url = overrides.get("openai_base_url", "")
     settings.ollama_base_url = overrides.get("ollama_base_url", "http://localhost:11434")
+    settings.ollama_embedding_model = overrides.get(
+        "ollama_embedding_model", "nomic-embed-text"
+    )
+    settings.ollama_embedding_dimensions = overrides.get(
+        "ollama_embedding_dimensions", 768
+    )
+
+    def _resolved_embedding_model(provider):
+        if provider == "ollama":
+            return settings.ollama_embedding_model
+        return settings.embedding_model
+
+    def _resolved_embedding_dimensions(provider):
+        if provider == "ollama":
+            return settings.ollama_embedding_dimensions
+        return settings.embedding_dimensions
+
+    settings.resolved_embedding_model = MagicMock(
+        side_effect=_resolved_embedding_model
+    )
+    settings.resolved_embedding_dimensions = MagicMock(
+        side_effect=_resolved_embedding_dimensions
+    )
     return settings
 
 
@@ -88,20 +111,20 @@ class TestCreateEmbeddingProviderOllama:
 
         mock_ollama_provider.assert_called_once_with(
             base_url="http://custom:11434",
-            model="text-embedding-3-small",
-            dimensions=1536,
+            model="nomic-embed-text",
+            dimensions=768,
         )
 
     def test_passes_model_from_settings(self, mock_ollama_provider):
-        settings = _make_settings(embedding_model="nomic-embed-text")
+        settings = _make_settings(ollama_embedding_model="mxbai-embed-large")
 
         create_embedding_provider("ollama", settings)
 
         _, kwargs = mock_ollama_provider.call_args
-        assert kwargs["model"] == "nomic-embed-text"
+        assert kwargs["model"] == "mxbai-embed-large"
 
     def test_passes_dimensions_from_settings(self, mock_ollama_provider):
-        settings = _make_settings(embedding_dimensions=384)
+        settings = _make_settings(ollama_embedding_dimensions=384)
 
         create_embedding_provider("ollama", settings)
 

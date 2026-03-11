@@ -4,8 +4,13 @@ from pathlib import Path
 
 import pytest
 
+import constellation.parsers.registry as registry_module
 from constellation.parsers.base import BaseParser, ParseResult
-from constellation.parsers.registry import ParserRegistry
+from constellation.parsers.dotnet import DotNetParser
+from constellation.parsers.java import JavaParser
+from constellation.parsers.javascript import JavaScriptParser
+from constellation.parsers.python_parser import PythonParser
+from constellation.parsers.registry import ParserRegistry, get_default_registry
 
 
 # --- Fake parser for testing ---
@@ -44,6 +49,16 @@ def _typescript_parser() -> FakeParser:
 
 
 # --- Tests ---
+
+
+@pytest.fixture
+def reset_default_registry():
+    original = registry_module._default_registry
+    registry_module._default_registry = None
+    try:
+        yield
+    finally:
+        registry_module._default_registry = original
 
 
 class TestParserRegistryRegisterAndLookup:
@@ -125,3 +140,30 @@ class TestParserRegistryOverride:
         registry.register(parser_b)
         found = registry.get_parser_for_file(Path("file.xx"))
         assert found is parser_b
+
+
+class TestDefaultRegistry:
+    """The lazy default registry should register the built-in parser set."""
+
+    def test_registers_all_builtin_extensions(self, reset_default_registry):
+        registry = get_default_registry()
+
+        assert {".py", ".java", ".js", ".jsx", ".ts", ".tsx", ".cs"} <= (
+            registry.supported_extensions
+        )
+
+    def test_looks_up_builtin_parsers(self, reset_default_registry):
+        registry = get_default_registry()
+
+        assert isinstance(registry.get_parser_for_file(Path("main.py")), PythonParser)
+        assert isinstance(registry.get_parser_for_file(Path("App.java")), JavaParser)
+        assert isinstance(
+            registry.get_parser_for_file(Path("component.tsx")),
+            JavaScriptParser,
+        )
+        assert isinstance(registry.get_parser_for_file(Path("Program.cs")), DotNetParser)
+
+    def test_returns_singleton_instance(self, reset_default_registry):
+        registry = get_default_registry()
+
+        assert get_default_registry() is registry

@@ -8,8 +8,8 @@ def create_embedding_provider(provider_name: str, settings: Settings) -> BaseEmb
 
         return OpenAIEmbeddingProvider(
             api_key=settings.openai_api_key,
-            model=settings.embedding_model,
-            dimensions=settings.embedding_dimensions,
+            model=settings.resolved_embedding_model("openai"),
+            dimensions=settings.resolved_embedding_dimensions("openai"),
             base_url=settings.openai_base_url or None,
         )
     elif provider_name == "ollama":
@@ -17,8 +17,8 @@ def create_embedding_provider(provider_name: str, settings: Settings) -> BaseEmb
 
         return OllamaEmbeddingProvider(
             base_url=settings.ollama_base_url,
-            model=settings.embedding_model,
-            dimensions=settings.embedding_dimensions,
+            model=settings.resolved_embedding_model("ollama"),
+            dimensions=settings.resolved_embedding_dimensions("ollama"),
         )
     else:
         raise ValueError(f"Unknown embedding provider: {provider_name}")

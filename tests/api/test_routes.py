@@ -1,6 +1,6 @@
 """Tests for API routes."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +18,9 @@ def mock_redis():
     with patch("constellation.api.routes.redis") as mock_r:
         mock_instance = MagicMock()
         mock_r.from_url.return_value = mock_instance
-        mock_instance.exists.return_value = False
+        mock_instance.set.return_value = True
+        mock_instance.get.return_value = None
+        mock_instance.delete.return_value = 1
         mock_instance.ping.return_value = True
         yield mock_instance
 
@@ -56,9 +58,36 @@ class TestIndexRepo:
         data = response.json()
         assert data["job_id"] == "task-abc-123"
         assert data["status"] == "queued"
-        mock_task.delay.assert_called_once_with(
-            "/path/to/repo", None, None, False
-        )
+        args, kwargs = mock_task.delay.call_args
+        assert args == ("/path/to/repo", None, None, False)
+        assert isinstance(kwargs["lock_token"], str)
+        assert kwargs["lock_token"]
+        mock_redis.set.assert_called_once()
+
+    def test_starts_claim_heartbeat_after_dispatch(self, client, mock_redis, mock_task):
+        with patch("constellation.api.routes.start_claim_heartbeat") as mock_heartbeat, \
+             patch("constellation.api.routes.AsyncResult") as mock_async_result:
+            async_result = MagicMock()
+            async_result.state = "PENDING"
+            mock_async_result.return_value = async_result
+            response = client.post(
+                "/repositories/index",
+                json={"source": "/path/to/repo"},
+            )
+
+            assert response.status_code == 202
+            lock_token = mock_task.delay.call_args.kwargs["lock_token"]
+            mock_heartbeat.assert_called_once_with(
+                mock_redis,
+                "constellation:lock:repo",
+                lock_token,
+                should_continue=ANY,
+                max_lifetime=3600,
+            )
+            should_continue = mock_heartbeat.call_args.kwargs["should_continue"]
+            assert should_continue() is True
+            async_result.state = "STARTED"
+            assert should_continue() is False
 
     def test_github_url_derives_name(self, client, mock_redis, mock_task):
         response = client.post(
@@ -79,13 +108,29 @@ class TestIndexRepo:
         assert data["repository"] == "custom-name"
 
     def test_409_when_lock_exists(self, client, mock_redis, mock_task):
-        mock_redis.exists.return_value = True
-        response = client.post(
-            "/repositories/index",
-            json={"source": "/path/to/repo"},
-        )
+        mock_redis.set.return_value = False
+        with patch("constellation.api.routes.start_claim_heartbeat") as mock_heartbeat:
+            response = client.post(
+                "/repositories/index",
+                json={"source": "/path/to/repo"},
+            )
         assert response.status_code == 409
         assert "already in progress" in response.json()["detail"]
+        mock_heartbeat.assert_not_called()
+
+    def test_releases_claim_when_dispatch_fails(self, client, mock_redis, mock_task):
+        mock_task.delay.side_effect = RuntimeError("queue down")
+        mock_redis.get.side_effect = lambda key: mock_redis.set.call_args[0][1]
+
+        with patch("constellation.api.routes.start_claim_heartbeat") as mock_heartbeat:
+            with pytest.raises(RuntimeError, match="queue down"):
+                client.post(
+                    "/repositories/index",
+                    json={"source": "/path/to/repo"},
+                )
+
+        mock_redis.delete.assert_called_once()
+        mock_heartbeat.assert_not_called()
 
 
 class TestListRepositories:

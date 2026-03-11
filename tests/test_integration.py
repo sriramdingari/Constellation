@@ -101,6 +101,10 @@ class TestFullIndexingPipeline:
         self, graph_client, embedding_provider, parser_registry,
         integration_settings, sample_repo,
     ):
+        assert {".py", ".java", ".js", ".jsx", ".ts", ".tsx", ".cs"} <= (
+            parser_registry.supported_extensions
+        )
+
         async def run():
             try:
                 await graph_client.connect()
@@ -117,7 +121,8 @@ class TestFullIndexingPipeline:
                     name=REPO_NAME,
                 )
 
-                assert result.files_processed > 0
+                assert result.files_total == 2
+                assert result.files_processed == 2
                 assert result.entities_created > 0
                 assert result.errors == []
 
@@ -187,7 +192,284 @@ class TestFullIndexingPipeline:
                 # Reindex — modified file should be reprocessed
                 result = await pipeline.run(source=str(sample_repo), name=REPO_NAME)
                 assert result.files_processed >= 1
+
+                deleted_method_rows = await graph_client.query(
+                    """
+                    MATCH (m:Method {id: $id})
+                    RETURN count(m) AS count
+                    """,
+                    id=f"{REPO_NAME}::service.UserService.delete_user",
+                )
+                assert deleted_method_rows[0]["count"] == 0
             finally:
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_declaration_stable_reindex_reports_zero_new_entities(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-stable-{tmp_path.name}"
+        stable_repo = tmp_path / "stable"
+        stable_repo.mkdir()
+        service_file = stable_repo / "service.py"
+        service_file.write_text(
+            "class UserService:\n"
+            "    def get_user(self):\n"
+            "        return {'version': 1}\n"
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(stable_repo), name=repo_name)
+
+                service_file.write_text(
+                    "class UserService:\n"
+                    "    def get_user(self):\n"
+                    "        return {'version': 2}\n"
+                )
+
+                result = await pipeline.run(source=str(stable_repo), name=repo_name)
+                assert result.entities_created == 0
+            finally:
+                await graph_client.delete_repository(repo_name)
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_reintroduced_file_restores_cross_file_relationships(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-restored-{tmp_path.name}"
+        restored_repo = tmp_path / "restored"
+        restored_repo.mkdir()
+        base_file = restored_repo / "BaseEntity.java"
+        service_file = restored_repo / "OrderService.java"
+        base_file.write_text(
+            "package com.example.shared;\n"
+            "public class BaseEntity {}\n"
+        )
+        service_file.write_text(
+            "package com.example.shared;\n"
+            "public class OrderService extends BaseEntity {}\n"
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(restored_repo), name=repo_name)
+
+                base_file.unlink()
+                await pipeline.run(source=str(restored_repo), name=repo_name)
+
+                removed_rows = await graph_client.query(
+                    """
+                    MATCH (:Class {id: $source})-[r:EXTENDS]->(:Class {id: $target})
+                    RETURN count(r) AS count
+                    """,
+                    source=f"{repo_name}::com.example.shared.OrderService",
+                    target=f"{repo_name}::com.example.shared.BaseEntity",
+                )
+                assert removed_rows[0]["count"] == 0
+
+                base_file.write_text(
+                    "package com.example.shared;\n"
+                    "public class BaseEntity {}\n"
+                )
+                await pipeline.run(source=str(restored_repo), name=repo_name)
+
+                restored_rows = await graph_client.query(
+                    """
+                    MATCH (:Class {id: $source})-[r:EXTENDS]->(:Class {id: $target})
+                    RETURN count(r) AS count
+                    """,
+                    source=f"{repo_name}::com.example.shared.OrderService",
+                    target=f"{repo_name}::com.example.shared.BaseEntity",
+                )
+                assert restored_rows[0]["count"] == 1
+            finally:
+                await graph_client.delete_repository(repo_name)
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_java_calls_persist_with_method_and_reference_targets(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-java-calls-{tmp_path.name}"
+        java_repo = tmp_path / "java-calls"
+        java_repo.mkdir()
+        (java_repo / "OrderService.java").write_text(
+            "package com.example;\n"
+            "public class OrderService {\n"
+            "    public void processOrder(String id) {\n"
+            "        save();\n"
+            "        audit.log();\n"
+            "    }\n"
+            "    public void save() {}\n"
+            "}\n"
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(java_repo), name=repo_name)
+
+                method_rows = await graph_client.query(
+                    """
+                    MATCH (:Method {id: $caller})-[:CALLS]->(target:Method)
+                    RETURN count(target) AS count, collect(target.name) AS names
+                    """,
+                    caller=f"{repo_name}::com.example.OrderService.processOrder(String)",
+                )
+                reference_rows = await graph_client.query(
+                    """
+                    MATCH (:Method {id: $caller})-[:CALLS]->(target:Reference)
+                    RETURN count(target) AS count, collect(target.name) AS names
+                    """,
+                    caller=f"{repo_name}::com.example.OrderService.processOrder(String)",
+                )
+
+                assert method_rows[0]["count"] == 1
+                assert "save" in method_rows[0]["names"]
+                assert reference_rows[0]["count"] == 1
+                assert "audit.log" in reference_rows[0]["names"]
+            finally:
+                await graph_client.delete_repository(repo_name)
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_reindex_clears_removed_optional_properties(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-props-{tmp_path.name}"
+        props_repo = tmp_path / "props"
+        props_repo.mkdir()
+        service_file = props_repo / "service.py"
+        service_file.write_text(
+            'class UserService:\n'
+            '    """Initial docstring."""\n'
+            '    pass\n'
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(props_repo), name=repo_name)
+                initial_rows = await graph_client.query(
+                    """
+                    MATCH (c:Class {id: $id})
+                    RETURN c.docstring AS docstring
+                    """,
+                    id=f"{repo_name}::service.py#UserService",
+                )
+                assert initial_rows[0]["docstring"] == "Initial docstring."
+
+                service_file.write_text(
+                    "class UserService:\n"
+                    "    pass\n"
+                )
+
+                await pipeline.run(source=str(props_repo), name=repo_name)
+                updated_rows = await graph_client.query(
+                    """
+                    MATCH (c:Class {id: $id})
+                    RETURN c.docstring AS docstring
+                    """,
+                    id=f"{repo_name}::service.py#UserService",
+                )
+                assert updated_rows[0]["docstring"] is None
+            finally:
+                await graph_client.delete_repository(repo_name)
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_parse_errors_do_not_mark_file_as_clean(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-parse-{tmp_path.name}"
+        parse_repo = tmp_path / "parse-errors"
+        parse_repo.mkdir()
+        broken_file = parse_repo / "service.py"
+        broken_file.write_text(
+            "class UserService:\n"
+            "    def get_user(self):\n"
+            "        return 1\n"
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(parse_repo), name=repo_name)
+
+                broken_file.write_text(
+                    "class UserService:\n"
+                    "    def get_user(self):\n"
+                    "        return\n"
+                    "    def broken(\n"
+                )
+
+                result1 = await pipeline.run(source=str(parse_repo), name=repo_name)
+                assert result1.errors
+
+                result2 = await pipeline.run(source=str(parse_repo), name=repo_name)
+                assert result2.files_processed == 1
+                assert result2.files_skipped == 0
+            finally:
+                await graph_client.delete_repository(repo_name)
                 await graph_client.close()
 
         asyncio.run(run())
@@ -218,7 +500,127 @@ class TestFullIndexingPipeline:
                 # Reindex — stale file should be removed
                 result2 = await pipeline.run(source=str(sample_repo), name=REPO_NAME)
                 assert result2.files_total < initial_total
+
+                package_rows = await graph_client.query(
+                    """
+                    MATCH (p:Package {repository: $repository, name: $name})
+                    RETURN count(p) AS count
+                    """,
+                    repository=REPO_NAME,
+                    name="com.example",
+                )
+                assert package_rows[0]["count"] == 0
             finally:
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_deleted_file_keeps_shared_live_nodes(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-shared-{tmp_path.name}"
+        shared_repo = tmp_path / "shared"
+        shared_repo.mkdir()
+        (shared_repo / "BaseEntity.java").write_text(
+            "package com.example.shared;\n"
+            "public class BaseEntity {}\n"
+        )
+        (shared_repo / "OrderService.java").write_text(
+            "package com.example.shared;\n"
+            "public class OrderService extends BaseEntity {}\n"
+        )
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(shared_repo), name=repo_name)
+                (shared_repo / "OrderService.java").unlink()
+                await pipeline.run(source=str(shared_repo), name=repo_name)
+
+                base_rows = await graph_client.query(
+                    """
+                    MATCH (c:Class {id: $id})
+                    RETURN count(c) AS count
+                    """,
+                    id=f"{repo_name}::com.example.shared.BaseEntity",
+                )
+                package_rows = await graph_client.query(
+                    """
+                    MATCH (p:Package {id: $id})
+                    RETURN count(p) AS count
+                    """,
+                    id=f"{repo_name}::com.example.shared",
+                )
+
+                assert base_rows[0]["count"] == 1
+                assert package_rows[0]["count"] == 1
+            finally:
+                await graph_client.delete_repository(repo_name)
+                await graph_client.close()
+
+        asyncio.run(run())
+
+    def test_deleted_unrelated_file_keeps_nested_csharp_namespaces(
+        self, graph_client, embedding_provider, parser_registry,
+        integration_settings, tmp_path,
+    ):
+        repo_name = f"{REPO_NAME}-nested-ns-{tmp_path.name}"
+        nested_repo = tmp_path / "nested-ns"
+        nested_repo.mkdir()
+        (nested_repo / "Nested.cs").write_text(
+            "namespace SampleApp {\n"
+            "    namespace Services {\n"
+            "        public class UserService {}\n"
+            "    }\n"
+            "}\n"
+        )
+        (nested_repo / "helper.py").write_text("x = 1\n")
+
+        async def run():
+            try:
+                await graph_client.connect()
+                await graph_client.initialize_schema()
+
+                pipeline = IndexingPipeline(
+                    graph_client=graph_client,
+                    embedding_provider=embedding_provider,
+                    parser_registry=parser_registry,
+                    settings=integration_settings,
+                )
+
+                await pipeline.run(source=str(nested_repo), name=repo_name)
+                (nested_repo / "helper.py").unlink()
+                await pipeline.run(source=str(nested_repo), name=repo_name)
+
+                outer_rows = await graph_client.query(
+                    """
+                    MATCH (p:Package {id: $id})
+                    RETURN count(p) AS count
+                    """,
+                    id=f"{repo_name}::SampleApp",
+                )
+                inner_rows = await graph_client.query(
+                    """
+                    MATCH (p:Package {id: $id})
+                    RETURN count(p) AS count
+                    """,
+                    id=f"{repo_name}::SampleApp.Services",
+                )
+
+                assert outer_rows[0]["count"] == 1
+                assert inner_rows[0]["count"] == 1
+            finally:
+                await graph_client.delete_repository(repo_name)
                 await graph_client.close()
 
         asyncio.run(run())

@@ -568,6 +568,56 @@ class TestEntityIdFormat:
         assert "UserService" in entity.id
         assert "__init__" in entity.id
 
+    def test_nested_class_ids_include_outer_class(self, parser, tmp_path):
+        nested_file = tmp_path / "nested.py"
+        nested_file.write_text(
+            "class OuterA:\n"
+            "    class Inner:\n"
+            "        pass\n"
+            "\n"
+            "class OuterB:\n"
+            "    class Inner:\n"
+            "        pass\n"
+        )
+
+        result = parser.parse_file(nested_file, repository=REPOSITORY)
+
+        inner_ids = {
+            entity.id
+            for entity in result.entities
+            if entity.entity_type == EntityType.CLASS and entity.name == "Inner"
+        }
+
+        assert inner_ids == {
+            f"{REPOSITORY}::nested.OuterA.Inner",
+            f"{REPOSITORY}::nested.OuterB.Inner",
+        }
+
+    def test_nested_classes_use_declares_relationship(self, parser, tmp_path):
+        nested_file = tmp_path / "nested.py"
+        nested_file.write_text(
+            "class Outer:\n"
+            "    class Inner:\n"
+            "        pass\n"
+        )
+
+        result = parser.parse_file(nested_file, repository=REPOSITORY)
+
+        outer = next(
+            entity for entity in result.entities
+            if entity.entity_type == EntityType.CLASS and entity.id == f"{REPOSITORY}::nested.Outer"
+        )
+        inner = next(
+            entity for entity in result.entities
+            if entity.entity_type == EntityType.CLASS and entity.id == f"{REPOSITORY}::nested.Outer.Inner"
+        )
+        declares = _find_relationships(result, RelationshipType.DECLARES)
+
+        assert any(
+            relationship.source_id == outer.id and relationship.target_id == inner.id
+            for relationship in declares
+        )
+
 
 # ===========================================================================
 # Empty File

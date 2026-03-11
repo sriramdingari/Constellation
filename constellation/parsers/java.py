@@ -168,7 +168,10 @@ class JavaParser(BaseParser):
             return
 
         class_name = self._text(name_node, ctx.code)
-        full_name = f"{ctx.package_name}.{class_name}" if ctx.package_name else class_name
+        if outer_class_id and ctx.current_class_full_name:
+            full_name = f"{ctx.current_class_full_name}.{class_name}"
+        else:
+            full_name = f"{ctx.package_name}.{class_name}" if ctx.package_name else class_name
         entity_id = f"{ctx.repository}::{full_name}"
 
         modifiers = self._extract_modifiers(node, ctx.code)
@@ -251,10 +254,21 @@ class JavaParser(BaseParser):
         # Process body
         body_node = node.child_by_field_name("body")
         if body_node:
-            class_ctx = ctx.with_class(class_name, full_name, annotations)
+            exact_call_targets, call_targets_by_name = self._collect_class_call_targets(
+                body_node,
+                ctx,
+                full_name,
+            )
+            class_ctx = ctx.with_class(
+                class_name,
+                full_name,
+                annotations,
+                exact_call_targets=exact_call_targets,
+                call_targets_by_name=call_targets_by_name,
+            )
             self._process_class_body(body_node, class_ctx, entity_id, result, is_interface=is_interface)
             # Nested classes
-            self._process_nested_types(body_node, ctx, entity_id, result)
+            self._process_nested_types(body_node, class_ctx, entity_id, result)
 
     # ------------------------------------------------------------------
     # Interface extends
@@ -329,7 +343,10 @@ class JavaParser(BaseParser):
             return
 
         enum_name = self._text(name_node, ctx.code)
-        full_name = f"{ctx.package_name}.{enum_name}" if ctx.package_name else enum_name
+        if outer_class_id and ctx.current_class_full_name:
+            full_name = f"{ctx.current_class_full_name}.{enum_name}"
+        else:
+            full_name = f"{ctx.package_name}.{enum_name}" if ctx.package_name else enum_name
         entity_id = f"{ctx.repository}::{full_name}"
 
         modifiers = self._extract_modifiers(node, ctx.code)
@@ -376,7 +393,18 @@ class JavaParser(BaseParser):
         # Process enum body
         body_node = node.child_by_field_name("body")
         if body_node:
-            enum_ctx = ctx.with_class(enum_name, full_name, [])
+            exact_call_targets, call_targets_by_name = self._collect_class_call_targets(
+                body_node,
+                ctx,
+                full_name,
+            )
+            enum_ctx = ctx.with_class(
+                enum_name,
+                full_name,
+                [],
+                exact_call_targets=exact_call_targets,
+                call_targets_by_name=call_targets_by_name,
+            )
             for child in body_node.children:
                 if child.type == "enum_body_declarations":
                     for decl in child.children:
@@ -615,19 +643,107 @@ class JavaParser(BaseParser):
             called_method = self._text(call_name_node, ctx.code)
 
             call_object_node = call_node.child_by_field_name("object")
+            is_current_class_call = False
             if call_object_node:
                 object_text = self._text(call_object_node, ctx.code)
-                called_full = f"{object_text}.{called_method}"
+                is_current_class_call = object_text in {
+                    "this",
+                    ctx.current_class,
+                    ctx.current_class_full_name,
+                }
+                if is_current_class_call:
+                    called_full = f"{ctx.current_class_full_name}.{called_method}"
+                else:
+                    called_full = f"{object_text}.{called_method}"
             else:
                 called_full = f"{ctx.current_class_full_name}.{called_method}"
+                is_current_class_call = True
 
             if called_full not in processed:
                 processed.add(called_full)
+                target_id = None
+                if is_current_class_call:
+                    target_id = self._resolve_current_class_call(
+                        called_method,
+                        call_node,
+                        ctx,
+                    )
+                if target_id is None:
+                    target_id = f"{source_method_id}::ref:{called_full}"
+                    result.add_entity(CodeEntity(
+                        id=target_id,
+                        name=called_full,
+                        entity_type=EntityType.REFERENCE,
+                        repository=ctx.repository,
+                        file_path=ctx.file_path,
+                        line_number=call_node.start_point[0] + 1,
+                        language=self.language,
+                        properties={"symbol": called_full},
+                    ))
                 result.add_relationship(CodeRelationship(
                     source_id=source_method_id,
-                    target_id=f"ref:{called_full}",
+                    target_id=target_id,
                     relationship_type=RelationshipType.CALLS,
                 ))
+
+    def _collect_class_call_targets(
+        self,
+        body_node: Node,
+        ctx: _ParsingContext,
+        class_full_name: str,
+    ) -> tuple[dict[tuple[str, int], list[str]], dict[str, list[str]]]:
+        """Collect current-class method targets so local calls can resolve to Methods."""
+        exact_targets: dict[tuple[str, int], list[str]] = {}
+        name_targets: dict[str, list[str]] = {}
+
+        method_nodes: list[Node] = []
+        for child in body_node.children:
+            if child.type == "method_declaration":
+                method_nodes.append(child)
+            elif child.type == "enum_body_declarations":
+                for decl in child.children:
+                    if decl.type == "method_declaration":
+                        method_nodes.append(decl)
+
+        for method_node in method_nodes:
+            name_node = method_node.child_by_field_name("name")
+            if not name_node:
+                continue
+            method_name = self._text(name_node, ctx.code)
+            parameters = self._extract_parameters(method_node, ctx.code)
+            param_type_str = ",".join(p["type"] for p in parameters)
+            full_name = f"{class_full_name}.{method_name}({param_type_str})"
+            target_id = f"{ctx.repository}::{full_name}"
+            exact_targets.setdefault((method_name, len(parameters)), []).append(target_id)
+            name_targets.setdefault(method_name, []).append(target_id)
+
+        return exact_targets, name_targets
+
+    def _resolve_current_class_call(
+        self,
+        called_method: str,
+        call_node: Node,
+        ctx: _ParsingContext,
+    ) -> str | None:
+        """Resolve a call to a current-class method when the target is unambiguous."""
+        exact_matches = ctx.exact_call_targets.get(
+            (called_method, self._argument_count(call_node)),
+            [],
+        )
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        name_matches = ctx.call_targets_by_name.get(called_method, [])
+        if len(name_matches) == 1:
+            return name_matches[0]
+
+        return None
+
+    def _argument_count(self, call_node: Node) -> int:
+        arguments_node = call_node.child_by_field_name("arguments")
+        if not arguments_node:
+            return 0
+        return sum(1 for child in arguments_node.children if child.is_named)
 
     # ------------------------------------------------------------------
     # Helpers: Modifiers, Annotations, Parameters, Docstrings
@@ -775,6 +891,8 @@ class _ParsingContext:
         current_class: str = "",
         current_class_full_name: str = "",
         class_annotations: list[dict[str, str | None]] | None = None,
+        exact_call_targets: dict[tuple[str, int], list[str]] | None = None,
+        call_targets_by_name: dict[str, list[str]] | None = None,
     ) -> None:
         self.file_path = file_path
         self.file_id = file_id
@@ -784,12 +902,16 @@ class _ParsingContext:
         self.current_class = current_class
         self.current_class_full_name = current_class_full_name
         self.class_annotations = class_annotations or []
+        self.exact_call_targets = exact_call_targets or {}
+        self.call_targets_by_name = call_targets_by_name or {}
 
     def with_class(
         self,
         class_name: str,
         class_full_name: str,
         class_annotations: list[dict[str, str | None]] | None = None,
+        exact_call_targets: dict[tuple[str, int], list[str]] | None = None,
+        call_targets_by_name: dict[str, list[str]] | None = None,
     ) -> _ParsingContext:
         return _ParsingContext(
             file_path=self.file_path,
@@ -800,4 +922,6 @@ class _ParsingContext:
             current_class=class_name,
             current_class_full_name=class_full_name,
             class_annotations=class_annotations or [],
+            exact_call_targets=exact_call_targets,
+            call_targets_by_name=call_targets_by_name,
         )

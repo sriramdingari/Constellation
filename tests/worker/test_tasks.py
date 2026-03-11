@@ -301,6 +301,70 @@ class TestRedisLockConcurrency:
         mock_run_indexing.assert_not_called()
 
 
+class TestPreclaimedApiLock:
+    @patch("constellation.worker.tasks._run_indexing", new_callable=AsyncMock)
+    @patch("constellation.worker.tasks.redis")
+    def test_reuses_dispatch_claim_when_lock_token_matches(
+        self,
+        mock_redis_mod,
+        mock_run_indexing,
+    ):
+        """Worker should resume the API's pre-dispatch claim instead of racing it."""
+        mock_redis_client = MagicMock()
+        mock_redis_client.get.return_value = "dispatch-token"
+        mock_redis_client.expire = MagicMock()
+        mock_redis_client.delete = MagicMock()
+        mock_redis_mod.from_url.return_value = mock_redis_client
+
+        result = _make_indexing_result(repository="my-repo")
+        mock_run_indexing.return_value = result
+
+        mock_self = _make_mock_self()
+        returned = _call_task(
+            mock_self,
+            source="/path/to/repo",
+            name="my-repo",
+            lock_token="dispatch-token",
+        )
+
+        assert returned["repository"] == "my-repo"
+        mock_redis_client.expire.assert_called_once_with(
+            "constellation:lock:my-repo",
+            3600,
+        )
+        mock_redis_client.delete.assert_called_once_with(
+            "constellation:lock:my-repo"
+        )
+
+    @patch("constellation.worker.tasks._run_indexing", new_callable=AsyncMock)
+    @patch("constellation.worker.tasks.redis")
+    def test_raises_when_dispatch_claim_is_owned_by_another_task(
+        self,
+        mock_redis_mod,
+        mock_run_indexing,
+    ):
+        """A mismatched pre-dispatch token should fail before indexing starts."""
+        mock_redis_client = MagicMock()
+        mock_redis_client.get.return_value = "other-token"
+        mock_redis_mod.from_url.return_value = mock_redis_client
+
+        mock_self = _make_mock_self()
+
+        with pytest.raises(
+            RuntimeError,
+            match="[Ii]ndexing already in progress",
+        ):
+            _call_task(
+                mock_self,
+                source="/path/to/repo",
+                name="my-repo",
+                lock_token="dispatch-token",
+            )
+
+        mock_run_indexing.assert_not_called()
+        mock_redis_client.delete.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Test: Redis lock released after success
 # ---------------------------------------------------------------------------
@@ -504,6 +568,35 @@ class TestRetryOnException:
         call_kwargs = mock_self.retry.call_args[1]
         # countdown = 2^1 * 10 = 20
         assert call_kwargs["countdown"] == 20
+
+    @patch("constellation.worker.tasks._run_indexing", new_callable=AsyncMock)
+    @patch("constellation.worker.tasks.redis")
+    def test_retry_keeps_dispatch_claim_for_follow_up_attempts(
+        self,
+        mock_redis_mod,
+        mock_run_indexing,
+    ):
+        """A scheduled retry should not release the API's repo claim."""
+        mock_redis_client = MagicMock()
+        mock_redis_client.get.return_value = "dispatch-token"
+        mock_redis_client.delete = MagicMock()
+        mock_redis_mod.from_url.return_value = mock_redis_client
+
+        original_error = ValueError("retry me")
+        mock_run_indexing.side_effect = original_error
+
+        mock_self = _make_mock_self(retries=0)
+        mock_self.retry = MagicMock(side_effect=Exception("celery-retry"))
+
+        with pytest.raises(Exception, match="celery-retry"):
+            _call_task(
+                mock_self,
+                source="/path/to/repo",
+                name="my-repo",
+                lock_token="dispatch-token",
+            )
+
+        mock_redis_client.delete.assert_not_called()
 
     @patch("constellation.worker.tasks._run_indexing", new_callable=AsyncMock)
     @patch("constellation.worker.tasks.redis")
