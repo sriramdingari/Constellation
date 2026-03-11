@@ -63,6 +63,7 @@ class _ParsingContext:
     # Export tracking (populated in first pass)
     exported_names: set[str] = field(default_factory=set)
     default_export: str | None = None
+    emitted_hooks: set[str] = field(default_factory=set)
 
     def entity_id(self, *parts: str) -> str:
         """Build an entity ID in the format ``{repository}::{qualified.name}``."""
@@ -569,9 +570,22 @@ class JavaScriptParser(BaseParser):
             if call_name in REACT_HOOKS or call_name.startswith("use"):
                 if call_name not in seen:
                     seen.add(call_name)
+                    hook_id = f"hook:{call_name}"
+                    if hook_id not in ctx.emitted_hooks:
+                        ctx.emitted_hooks.add(hook_id)
+                        result.add_entity(CodeEntity(
+                            id=hook_id,
+                            name=call_name,
+                            entity_type=EntityType.HOOK,
+                            repository=ctx.repository,
+                            file_path=ctx.file_path,
+                            line_number=call_node.start_point[0] + 1,
+                            line_end=call_node.end_point[0] + 1,
+                            language=self.language,
+                        ))
                     result.add_relationship(CodeRelationship(
                         source_id=source_id,
-                        target_id=f"hook:{call_name}",
+                        target_id=hook_id,
                         relationship_type=RelationshipType.USES_HOOK,
                     ))
 

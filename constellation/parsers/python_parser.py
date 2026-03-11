@@ -198,7 +198,13 @@ class PythonParser(BaseParser):
                 dec_text = self._get_text(child, ctx.code).lstrip("@").strip()
                 decorators.append(dec_text)
             elif child.type == "class_definition":
-                self._process_class(child, ctx, result, decorators=decorators)
+                self._process_class(
+                    child,
+                    ctx,
+                    result,
+                    decorators=decorators,
+                    outer_class_ctx=class_ctx,
+                )
             elif child.type == "function_definition":
                 if class_ctx is not None:
                     self._process_method(child, ctx, class_ctx, result, decorators=decorators)
@@ -215,6 +221,7 @@ class PythonParser(BaseParser):
         ctx: _ParsingContext,
         result: ParseResult,
         decorators: list[str],
+        outer_class_ctx: _ClassContext | None = None,
     ) -> None:
         """Process a class definition node."""
         name_node = node.child_by_field_name("name")
@@ -222,7 +229,10 @@ class PythonParser(BaseParser):
             return
 
         class_name = self._get_text(name_node, ctx.code)
-        full_name = f"{ctx.module_name}.{class_name}" if ctx.module_name else class_name
+        if outer_class_ctx is not None:
+            full_name = f"{outer_class_ctx.class_full_name}.{class_name}"
+        else:
+            full_name = f"{ctx.module_name}.{class_name}" if ctx.module_name else class_name
         entity_id = f"{ctx.repository}::{full_name}"
 
         # Extract base classes
@@ -257,12 +267,19 @@ class PythonParser(BaseParser):
         )
         result.add_entity(class_entity)
 
-        # File CONTAINS Class
-        result.add_relationship(CodeRelationship(
-            source_id=ctx.file_entity_id,
-            target_id=entity_id,
-            relationship_type=RelationshipType.CONTAINS,
-        ))
+        if outer_class_ctx is not None:
+            result.add_relationship(CodeRelationship(
+                source_id=outer_class_ctx.class_entity_id,
+                target_id=entity_id,
+                relationship_type=RelationshipType.DECLARES,
+            ))
+        else:
+            # File CONTAINS top-level classes.
+            result.add_relationship(CodeRelationship(
+                source_id=ctx.file_entity_id,
+                target_id=entity_id,
+                relationship_type=RelationshipType.CONTAINS,
+            ))
 
         # Process class body
         if body_node:
@@ -290,7 +307,13 @@ class PythonParser(BaseParser):
                 self._process_decorated_definition(child, ctx, result, class_ctx=class_ctx)
             elif child.type == "class_definition":
                 # Nested/inner class
-                self._process_class(child, ctx, result, decorators=[])
+                self._process_class(
+                    child,
+                    ctx,
+                    result,
+                    decorators=[],
+                    outer_class_ctx=class_ctx,
+                )
 
     # ------------------------------------------------------------------
     # Method processing

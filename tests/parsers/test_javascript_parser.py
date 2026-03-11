@@ -314,6 +314,12 @@ class TestUsesHookRelationships:
         matching = [s for s in source_ids if "UserCard" in s]
         assert len(matching) > 0
 
+    def test_hook_entities_exist(self, tsx_result):
+        hook_entities = _entities_by_type(tsx_result, EntityType.HOOK)
+        names = [entity.name for entity in hook_entities]
+        assert "useState" in names
+        assert "useContext" in names
+
 
 # ===========================================================================
 # Edge cases: test stereotype detection

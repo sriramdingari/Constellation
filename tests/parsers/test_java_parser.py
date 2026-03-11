@@ -384,6 +384,31 @@ class TestDeclaresRelationship:
         pairs = [(r.source_id, r.target_id) for r in declares]
         assert (container.id, inner.id) in pairs
 
+    def test_nested_class_ids_include_outer_class(self, parser, tmp_path):
+        nested_file = tmp_path / "Nested.java"
+        nested_file.write_text(
+            "package com.example.nested;\n"
+            "class OuterA {\n"
+            "    class Inner {}\n"
+            "}\n"
+            "class OuterB {\n"
+            "    class Inner {}\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(nested_file, repository=REPO)
+
+        inner_ids = {
+            entity.id
+            for entity in _entities(result, EntityType.CLASS)
+            if entity.name == "Inner"
+        }
+
+        assert inner_ids == {
+            f"{REPO}::com.example.nested.OuterA.Inner",
+            f"{REPO}::com.example.nested.OuterB.Inner",
+        }
+
 
 # ===========================================================================
 # CONTAINS Relationship (File -> Class)
@@ -444,6 +469,46 @@ class TestCallsRelationships:
         assert process_method is not None
         call_targets = [r.target_id for r in calls if r.source_id == process_method.id]
         assert len(call_targets) >= 2  # save() and audit()
+
+    def test_same_class_calls_resolve_to_method_targets(self, edge_result):
+        calls = _rels(edge_result, RelationshipType.CALLS)
+        process_targets = {
+            relationship.target_id
+            for relationship in calls
+            if relationship.source_id == f"{REPO}::com.example.edge.OrderService.processOrder(String)"
+        }
+
+        assert f"{REPO}::com.example.edge.OrderService.save()" in process_targets
+        assert f"{REPO}::com.example.edge.OrderService.audit()" in process_targets
+
+    def test_external_calls_materialize_reference_targets(self, parser, tmp_path):
+        sample = tmp_path / "ExternalCalls.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class LoggerService {\n"
+            "    public void process() {\n"
+            "        local();\n"
+            "        logger.info();\n"
+            "    }\n"
+            "    public void local() {}\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        process_id = f"{REPO}::com.example.LoggerService.process()"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == process_id
+        }
+
+        assert f"{REPO}::com.example.LoggerService.local()" in call_targets
+        reference_targets = [
+            entity for entity in _entities(result, EntityType.REFERENCE)
+            if entity.id in call_targets
+        ]
+        assert len(reference_targets) == 1
+        assert reference_targets[0].name == "logger.info"
 
 
 # ===========================================================================

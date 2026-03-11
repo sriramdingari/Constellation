@@ -10,4 +10,5 @@ markers = [
     "integration: requires running Neo4j and Redis",
 ]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-m 'not integration'"

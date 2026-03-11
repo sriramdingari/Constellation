@@ -14,8 +14,10 @@ def upsert_entities_query(label: str) -> str:
     return f"""
     UNWIND $entities AS entity
     MERGE (n:{label} {{id: entity.id}})
-    SET n += entity.properties
-    RETURN count(n) AS count
+    ON CREATE SET n.__created__ = true
+    WITH n, entity, coalesce(n.__created__, false) AS created
+    SET n = entity.properties
+    RETURN sum(CASE WHEN created THEN 1 ELSE 0 END) AS count
     """
 
 
@@ -30,8 +32,10 @@ def create_relationships_query(rel_type: str) -> str:
     MATCH (source {{id: rel.source_id}})
     MATCH (target {{id: rel.target_id}})
     MERGE (source)-[r:{rel_type}]->(target)
-    SET r += rel.properties
-    RETURN count(r) AS count
+    ON CREATE SET r.__created__ = true
+    WITH r, rel, coalesce(r.__created__, false) AS created
+    SET r = rel.properties
+    RETURN sum(CASE WHEN created THEN 1 ELSE 0 END) AS count
     """
 
 
@@ -57,8 +61,10 @@ ORDER BY r.name
 
 DELETE_REPOSITORY = """
 MATCH (r:Repository {name: $name})
-OPTIONAL MATCH (r)-[*]->(n)
-DETACH DELETE n, r
+OPTIONAL MATCH (n {repository: $name})
+WITH r, collect(n) AS nodes
+FOREACH (node IN nodes | DETACH DELETE node)
+DETACH DELETE r
 """
 
 GET_FILE_HASHES = """
@@ -66,12 +72,69 @@ MATCH (f:File {repository: $repository})
 RETURN f.file_path AS file_path, f.content_hash AS content_hash
 """
 
+GET_FILE_ENTITY_SNAPSHOT = """
+MATCH (n {repository: $repository, file_path: $file_path})
+RETURN n.id AS id, labels(n) AS labels
+"""
+
+COUNT_REPOSITORY_ENTITIES = """
+MATCH (n {repository: $repository})
+RETURN count(n) AS count
+"""
+
+DELETE_FILE_OUTBOUND_RELATIONSHIPS = """
+MATCH (n {repository: $repository, file_path: $file_path})
+WHERE NOT n:Package
+OPTIONAL MATCH (n)-[r]->()
+WITH collect(r) AS relationships
+FOREACH (relationship IN relationships | DELETE relationship)
+"""
+
+DELETE_ENTITIES_BY_IDS = """
+UNWIND $entity_ids AS entity_id
+MATCH (n {repository: $repository, id: entity_id})
+WHERE NOT n:Package
+DETACH DELETE n
+"""
+
 DELETE_STALE_FILES = """
 UNWIND $file_paths AS path
-MATCH (f:File {repository: $repository, file_path: path})
-OPTIONAL MATCH (f)-[*]->(n)
-DETACH DELETE n, f
+MATCH (n {repository: $repository, file_path: path})
+WHERE NOT n:Package
+DETACH DELETE n
 """
+
+DELETE_ORPHAN_PACKAGES = """
+MATCH (p:Package {repository: $repository})
+WHERE NOT ()-->(p)
+AND NOT EXISTS {
+    MATCH (child:Package {repository: $repository})
+    WHERE child.id STARTS WITH p.id + '.'
+}
+WITH collect(p) AS packages
+FOREACH (package IN packages | DETACH DELETE package)
+RETURN size(packages) AS count
+"""
+
+DELETE_ORPHAN_REFERENCES = """
+MATCH (r:Reference {repository: $repository})
+WHERE NOT ()-->(r)
+WITH collect(r) AS references
+FOREACH (reference IN references | DETACH DELETE reference)
+RETURN size(references) AS count
+"""
+
+GET_VECTOR_INDEX = """
+SHOW INDEXES YIELD name, type, options
+WHERE type = 'VECTOR' AND name = $index_name
+RETURN options
+"""
+
+
+def drop_index_query(index_name: str) -> str:
+    """Generate a Cypher query to drop an index by name if it exists."""
+    return f"DROP INDEX {index_name} IF EXISTS"
+
 
 CREATE_VECTOR_INDEX = """
 CREATE VECTOR INDEX {index_name} IF NOT EXISTS

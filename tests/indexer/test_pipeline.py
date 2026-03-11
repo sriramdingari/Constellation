@@ -119,6 +119,22 @@ def _create_py_file(directory: Path, name: str = "main.py", content: str = "x = 
     return f
 
 
+def _collect_upserted_entities(mock_graph_client) -> list[CodeEntity]:
+    entities: list[CodeEntity] = []
+    for call in mock_graph_client.upsert_entities.call_args_list:
+        entities.extend(call[0][0] if call[0] else call[1].get("entities", []))
+    return entities
+
+
+def _collect_created_relationships(mock_graph_client) -> list[CodeRelationship]:
+    relationships: list[CodeRelationship] = []
+    for call in mock_graph_client.create_relationships.call_args_list:
+        relationships.extend(
+            call[0][0] if call[0] else call[1].get("relationships", [])
+        )
+    return relationships
+
+
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
@@ -190,7 +206,7 @@ class TestChangeDetection:
         from constellation.indexer.collector import compute_file_hash
         existing_hash = compute_file_hash(f)
         mock_graph_client.get_file_hashes = AsyncMock(
-            return_value={str(f): existing_hash}
+            return_value={"unchanged.py": existing_hash}
         )
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
@@ -209,7 +225,7 @@ class TestChangeDetection:
         _create_py_file(tmp_path, "changed.py", "new content")
 
         mock_graph_client.get_file_hashes = AsyncMock(
-            return_value={str(tmp_path / "changed.py"): "old_hash_doesnt_match"}
+            return_value={"changed.py": "old_hash_doesnt_match"}
         )
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
@@ -218,6 +234,122 @@ class TestChangeDetection:
         assert result.files_processed == 1
         assert result.files_skipped == 0
         mock_parser.parse_file.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_changed_files_refresh_relationships_from_unchanged_files(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """A changed file should trigger relationship rebuilds from unchanged files."""
+        caller_file = tmp_path / "Caller.java"
+        caller_file.write_text("class Caller extends Target {}")
+        target_file = tmp_path / "Target.java"
+        target_file.write_text("class Target {}")
+
+        from constellation.indexer.collector import compute_file_hash
+
+        original_target_hash = compute_file_hash(target_file)
+        target_file.write_text("class Target { int version = 2; }")
+
+        mock_parser.language = "java"
+        mock_parser.file_extensions = [".java"]
+        mock_registry.supported_extensions = {".java"}
+        mock_graph_client.get_file_hashes = AsyncMock(
+            return_value={
+                "Caller.java": compute_file_hash(caller_file),
+                "Target.java": original_target_hash,
+            }
+        )
+
+        def _parse_java(file_path: Path, repository: str) -> ParseResult:
+            file_id = f"{repository}::{file_path}"
+            if file_path.name == "Caller.java":
+                caller_id = f"{repository}::example.Caller"
+                return ParseResult(
+                    file_path=str(file_path),
+                    language="java",
+                    entities=[
+                        CodeEntity(
+                            id=file_id,
+                            name=file_path.name,
+                            entity_type=EntityType.FILE,
+                            repository=repository,
+                            file_path=str(file_path),
+                            line_number=1,
+                            language="java",
+                        ),
+                        CodeEntity(
+                            id=caller_id,
+                            name="Caller",
+                            entity_type=EntityType.CLASS,
+                            repository=repository,
+                            file_path=str(file_path),
+                            line_number=1,
+                            language="java",
+                        ),
+                    ],
+                    relationships=[
+                        CodeRelationship(
+                            source_id=file_id,
+                            target_id=caller_id,
+                            relationship_type=RelationshipType.CONTAINS,
+                        ),
+                        CodeRelationship(
+                            source_id=caller_id,
+                            target_id=f"{repository}::example.Target",
+                            relationship_type=RelationshipType.EXTENDS,
+                        ),
+                    ],
+                )
+
+            target_id = f"{repository}::example.Target"
+            return ParseResult(
+                file_path=str(file_path),
+                language="java",
+                entities=[
+                    CodeEntity(
+                        id=file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="java",
+                    ),
+                    CodeEntity(
+                        id=target_id,
+                        name="Target",
+                        entity_type=EntityType.CLASS,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="java",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=file_id,
+                        target_id=target_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    )
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_java)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            result = await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        assert result.files_processed == 1
+        assert result.files_skipped == 1
+        assert mock_parser.parse_file.call_count == 2
+
+        relationships = _collect_created_relationships(mock_graph_client)
+        assert any(
+            relationship.source_id == "test-repo::example.Caller"
+            and relationship.target_id == "test-repo::example.Target"
+            and relationship.relationship_type == RelationshipType.EXTENDS
+            for relationship in relationships
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +368,7 @@ class TestReindexMode:
         from constellation.indexer.collector import compute_file_hash
         existing_hash = compute_file_hash(f)
         mock_graph_client.get_file_hashes = AsyncMock(
-            return_value={str(f): existing_hash}
+            return_value={"existing.py": existing_hash}
         )
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
@@ -269,6 +401,31 @@ class TestGithubSource:
         mock_clone.assert_called_once_with("https://github.com/user/repo")
         mock_cleanup.assert_called_once_with(tmp_path)
         assert result.repository is not None
+
+    @pytest.mark.asyncio
+    async def test_github_url_change_detection_uses_relative_paths(
+        self, pipeline, mock_graph_client, mock_parser, tmp_path
+    ):
+        """Remote reindexing should compare hashes using repo-relative paths."""
+        source_dir = tmp_path / "src"
+        source_dir.mkdir()
+        f = _create_py_file(source_dir, "cloned.py")
+
+        from constellation.indexer.collector import compute_file_hash
+
+        mock_graph_client.get_file_hashes = AsyncMock(
+            return_value={"src/cloned.py": compute_file_hash(f)}
+        )
+
+        with patch("constellation.indexer.pipeline.clone_repository", return_value=tmp_path), \
+             patch("constellation.indexer.pipeline.cleanup_clone"), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="sha123"), \
+             patch("constellation.indexer.pipeline.is_github_url", return_value=True):
+            result = await pipeline.run(source="https://github.com/user/repo")
+
+        assert result.files_skipped == 1
+        assert result.files_processed == 0
+        mock_parser.parse_file.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_github_url_derives_repo_name(
@@ -314,6 +471,8 @@ class TestParseErrorHandling:
 
         assert len(result.errors) >= 1
         assert any("bad.py" in e or "Syntax error" in e for e in result.errors)
+        pipeline._graph.upsert_entities.assert_not_awaited()
+        pipeline._graph.prepare_file_reindex.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_parse_exception(
@@ -407,8 +566,8 @@ class TestStaleFileDeletion:
         # Neo4j has an extra file that no longer exists
         mock_graph_client.get_file_hashes = AsyncMock(
             return_value={
-                str(tmp_path / "current.py"): "some_hash",
-                str(tmp_path / "deleted.py"): "old_hash",
+                "current.py": "some_hash",
+                "deleted.py": "old_hash",
             }
         )
 
@@ -419,7 +578,7 @@ class TestStaleFileDeletion:
         call_args = mock_graph_client.delete_stale_files.call_args
         # Extract file_paths from keyword args
         stale_paths = call_args[1].get("file_paths", [])
-        assert str(tmp_path / "deleted.py") in stale_paths
+        assert "deleted.py" in stale_paths
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +660,21 @@ class TestRepositoryNodeUpdate:
         assert "my-repo" in (call_kwargs[0] if call_kwargs[0] else ()) or \
                call_kwargs[1].get("name") == "my-repo"
 
+    @pytest.mark.asyncio
+    async def test_repository_entity_count_comes_from_graph(
+        self, pipeline, mock_graph_client, tmp_path
+    ):
+        """Repository metadata should use the graph count after indexing."""
+        _create_py_file(tmp_path, "a.py")
+        mock_graph_client.count_repository_entities = AsyncMock(return_value=42)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="sha456"):
+            await pipeline.run(source=str(tmp_path), name="my-repo")
+
+        mock_graph_client.count_repository_entities.assert_awaited_once_with("my-repo")
+        _, kwargs = mock_graph_client.upsert_repository.call_args
+        assert kwargs["entity_count"] == 42
+
 
 # ---------------------------------------------------------------------------
 # Commit SHA
@@ -557,6 +731,36 @@ class TestProgressCallback:
             # At least one call should have the total
             assert len(pos_args) >= 1 or len(args) >= 1
 
+    @pytest.mark.asyncio
+    async def test_progress_reports_processed_files_not_examined(
+        self, pipeline, mock_graph_client, tmp_path
+    ):
+        """Relationship refresh should not inflate files_processed progress."""
+        unchanged = _create_py_file(tmp_path, "unchanged.py", "x = 1")
+        _create_py_file(tmp_path, "changed.py", "x = 2")
+
+        from constellation.indexer.collector import compute_file_hash
+
+        mock_graph_client.get_file_hashes = AsyncMock(
+            return_value={
+                "unchanged.py": compute_file_hash(unchanged),
+                "changed.py": "outdated-hash",
+            }
+        )
+        callback = MagicMock()
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            result = await pipeline.run(
+                source=str(tmp_path),
+                progress_callback=callback,
+            )
+
+        assert result.files_processed == 1
+        assert result.files_skipped == 1
+        last_args = callback.call_args_list[-1].args
+        assert last_args[0] == 2
+        assert last_args[1] == 1
+
 
 # ---------------------------------------------------------------------------
 # Empty directory
@@ -586,7 +790,9 @@ class TestFileEntityCreation:
         self, pipeline, mock_graph_client, tmp_path
     ):
         """Each processed file gets a FILE entity with content_hash."""
-        _create_py_file(tmp_path, "module.py", "x = 1")
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        _create_py_file(src_dir, "module.py", "x = 1")
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
             result = await pipeline.run(source=str(tmp_path), name="test-repo")
@@ -598,10 +804,328 @@ class TestFileEntityCreation:
             all_entities.extend(c[0][0] if c[0] else c[1].get("entities", []))
 
         file_entities = [e for e in all_entities if e.entity_type == EntityType.FILE]
-        assert len(file_entities) >= 1
+        assert len(file_entities) == 1
         for fe in file_entities:
             assert fe.content_hash is not None
             assert len(fe.content_hash) == 32  # MD5 hex digest
+            assert fe.id == "test-repo::src/module.py"
+            assert fe.file_path == "src/module.py"
+
+        non_file_entities = [e for e in all_entities if e.entity_type != EntityType.FILE]
+        assert non_file_entities
+        assert all(e.file_path == "src/module.py" for e in non_file_entities)
+
+
+class TestScopedEntityNormalization:
+    @pytest.mark.asyncio
+    async def test_python_same_stem_files_get_distinct_entity_ids(
+        self, pipeline, mock_graph_client, mock_parser, tmp_path
+    ):
+        """Python entities should be scoped to the repo-relative file path."""
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        _create_py_file(tmp_path / "a", "utils.py", "class Foo: pass")
+        _create_py_file(tmp_path / "b", "utils.py", "class Foo: pass")
+
+        def _parse_python(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::{file_path}"
+            class_id = f"{repository}::utils.Foo"
+            func_id = f"{repository}::utils.build"
+            return ParseResult(
+                file_path=str(file_path),
+                language="python",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="python",
+                    ),
+                    CodeEntity(
+                        id=class_id,
+                        name="Foo",
+                        entity_type=EntityType.CLASS,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="python",
+                    ),
+                    CodeEntity(
+                        id=func_id,
+                        name="build",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=3,
+                        language="python",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=class_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=func_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=func_id,
+                        target_id=f"{repository}::Foo",
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_python)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        class_ids = {
+            entity.id
+            for entity in all_entities
+            if entity.entity_type == EntityType.CLASS
+        }
+        assert class_ids == {
+            "test-repo::a/utils.py#Foo",
+            "test-repo::b/utils.py#Foo",
+        }
+
+        call_edges = {
+            (relationship.source_id, relationship.target_id)
+            for relationship in _collect_created_relationships(mock_graph_client)
+            if relationship.relationship_type == RelationshipType.CALLS
+        }
+        assert call_edges == {
+            ("test-repo::a/utils.py#build", "test-repo::a/utils.py#Foo"),
+            ("test-repo::b/utils.py#build", "test-repo::b/utils.py#Foo"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_javascript_same_stem_files_get_distinct_entity_ids(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """JavaScript/TypeScript entities should also be scoped to the file path."""
+        mock_parser.language = "javascript"
+        mock_parser.file_extensions = [".ts"]
+        mock_registry.supported_extensions = {".ts"}
+
+        (tmp_path / "x").mkdir()
+        (tmp_path / "y").mkdir()
+        js_x = tmp_path / "x" / "utils.ts"
+        js_y = tmp_path / "y" / "utils.ts"
+        js_x.write_text("export class Widget {}")
+        js_y.write_text("export class Widget {}")
+
+        def _parse_javascript(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::utils"
+            class_id = f"{repository}::utils.Widget"
+            method_id = f"{repository}::utils.Widget.run"
+            return ParseResult(
+                file_path=str(file_path),
+                language="javascript",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=class_id,
+                        name="Widget",
+                        entity_type=EntityType.CLASS,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=method_id,
+                        name="run",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=2,
+                        language="javascript",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=class_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=class_id,
+                        target_id=method_id,
+                        relationship_type=RelationshipType.HAS_METHOD,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_javascript)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        scoped_ids = {
+            entity.id
+            for entity in all_entities
+            if entity.entity_type in {EntityType.CLASS, EntityType.METHOD}
+        }
+        assert scoped_ids == {
+            "test-repo::x/utils.ts#Widget",
+            "test-repo::x/utils.ts#Widget.run",
+            "test-repo::y/utils.ts#Widget",
+            "test-repo::y/utils.ts#Widget.run",
+        }
+
+    @pytest.mark.asyncio
+    async def test_javascript_hooks_are_materialized_as_entities(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """USES_HOOK targets should also be upserted as graph entities."""
+        mock_parser.language = "javascript"
+        mock_parser.file_extensions = [".tsx"]
+        mock_registry.supported_extensions = {".tsx"}
+
+        source_file = tmp_path / "component.tsx"
+        source_file.write_text("export const App = () => null;")
+
+        def _parse_javascript(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::component"
+            component_id = f"{repository}::component.App"
+            hook_id = "hook:useState"
+            return ParseResult(
+                file_path=str(file_path),
+                language="javascript",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=component_id,
+                        name="App",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=hook_id,
+                        name="useState",
+                        entity_type=EntityType.HOOK,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=2,
+                        language="javascript",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=component_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=component_id,
+                        target_id=hook_id,
+                        relationship_type=RelationshipType.USES_HOOK,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_javascript)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        hook_ids = {
+            entity.id
+            for entity in all_entities
+            if entity.entity_type == EntityType.HOOK
+        }
+        assert hook_ids == {"test-repo::component.tsx#useState"}
+
+    @pytest.mark.asyncio
+    async def test_changed_file_prepares_reindex_and_preserves_current_ids(
+        self, pipeline, mock_graph_client, mock_parser, tmp_path
+    ):
+        """Changed files should reconcile stale nodes before upserting new ones."""
+        changed_file = _create_py_file(tmp_path, "changed.py", "class UserService: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(
+            return_value={"changed.py": "old_hash_doesnt_match"}
+        )
+
+        def _parse_python(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::{file_path}"
+            class_id = f"{repository}::changed.UserService"
+            return ParseResult(
+                file_path=str(file_path),
+                language="python",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="python",
+                    ),
+                    CodeEntity(
+                        id=class_id,
+                        name="UserService",
+                        entity_type=EntityType.CLASS,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="python",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=class_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    )
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_python)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        mock_graph_client.prepare_file_reindex.assert_awaited_once()
+        _, kwargs = mock_graph_client.prepare_file_reindex.await_args
+        assert kwargs["repository"] == "test-repo"
+        assert kwargs["file_path"] == "changed.py"
+        assert kwargs["current_entity_ids"] == {
+            "test-repo::changed.py",
+            "test-repo::changed.py#UserService",
+        }
 
 
 # ---------------------------------------------------------------------------

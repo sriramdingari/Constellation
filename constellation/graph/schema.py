@@ -9,6 +9,8 @@ NODE_LABELS = [
     "Method",
     "Constructor",
     "Field",
+    "Hook",
+    "Reference",
 ]
 
 EMBEDDABLE_LABELS = ["Method", "Class", "Interface", "Constructor"]
@@ -22,6 +24,8 @@ CONSTRAINTS = [
     "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Method) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Constructor) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Field) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Hook) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Reference) REQUIRE n.id IS UNIQUE",
 ]
 
 COMPOSITE_INDEXES = [

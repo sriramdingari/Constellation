@@ -46,30 +46,19 @@ _default_registry: ParserRegistry | None = None
 
 
 def _register_default_parsers(registry: ParserRegistry) -> None:
-    """Register the four built-in language parsers (deferred imports)."""
-    try:
-        from constellation.parsers.java_parser import JavaParser
-        registry.register(JavaParser())
-    except ImportError:
-        pass
+    """Register the built-in language parsers shipped in this repository."""
+    from constellation.parsers.dotnet import DotNetParser
+    from constellation.parsers.java import JavaParser
+    from constellation.parsers.javascript import JavaScriptParser
+    from constellation.parsers.python_parser import PythonParser
 
-    try:
-        from constellation.parsers.kotlin_parser import KotlinParser
-        registry.register(KotlinParser())
-    except ImportError:
-        pass
-
-    try:
-        from constellation.parsers.typescript_parser import TypeScriptParser
-        registry.register(TypeScriptParser())
-    except ImportError:
-        pass
-
-    try:
-        from constellation.parsers.python_parser import PythonParser
-        registry.register(PythonParser())
-    except ImportError:
-        pass
+    for parser_cls in (
+        PythonParser,
+        JavaParser,
+        JavaScriptParser,
+        DotNetParser,
+    ):
+        registry.register(parser_cls())
 
 
 def get_default_registry() -> ParserRegistry:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import redis
+from uuid import uuid4
 from celery.result import AsyncResult
 from fastapi import APIRouter, HTTPException
 
@@ -17,6 +18,12 @@ from constellation.api.schemas import (
 from constellation.config import get_settings
 from constellation.graph.client import GraphClient
 from constellation.indexer.collector import derive_repo_name
+from constellation.locking import (
+    INDEX_LOCK_TTL_SECONDS,
+    acquire_dispatch_claim,
+    release_claim,
+    start_claim_heartbeat,
+)
 from constellation.worker.celery_app import celery_app
 from constellation.worker.tasks import index_repository
 
@@ -50,14 +57,34 @@ async def index_repo(request: IndexRequest):
     settings = get_settings()
     r = redis.from_url(settings.redis_url)
     lock_key = f"constellation:lock:{repo_name}"
-    if r.exists(lock_key):
+    lock_token = uuid4().hex
+    if not acquire_dispatch_claim(r, lock_key, lock_token):
         raise HTTPException(
             status_code=409,
             detail=f"Indexing already in progress for {repo_name}",
         )
 
-    task = index_repository.delay(
-        request.source, request.name, request.exclude_patterns, request.reindex
+    try:
+        task = index_repository.delay(
+            request.source,
+            request.name,
+            request.exclude_patterns,
+            request.reindex,
+            lock_token=lock_token,
+        )
+    except Exception:
+        release_claim(r, lock_key, lock_token)
+        raise
+
+    def _task_is_still_queued() -> bool:
+        return AsyncResult(task.id, app=celery_app).state in {"PENDING", "RETRY"}
+
+    start_claim_heartbeat(
+        r,
+        lock_key,
+        lock_token,
+        should_continue=_task_is_still_queued,
+        max_lifetime=INDEX_LOCK_TTL_SECONDS,
     )
     return IndexResponse(job_id=task.id, repository=repo_name)
 

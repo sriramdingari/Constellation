@@ -68,9 +68,13 @@ OPENAI_API_KEY=sk-your-key-here
 OPENAI_API_KEY=sk-your-litellm-key
 OPENAI_BASE_URL=http://localhost:4000
 
-# For Ollama (no API key needed)
+# For Ollama (no API key needed; defaults to nomic-embed-text / 768 dims)
 EMBEDDING_PROVIDER=ollama
 OLLAMA_BASE_URL=http://host.docker.internal:11434
+
+# Optional Ollama overrides
+# OLLAMA_EMBEDDING_MODEL=mxbai-embed-large
+# OLLAMA_EMBEDDING_DIMENSIONS=1024
 ```
 
 > **Docker networking note:** When running in Docker, use service names for Neo4j and Redis:
@@ -298,11 +302,13 @@ All settings are configured through environment variables or a `.env` file.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMBEDDING_PROVIDER` | `openai` | Provider to use: `openai` or `ollama` |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model name |
-| `EMBEDDING_DIMENSIONS` | `1536` | Vector dimensions |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Model name for OpenAI-compatible providers |
+| `EMBEDDING_DIMENSIONS` | `1536` | Vector dimensions for OpenAI-compatible providers |
 | `OPENAI_API_KEY` | — | Required for OpenAI provider |
 | `OPENAI_BASE_URL` | — | Custom base URL for OpenAI-compatible APIs (e.g., LiteLLM) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `OLLAMA_EMBEDDING_MODEL` | `nomic-embed-text` | Model name for Ollama |
+| `OLLAMA_EMBEDDING_DIMENSIONS` | `768` | Vector dimensions for Ollama |
 
 ### Performance Tuning
 
@@ -370,8 +376,9 @@ WHERE r.name = "my-project"
 RETURN c.name, f.path;
 
 -- Find all callers of a method
-MATCH (caller:Method)-[:CALLS]->(target:Method {name: "processPayment"})
-RETURN caller.name, caller.qualified_name;
+MATCH (caller:Method)-[:CALLS]->(target)
+WHERE target.name = "processPayment"
+RETURN caller.name, target.name;
 ```
 
 ## Graph Schema
@@ -390,6 +397,7 @@ graph TD
     Class -->|IMPLEMENTS| Interface
     Interface -->|EXTENDS| Interface2[Interface]
     Method2 -->|CALLS| Method3[Method]
+    Method2 -->|CALLS| Ref[Reference]
     Method2 -->|USES_TYPE| Class3[Class]
     File -->|EXPORTS| Class4["Class / Method"]
 
@@ -416,20 +424,24 @@ graph TD
 | `Constructor` | Constructor method |
 | `Field` | Class field or property |
 | `Package` | Package or namespace |
+| `Hook` | Materialized framework hook usage such as a React hook |
+| `Reference` | Materialized unresolved symbol reference used for persisted call edges |
 
 ### Relationship Types
 
 | Relationship | From | To |
 |-------------|------|-----|
-| `CONTAINS` | Repository/File/Class | File/Class/Method/Field |
+| `CONTAINS` | File/Class | Package/Class/Method/Field |
+| `DECLARES` | Class | Class/Interface |
 | `HAS_METHOD` | Class | Method |
 | `HAS_CONSTRUCTOR` | Class | Constructor |
 | `HAS_FIELD` | Class | Field |
 | `EXTENDS` | Class/Interface | Class/Interface |
 | `IMPLEMENTS` | Class | Interface |
-| `CALLS` | Method | Method |
+| `CALLS` | Method | Method/Reference |
 | `USES_TYPE` | Method | Class |
-| `IN_PACKAGE` | File | Package |
+| `USES_HOOK` | Method | Hook |
+| `IN_PACKAGE` | File/Class/Interface | Package |
 | `EXPORTS` | File | Class/Method |
 
 ## Language Support
