@@ -1,0 +1,13 @@
+[project]
+name = "constellation"
+version = "0.1.0"
+description = "Code indexing engine — parses, embeds, and graphs source code in Neo4j"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires running Neo4j and Redis",
+]
+asyncio_mode = "auto"
+addopts = "-m 'not integration'"
