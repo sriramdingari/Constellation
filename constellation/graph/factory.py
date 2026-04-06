@@ -13,7 +13,10 @@ def create_write_backend(settings: Settings) -> WriteBackend:
     """
     if settings.storage_backend == "postgres":
         from constellation.graph.postgres import PostgresWriteBackend
-        return PostgresWriteBackend(dsn=settings.postgres_dsn)
+        return PostgresWriteBackend(
+            dsn=settings.postgres_dsn,
+            embedding_dimensions=settings.resolved_embedding_dimensions(),
+        )
     elif settings.storage_backend == "neo4j":
         from constellation.graph.neo4j import Neo4jWriteBackend
         return Neo4jWriteBackend(settings)

@@ -61,12 +61,6 @@ CREATE TABLE IF NOT EXISTS code_references (
     UNIQUE (source_symbol_id, target_symbol_id, ref_type)
 );
 
-CREATE TABLE IF NOT EXISTS code_embeddings (
-    symbol_id    TEXT PRIMARY KEY REFERENCES code_symbols(id) ON DELETE CASCADE,
-    embedding    vector(1536),
-    content_hash TEXT
-);
-
 CREATE INDEX IF NOT EXISTS idx_symbols_repo   ON code_symbols(repository);
 CREATE INDEX IF NOT EXISTS idx_symbols_type   ON code_symbols(repository, symbol_type);
 CREATE INDEX IF NOT EXISTS idx_symbols_name   ON code_symbols(symbol_name);
@@ -92,8 +86,9 @@ _EMBEDDABLE_TYPES = {
 class PostgresWriteBackend(WriteBackend):
     """PostgreSQL + pgvector implementation of WriteBackend."""
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, embedding_dimensions: int = 1536) -> None:
         self._dsn = dsn
+        self._embedding_dimensions = embedding_dimensions
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
@@ -120,6 +115,14 @@ class PostgresWriteBackend(WriteBackend):
             # multi-statement strings natively. Do NOT split on ";" as it
             # breaks atomicity.
             await conn.execute(_DDL)
+            # Embeddings table uses configurable dimensions
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS code_embeddings (
+                    symbol_id    TEXT PRIMARY KEY REFERENCES code_symbols(id) ON DELETE CASCADE,
+                    embedding    vector({self._embedding_dimensions}),
+                    content_hash TEXT
+                )
+            """)
             await conn.execute(_HNSW_INDEX)
 
     # ── Repository ───────────────────────────────────────────────────────
@@ -139,19 +142,33 @@ class PostgresWriteBackend(WriteBackend):
                 last_indexed_at = now()
         """, name, source, commit_sha, entity_count)
 
+    @staticmethod
+    def _normalize_repo_row(row: dict) -> dict:
+        """Normalize Postgres row to match the API's RepositoryInfo schema."""
+        result = dict(row)
+        # Rename commit_sha → last_commit_sha (API expectation)
+        if "commit_sha" in result:
+            result["last_commit_sha"] = result.pop("commit_sha")
+        # Convert datetime to ISO string (Pydantic expects str)
+        if "last_indexed_at" in result and result["last_indexed_at"] is not None:
+            result["last_indexed_at"] = result["last_indexed_at"].isoformat()
+        if "created_at" in result and result["created_at"] is not None:
+            result["created_at"] = result["created_at"].isoformat()
+        return result
+
     async def get_repository(self, name: str) -> dict | None:
         pool = self._require_pool()
         row = await pool.fetchrow(
             "SELECT * FROM code_repos WHERE name = $1", name
         )
-        return dict(row) if row else None
+        return self._normalize_repo_row(dict(row)) if row else None
 
     async def list_repositories(self) -> list[dict]:
         pool = self._require_pool()
         rows = await pool.fetch(
             "SELECT * FROM code_repos ORDER BY name"
         )
-        return [dict(r) for r in rows]
+        return [self._normalize_repo_row(dict(r)) for r in rows]
 
     async def delete_repository(self, name: str) -> None:
         pool = self._require_pool()
@@ -193,14 +210,14 @@ class PostgresWriteBackend(WriteBackend):
                 # 1. Delete stale files (CASCADE removes symbols, refs, embeddings)
                 if stale_file_paths:
                     await conn.execute(
-                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2)",
+                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2) AND symbol_type != 'Package'",
                         repository, stale_file_paths,
                     )
                 # 2. Delete reindex targets
                 reindex_paths = [path for path, _ in reindex_preparations]
                 if reindex_paths:
                     await conn.execute(
-                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2)",
+                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2) AND symbol_type != 'Package'",
                         repository, reindex_paths,
                     )
 
@@ -213,13 +230,19 @@ class PostgresWriteBackend(WriteBackend):
                 # 5. Upsert embeddings for embeddable entities
                 await self._upsert_embeddings(conn, entities)
 
-                # 6. Cleanup orphan packages
+                # 6. Cleanup orphan packages — preserve parents with child packages
                 await conn.execute("""
                     DELETE FROM code_symbols
                     WHERE repository = $1 AND symbol_type = 'Package'
                     AND id NOT IN (
                         SELECT DISTINCT target_symbol_id FROM code_references
                         WHERE ref_type = 'IN_PACKAGE' AND target_symbol_id IS NOT NULL
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM code_symbols child
+                        WHERE child.repository = $1
+                        AND child.symbol_type = 'Package'
+                        AND child.id LIKE code_symbols.id || '.%'
                     )
                 """, repository)
 

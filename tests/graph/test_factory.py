@@ -34,4 +34,7 @@ def test_factory_returns_postgres_when_configured():
     with patch.dict("sys.modules", {"constellation.graph.postgres": MagicMock(PostgresWriteBackend=mock_postgres_cls)}):
         settings = Settings(storage_backend="postgres", postgres_dsn="postgresql://test@localhost/db")
         backend = create_write_backend(settings)
-        mock_postgres_cls.assert_called_once_with(dsn="postgresql://test@localhost/db")
+        mock_postgres_cls.assert_called_once_with(
+            dsn="postgresql://test@localhost/db",
+            embedding_dimensions=settings.resolved_embedding_dimensions(),
+        )
