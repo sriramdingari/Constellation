@@ -13,6 +13,7 @@ from typing import Callable
 
 from constellation.config import Settings
 from constellation.embeddings.base import BaseEmbeddingProvider, is_embeddable, prepare_embedding_text
+from constellation.graph.base import WriteBackend
 from constellation.indexer.cloner import clone_repository, cleanup_clone, get_commit_sha
 from constellation.indexer.collector import (
     collect_files,
@@ -47,7 +48,7 @@ class IndexingPipeline:
     Parameters
     ----------
     graph_client:
-        Async Neo4j graph client for storing entities/relationships.
+        Write backend for storing entities/relationships.
     embedding_provider:
         Provider for generating vector embeddings.
     parser_registry:
@@ -58,7 +59,7 @@ class IndexingPipeline:
 
     def __init__(
         self,
-        graph_client,
+        graph_client: "WriteBackend",
         embedding_provider: BaseEmbeddingProvider,
         parser_registry: ParserRegistry,
         settings: Settings,

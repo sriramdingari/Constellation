@@ -43,7 +43,7 @@ def mock_graph_client():
     mock_client.list_repositories = AsyncMock(return_value=[])
     mock_client.delete_repository = AsyncMock()
     with patch(
-        "constellation.api.routes.GraphClient", return_value=mock_client
+        "constellation.api.routes.create_write_backend", return_value=mock_client
     ):
         yield mock_client
 

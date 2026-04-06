@@ -12,7 +12,7 @@ import pytest
 
 from constellation.config import Settings
 from constellation.embeddings.base import BaseEmbeddingProvider
-from constellation.graph.client import GraphClient
+from constellation.graph.factory import create_write_backend
 from constellation.indexer.pipeline import IndexingPipeline
 from constellation.parsers.registry import get_default_registry
 
@@ -49,7 +49,7 @@ def integration_settings():
 
 @pytest.fixture
 def graph_client(integration_settings):
-    return GraphClient(integration_settings)
+    return create_write_backend(integration_settings)
 
 
 @pytest.fixture
