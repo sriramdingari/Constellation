@@ -60,6 +60,25 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: constellation
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: constellation
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U constellation"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
 volumes:
   neo4j_data:
   repos:
+  postgres_data:
