@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic_settings import BaseSettings
 
 DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -21,6 +23,8 @@ class Settings(BaseSettings):
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS
     embedding_batch_size: int = 8
     entity_batch_size: int = 100
+    storage_backend: Literal["neo4j", "postgres"] = "neo4j"
+    postgres_dsn: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

@@ -1,6 +1,8 @@
 import os
 from unittest.mock import patch
 
+import pytest
+
 from constellation.config import Settings, get_settings
 
 
@@ -98,6 +100,26 @@ class TestSettings:
         assert s.ollama_embedding_dimensions == 1024
         assert s.resolved_embedding_model() == "mxbai-embed-large"
         assert s.resolved_embedding_dimensions() == 1024
+
+
+class TestStorageBackend:
+    def test_settings_default_storage_backend(self):
+        s = _settings_without_env_file()
+        assert s.storage_backend == "neo4j"
+        assert s.postgres_dsn == ""
+
+    def test_settings_postgres_backend(self):
+        s = _settings_without_env_file(
+            storage_backend="postgres",
+            postgres_dsn="postgresql://user:pass@localhost/db",
+        )
+        assert s.storage_backend == "postgres"
+        assert s.postgres_dsn == "postgresql://user:pass@localhost/db"
+
+    def test_settings_invalid_backend_raises(self):
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError):
+            _settings_without_env_file(storage_backend="sqlite")
 
 
 class TestGetSettings:
