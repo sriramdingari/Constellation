@@ -121,6 +121,26 @@ class TestStorageBackend:
         with pytest.raises(ValidationError):
             _settings_without_env_file(storage_backend="sqlite")
 
+    def test_settings_postgres_backend_requires_non_empty_dsn(self):
+        """storage_backend=postgres with empty postgres_dsn must raise."""
+        from pydantic import ValidationError
+        with pytest.raises(ValidationError, match="postgres_dsn"):
+            _settings_without_env_file(storage_backend="postgres", postgres_dsn="")
+
+    def test_settings_postgres_backend_accepts_non_empty_dsn(self):
+        """storage_backend=postgres with a real DSN must construct cleanly."""
+        s = _settings_without_env_file(
+            storage_backend="postgres",
+            postgres_dsn="postgresql://user:pass@localhost:5432/db",
+        )
+        assert s.storage_backend == "postgres"
+        assert s.postgres_dsn == "postgresql://user:pass@localhost:5432/db"
+
+    def test_settings_neo4j_backend_does_not_require_dsn(self):
+        """storage_backend=neo4j must not require postgres_dsn."""
+        s = _settings_without_env_file(storage_backend="neo4j", postgres_dsn="")
+        assert s.storage_backend == "neo4j"
+
 
 class TestGetSettings:
     def test_returns_settings_instance(self):

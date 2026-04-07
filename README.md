@@ -137,6 +137,34 @@ source .venv/bin/activate
 celery -A constellation.worker.celery_app worker --loglevel=info
 ```
 
+### Option 3: PostgreSQL Backend (Alternative to Neo4j)
+
+Constellation supports PostgreSQL + pgvector as an alternative storage backend. Neo4j is
+still the default; switching to Postgres is a single environment-variable flip.
+
+```bash
+# Start Postgres via the compose profile (requires Docker)
+docker compose --profile postgres up -d postgres
+
+# Configure the app to use it
+cat >> .env <<EOF
+STORAGE_BACKEND=postgres
+POSTGRES_DSN=postgresql://constellation:secret@localhost:5432/constellation
+EOF
+
+# Start Redis (still required for Celery job state)
+docker compose up -d redis
+
+# Run the API server and worker as before
+uvicorn constellation.main:app --host 0.0.0.0 --port 8000
+celery -A constellation.worker.celery_app worker --loglevel=info
+```
+
+Notes:
+- `asyncpg` and `pgvector` are already in `requirements.txt`, so no extra install is needed.
+- The schema is created on the first indexing run via `initialize_schema()`.
+- Switching embedding providers later (e.g., OpenAI 1536 → Ollama 768) is handled automatically: the backend detects the dimension change and triggers a full re-embed on the next indexing run.
+
 ## Quick Start
 
 Once the services are running, index a repository with a single curl:
