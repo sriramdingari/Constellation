@@ -93,6 +93,16 @@ class PostgresWriteBackend(WriteBackend):
 
     async def connect(self) -> None:
         from pgvector.asyncpg import register_vector
+
+        # Ensure the pgvector extension exists BEFORE creating the pool,
+        # otherwise register_vector (used as pool init) fails with
+        # "unknown type: public.vector" on a fresh database.
+        bootstrap = await asyncpg.connect(self._dsn)
+        try:
+            await bootstrap.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        finally:
+            await bootstrap.close()
+
         self._pool = await asyncpg.create_pool(
             self._dsn, min_size=1, max_size=10, init=register_vector
         )
