@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import redis
+import asyncio
+import logging
 from uuid import uuid4
+
+import redis
 from celery.result import AsyncResult
 from fastapi import APIRouter, HTTPException
 
@@ -27,7 +30,22 @@ from constellation.locking import (
 from constellation.worker.celery_app import celery_app
 from constellation.worker.tasks import index_repository
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Process-local flag: the first API call that acquires a backend also runs
+# initialize_schema() so the DB is ready for repository queries before the
+# first indexing job. Subsequent calls skip the init because it has already
+# run in this process. The operation is idempotent (CREATE TABLE IF NOT
+# EXISTS throughout), and an asyncio.Lock serializes concurrent first-call
+# coroutines so only one pays the DDL cost.
+#
+# Known limitation: if the DB is wiped while the server is running, this
+# flag stays True and queries will fail with UndefinedTableError until a
+# worker restart. Documented trade-off vs adding retry logic everywhere.
+_schema_initialized: bool = False
+_schema_init_lock: asyncio.Lock = asyncio.Lock()
 
 # Map Celery states to API-facing status strings.
 _STATE_MAP = {
@@ -42,10 +60,33 @@ _STATE_MAP = {
 
 
 async def _get_backend():
-    """Create and connect a WriteBackend. Caller must close it."""
+    """Create and connect a WriteBackend. Caller must close it.
+
+    On the first call per process, also runs initialize_schema() so that
+    a fresh Postgres deployment can serve repository queries before any
+    indexing job has run. Subsequent calls skip the init.
+
+    If initialize_schema() raises, the flag stays False so the next call
+    retries the init. Concurrent coroutines racing on the first call are
+    serialized by an asyncio.Lock — only one coroutine pays the DDL cost.
+    """
+    global _schema_initialized
     settings = get_settings()
     backend = create_write_backend(settings)
     await backend.connect()
+    if not _schema_initialized:
+        async with _schema_init_lock:
+            # Double-check after acquiring the lock: another coroutine may
+            # have initialized the schema while we were waiting.
+            if not _schema_initialized:
+                try:
+                    await backend.initialize_schema()
+                    _schema_initialized = True
+                except Exception:
+                    logger.exception(
+                        "Failed to initialize backend schema on first API acquisition"
+                    )
+                    raise
     return backend
 
 

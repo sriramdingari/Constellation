@@ -388,6 +388,33 @@ async def test_reindex_removes_stale_relationships(write_backend):
     await write_backend.delete_repository("stale-rel-test")
 
 
+async def test_fresh_deployment_can_list_repositories_without_indexing(postgres_dsn):
+    """On a truly fresh Postgres DB (no indexing run yet), a backend that
+    calls initialize_schema() before list_repositories() must return an
+    empty list, not raise UndefinedTableError."""
+    backend = PostgresWriteBackend(dsn=postgres_dsn, embedding_dimensions=1536)
+    try:
+        await backend.connect()
+        # Drop any tables left over from previous tests in this session so
+        # we're testing the truly-fresh case
+        pool = backend._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_references CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_symbols CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_repos CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS embedding_metadata CASCADE")
+
+        # A naive call to list_repositories without initialize_schema would
+        # now raise UndefinedTableError. With the bootstrap fix, calling
+        # initialize_schema first makes this work:
+        await backend.initialize_schema()
+        repos = await backend.list_repositories()
+        assert repos == []
+    finally:
+        await backend.close()
+
+
 async def test_delete_repository_removes_entities(write_backend):
     # Setup: ensure there is a repo
     await write_backend.upsert_repository(

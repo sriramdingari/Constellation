@@ -263,6 +263,37 @@ class TestGetJobStatus:
         assert "Connection refused" in data["error"]
 
 
+@pytest.mark.asyncio
+async def test_get_backend_initializes_schema_on_first_call(monkeypatch):
+    """_get_backend must call initialize_schema() on the first acquisition
+    so a fresh deployment can serve /repositories before any indexing job
+    has run. Subsequent calls must NOT re-initialize."""
+    from constellation.api import routes
+
+    # Reset the module-level flag via monkeypatch so it's restored at teardown
+    monkeypatch.setattr(routes, "_schema_initialized", False)
+
+    fake_backend = MagicMock()
+    fake_backend.connect = AsyncMock()
+    fake_backend.initialize_schema = AsyncMock()
+    fake_backend.close = AsyncMock()
+
+    def fake_factory(settings):
+        return fake_backend
+
+    monkeypatch.setattr(routes, "create_write_backend", fake_factory)
+
+    # First call: schema init must fire
+    backend1 = await routes._get_backend()
+    assert backend1 is fake_backend
+    assert fake_backend.initialize_schema.await_count == 1
+
+    # Second call: schema init must NOT fire again (flag guards it)
+    backend2 = await routes._get_backend()
+    assert fake_backend.initialize_schema.await_count == 1, \
+        "initialize_schema must run once per process, not per call"
+
+
 class TestHealth:
     def test_returns_health_status(self, client, mock_graph_client):
         with patch("constellation.api.routes.redis") as mock_redis_mod:
