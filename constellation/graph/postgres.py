@@ -317,12 +317,19 @@ class PostgresWriteBackend(WriteBackend):
             return 0
         created = 0
         for rel in relationships:
+            # Use INSERT ... SELECT ... WHERE EXISTS to silently skip edges
+            # whose endpoints are not in code_symbols. This mirrors Neo4j's
+            # MATCH (source) MATCH (target) MERGE behavior — unresolved targets
+            # (e.g. Java external superclasses, C# external::Base types,
+            # deleted-file references) are dropped, not raised.
             result = await conn.execute("""
                 INSERT INTO code_references (source_symbol_id, target_symbol_id, ref_type, properties)
-                VALUES ($1, $2, $3, $4)
+                SELECT $1, $2, $3, $4::jsonb
+                WHERE EXISTS (SELECT 1 FROM code_symbols WHERE id = $1)
+                  AND EXISTS (SELECT 1 FROM code_symbols WHERE id = $2)
                 ON CONFLICT (source_symbol_id, target_symbol_id, ref_type) DO NOTHING
             """, rel.source_id, rel.target_id, rel.relationship_type.value, json.dumps(rel.properties or {}))
-            if result.endswith("1"):
+            if result.endswith(" 1"):
                 created += 1
         return created
 

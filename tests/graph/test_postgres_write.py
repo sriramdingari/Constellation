@@ -97,3 +97,62 @@ async def test_delete_repository_deletes_symbols_then_repo(backend, mock_pool):
     second_call = mock_pool.execute.call_args_list[1][0][0]
     assert "code_symbols" in first_call
     assert "code_repos" in second_call
+
+
+@pytest.mark.asyncio
+async def test_upsert_relationships_skips_when_endpoint_missing(backend):
+    """Edges to non-existent symbols must be silently skipped, not abort the txn."""
+    # Mock conn.execute to return "INSERT 0 0" (no row inserted because EXISTS check failed)
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="INSERT 0 0")
+
+    rel = CodeRelationship(
+        source_id="repo::missing.source",
+        target_id="repo::missing.target",
+        relationship_type=RelationshipType.EXTENDS,
+    )
+    created = await backend._upsert_relationships(conn, [rel])
+
+    # Edge was skipped, but no exception raised
+    assert created == 0
+    # Verify the SQL contains specific EXISTS guards on both endpoints
+    sql = conn.execute.call_args[0][0]
+    assert "WHERE EXISTS (SELECT 1 FROM code_symbols WHERE id = $1)" in sql
+    assert "AND EXISTS (SELECT 1 FROM code_symbols WHERE id = $2)" in sql
+
+
+@pytest.mark.asyncio
+async def test_upsert_relationships_counts_inserted_when_endpoints_exist(backend):
+    """When both endpoints exist, the row is inserted and counted as created."""
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+    rel = CodeRelationship(
+        source_id="repo::A",
+        target_id="repo::B",
+        relationship_type=RelationshipType.CALLS,
+    )
+    created = await backend._upsert_relationships(conn, [rel])
+
+    assert created == 1
+
+
+@pytest.mark.asyncio
+async def test_upsert_relationships_does_not_count_double_digit_results(backend):
+    """Defensive: 'INSERT 0 11' must NOT be counted as one creation.
+
+    The change from endswith('1') to endswith(' 1') is what enables this distinction.
+    """
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="INSERT 0 11")
+
+    rel = CodeRelationship(
+        source_id="repo::A",
+        target_id="repo::B",
+        relationship_type=RelationshipType.CALLS,
+    )
+    created = await backend._upsert_relationships(conn, [rel])
+
+    # Per-row inserts should never return "INSERT 0 11", but if they did,
+    # the endswith(' 1') check correctly rejects it.
+    assert created == 0
