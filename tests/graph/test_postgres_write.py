@@ -162,7 +162,7 @@ async def test_upsert_relationships_does_not_count_double_digit_results(backend)
 async def test_initialize_schema_drops_embeddings_when_dimensions_change(mock_pool):
     """If existing code_embeddings has wrong vector dimension, drop+recreate.
 
-    Verifies the call sequence: _DDL → fetchval(pg_attribute) → DROP → CREATE.
+    Verifies the call sequence: _DDL → fetchval(pg_attribute) → DROP → UPDATE(clear hashes) → CREATE.
     The dimension check must happen after _DDL runs (which only creates the
     non-embeddings tables) so the table inspection sees the actual production state.
     """
@@ -190,6 +190,17 @@ async def test_initialize_schema_drops_embeddings_when_dimensions_change(mock_po
     drop_idx = next(i for i, s in enumerate(executed_sql) if "DROP TABLE" in s and "code_embeddings" in s)
     create_idx = next(i for i, s in enumerate(executed_sql) if "vector(768)" in s)
     assert drop_idx < create_idx, "DROP must precede CREATE in the call sequence"
+
+    # Verify the UPDATE content_hash clear also fires between DROP and CREATE
+    # (from Round 2 Task 1 — dimension drift must trigger re-embed)
+    clear_idx = next(
+        (i for i, s in enumerate(executed_sql) if "content_hash = NULL" in s),
+        None,
+    )
+    assert clear_idx is not None, \
+        f"Expected content_hash clear between DROP and CREATE; got: {executed_sql}"
+    assert drop_idx < clear_idx < create_idx, \
+        f"Expected DROP → UPDATE → CREATE order; got drop={drop_idx}, clear={clear_idx}, create={create_idx}"
 
 
 @pytest.mark.asyncio
@@ -283,3 +294,63 @@ async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_poo
     # Must NOT have issued a DROP TABLE
     executed_sql = [call.args[0] for call in conn.execute.call_args_list]
     assert not any("DROP TABLE" in sql for sql in executed_sql)
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_clears_file_hashes_on_dimension_drift(mock_pool):
+    """When dimensions drift, all File.content_hash values must be cleared
+    so the next pipeline run treats every file as changed and re-embeds them.
+    Otherwise unchanged files keep their stored hash, skip reprocessing, and
+    silently lose their embeddings.
+    """
+    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=768)
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=1536)  # existing is 1536, new is 768 → drift
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must have issued UPDATE code_symbols SET content_hash = NULL for File entities
+    clear_hash_stmts = [
+        s for s in executed_sql
+        if "UPDATE code_symbols" in s
+        and "content_hash = NULL" in s
+        and "symbol_type = 'File'" in s
+    ]
+    assert len(clear_hash_stmts) == 1, \
+        f"Expected exactly one UPDATE to clear File content_hash; got: {executed_sql}"
+    # Verify the ordering: DROP → UPDATE → CREATE
+    drop_idx = next(i for i, s in enumerate(executed_sql) if "DROP TABLE" in s and "code_embeddings" in s)
+    clear_idx = next(i for i, s in enumerate(executed_sql) if "content_hash = NULL" in s)
+    create_idx = next(i for i, s in enumerate(executed_sql) if "vector(768)" in s)
+    assert drop_idx < clear_idx < create_idx, \
+        f"Expected DROP → UPDATE → CREATE order; indices: drop={drop_idx}, clear={clear_idx}, create={create_idx}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_does_not_clear_hashes_when_dimensions_match(mock_pool):
+    """When dimensions already match, do NOT clear File content_hash."""
+    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=1536)  # matches configured
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must NOT have issued the content_hash clear
+    assert not any("content_hash = NULL" in s for s in executed_sql), \
+        f"Expected no UPDATE content_hash = NULL when dimensions match; got: {executed_sql}"

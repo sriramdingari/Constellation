@@ -151,10 +151,20 @@ class PostgresWriteBackend(WriteBackend):
             if existing_dim is not None and existing_dim != self._embedding_dimensions:
                 logger.warning(
                     "Embedding dimension drift: existing=%d, configured=%d. "
-                    "Dropping and recreating code_embeddings.",
+                    "Dropping code_embeddings and clearing File content hashes "
+                    "so the next indexing run regenerates embeddings for every file.",
                     existing_dim, self._embedding_dimensions,
                 )
                 await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+                # Clear File.content_hash so get_file_hashes() returns empty for
+                # every repo, which makes the pipeline's hash comparison see every
+                # file as changed and re-parse + re-embed everything. Without this,
+                # unchanged files would silently stay embedding-less until a manual
+                # full reindex.
+                await conn.execute(
+                    "UPDATE code_symbols SET content_hash = NULL "
+                    "WHERE symbol_type = 'File'"
+                )
 
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS code_embeddings (
