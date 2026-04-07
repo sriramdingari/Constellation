@@ -1,47 +1,77 @@
 """
-Integration test: index a small Python tree with PostgresWriteBackend,
-then verify the WriteBackend operations succeed against a real Postgres + pgvector.
+Integration tests for PostgresWriteBackend against a real pgvector database.
 
-Requires: POSTGRES_DSN env var pointing to a running pgvector instance.
-Run with: pytest tests/test_postgres_integration.py -m integration -v
+Uses testcontainers to auto-manage a pgvector/pgvector:pg16 container for the
+entire test session. Gracefully skips the whole module if Docker is unavailable.
 """
 import os
 import pytest
+import pytest_asyncio
 
 from constellation.config import Settings
 from constellation.graph.postgres import PostgresWriteBackend
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 
-pytestmark = pytest.mark.integration
+# Try to import testcontainers; if Docker or the library is unavailable, skip
+# the entire module rather than erroring at collection time.
+_skip_reason = None
+try:
+    from testcontainers.postgres import PostgresContainer
+except ImportError as e:
+    _skip_reason = f"testcontainers not installed: {e}"
 
-POSTGRES_DSN = os.environ.get(
-    "POSTGRES_DSN",
-    "postgresql://constellation:secret@localhost:5432/constellation"
-)
+pytestmark = [pytest.mark.postgres_integration]
+if _skip_reason:
+    pytestmark.append(pytest.mark.skip(reason=_skip_reason))
+
+
+@pytest.fixture(scope="session")
+def postgres_container():
+    """Session-scoped pgvector container. Starts once, tears down at session end."""
+    try:
+        container = PostgresContainer(
+            image="pgvector/pgvector:pg16",
+            username="constellation",
+            password="secret",
+            dbname="constellation",
+        )
+        container.start()
+    except Exception as exc:
+        pytest.skip(f"Docker unavailable for postgres integration tests: {exc}")
+    yield container
+    # Note: if container.start() raised above, pytest.skip() raises Skipped
+    # (a BaseException, not an Exception), which propagates past the yield
+    # and this line is never reached. Safe to call unconditionally on the
+    # happy path.
+    container.stop()
 
 
 @pytest.fixture
-def settings():
-    return Settings(
-        storage_backend="postgres",
-        postgres_dsn=POSTGRES_DSN,
-        embedding_provider="openai",
-        openai_api_key=os.environ.get("OPENAI_API_KEY", "fake-key-for-test"),
-    )
+def postgres_dsn(postgres_container):
+    """asyncpg-compatible DSN for the running container."""
+    # testcontainers returns a psycopg2 URL; normalize to asyncpg's form.
+    raw = postgres_container.get_connection_url()
+    return raw.replace("postgresql+psycopg2://", "postgresql://")
 
 
-@pytest.fixture
-async def write_backend(settings):
-    backend = PostgresWriteBackend(
-        dsn=POSTGRES_DSN,
-        embedding_dimensions=settings.resolved_embedding_dimensions(),
-    )
+@pytest_asyncio.fixture
+async def write_backend(postgres_dsn):
+    """Fresh PostgresWriteBackend connected to the session-scoped container.
+
+    Initializes the schema and cleans up any leftover test repositories at
+    the start of each test.
+    """
+    backend = PostgresWriteBackend(dsn=postgres_dsn, embedding_dimensions=1536)
     await backend.connect()
     await backend.initialize_schema()
-    # Clean up any prior test data
-    await backend.delete_repository("test-repo")
+    # Defensive: clean up any repos from a prior failed test
+    for name in ["test-repo", "test-repo-delete", "stable-reindex-test",
+                 "orphan-reindex-test", "stale-rel-test", "file-hashes-test"]:
+        try:
+            await backend.delete_repository(name)
+        except Exception:
+            pass
     yield backend
-    await backend.delete_repository("test-repo")
     await backend.close()
 
 
@@ -141,12 +171,50 @@ async def test_apply_indexing_changes_writes_entities(write_backend):
 
 
 async def test_get_file_hashes_returns_indexed_files(write_backend):
-    """After apply_indexing_changes with a File entity, get_file_hashes should return it."""
-    # The previous test set up some entities; this test verifies the file is in get_file_hashes
-    hashes = await write_backend.get_file_hashes("test-repo")
-    # The file_entity from the previous test had content_hash="hash1"
-    if "src/foo.py" in hashes:
-        assert hashes["src/foo.py"] == "hash1"
+    """get_file_hashes returns {file_path: content_hash} for all File entities."""
+    await write_backend.delete_repository("file-hashes-test")
+
+    file_a = CodeEntity(
+        id="file-hashes-test::src/a.py",
+        name="a.py",
+        entity_type=EntityType.FILE,
+        repository="file-hashes-test",
+        file_path="src/a.py",
+        line_number=1,
+        language="python",
+        content_hash="hash-a",
+    )
+    file_b = CodeEntity(
+        id="file-hashes-test::src/b.py",
+        name="b.py",
+        entity_type=EntityType.FILE,
+        repository="file-hashes-test",
+        file_path="src/b.py",
+        line_number=1,
+        language="python",
+        content_hash="hash-b",
+    )
+    await write_backend.apply_indexing_changes(
+        repository="file-hashes-test",
+        source="/tmp/test",
+        commit_sha=None,
+        reindex_preparations=[
+            ("src/a.py", {file_a.id}),
+            ("src/b.py", {file_b.id}),
+        ],
+        entities=[file_a, file_b],
+        relationships=[],
+        stale_file_paths=[],
+    )
+
+    hashes = await write_backend.get_file_hashes("file-hashes-test")
+
+    assert hashes == {
+        "src/a.py": "hash-a",
+        "src/b.py": "hash-b",
+    }
+
+    await write_backend.delete_repository("file-hashes-test")
 
 
 async def test_declaration_stable_reindex_reports_zero_new_entities(write_backend):
