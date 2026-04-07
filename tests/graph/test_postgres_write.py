@@ -241,6 +241,30 @@ async def test_orphan_package_cleanup_loops_until_stable(backend, mock_pool):
 
 
 @pytest.mark.asyncio
+async def test_upsert_entities_uses_returning_xmax_for_create_count(backend):
+    """Reinserting an existing entity must NOT count as 'created'."""
+    conn = AsyncMock()
+    # Simulate: first call returns inserted=True (new row), second returns False (update)
+    conn.fetchval = AsyncMock(side_effect=[True, False])
+    conn.execute = AsyncMock(return_value="INSERT 0 1")
+
+    e1 = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.CLASS,
+        repository="repo", file_path="a.py", line_number=1, language="python",
+    )
+    e2 = CodeEntity(
+        id="repo::B", name="B", entity_type=EntityType.CLASS,
+        repository="repo", file_path="b.py", line_number=1, language="python",
+    )
+    created = await backend._upsert_entities(conn, [e1, e2])
+    assert created == 1, f"Expected 1 true insert, got {created}"
+    # Verify the SQL uses RETURNING (xmax = 0) — fail loudly if implementation drifts
+    sql = conn.fetchval.call_args_list[0].args[0]
+    assert "RETURNING" in sql
+    assert "xmax = 0" in sql or "xmax=0" in sql
+
+
+@pytest.mark.asyncio
 async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_pool):
     """If existing code_embeddings already has the right dim, do not drop."""
     backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)

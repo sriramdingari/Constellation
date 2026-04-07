@@ -247,33 +247,65 @@ class PostgresWriteBackend(WriteBackend):
         pool = self._require_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
-                # 1. Delete stale files (CASCADE removes symbols, refs, embeddings)
+                # 1. Delete stale files (files that no longer exist on disk).
+                # Excludes packages — they're shared across files.
                 if stale_file_paths:
                     await conn.execute(
-                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2) AND symbol_type != 'Package'",
+                        "DELETE FROM code_symbols WHERE repository = $1 "
+                        "AND file_path = ANY($2) AND symbol_type != 'Package'",
                         repository, stale_file_paths,
                     )
-                # 2. Delete reindex targets
-                reindex_paths = [path for path, _ in reindex_preparations]
-                if reindex_paths:
-                    await conn.execute(
-                        "DELETE FROM code_symbols WHERE repository = $1 AND file_path = ANY($2) AND symbol_type != 'Package'",
-                        repository, reindex_paths,
-                    )
 
-                # 3. Upsert all entities
+                # 2. For each reindexed file, snapshot existing entity IDs and
+                # delete only the orphans (existing - current). Don't delete
+                # entities that are being re-upserted — that lets the upsert
+                # take the UPDATE path so entities_created reflects only true
+                # new entities. Mirrors Neo4j's _prepare_file_reindex.
+                #
+                # Also delete all outbound relationships sourced from any
+                # entity in the reindex set BEFORE the upsert. Without this,
+                # stale relationships (e.g. an EXTENDS edge that was removed
+                # in a refactor) would survive forever — the new
+                # _upsert_relationships uses ON CONFLICT DO NOTHING and
+                # cannot remove rows. Mirrors Neo4j's
+                # DELETE_FILE_OUTBOUND_RELATIONSHIPS in _prepare_file_reindex.
+                for file_path, current_entity_ids in reindex_preparations:
+                    existing_rows = await conn.fetch(
+                        "SELECT id FROM code_symbols WHERE repository = $1 "
+                        "AND file_path = $2 AND symbol_type != 'Package'",
+                        repository, file_path,
+                    )
+                    existing_ids = {r["id"] for r in existing_rows}
+
+                    # Delete outbound relationships for all entities in this file
+                    # (both surviving and being-removed). They'll be recreated by
+                    # _upsert_relationships from the new parsed set.
+                    if existing_ids:
+                        await conn.execute(
+                            "DELETE FROM code_references WHERE source_symbol_id = ANY($1)",
+                            list(existing_ids),
+                        )
+
+                    # Delete only the orphan entities (in snapshot, not in current)
+                    stale_ids = list(existing_ids - current_entity_ids)
+                    if stale_ids:
+                        await conn.execute(
+                            "DELETE FROM code_symbols WHERE id = ANY($1)",
+                            stale_ids,
+                        )
+
+                # 3. Upsert all entities (RETURNING xmax tracks true creations)
                 entities_created = await self._upsert_entities(conn, entities)
 
-                # 4. Upsert all relationships
+                # 4. Upsert all relationships (skips unresolved endpoints via EXISTS)
                 rels_created = await self._upsert_relationships(conn, relationships)
 
                 # 5. Upsert embeddings for embeddable entities
                 await self._upsert_embeddings(conn, entities)
 
                 # 6. Cleanup orphan packages — loop until stable.
-                # Nested namespaces (e.g. C# SampleApp.Services.Auth) require
-                # multiple passes: leaf must be deleted before its parent
-                # becomes orphan-eligible. Mirrors Neo4j's _cleanup_orphan_packages_with_runner.
+                # Nested namespaces require multiple passes: leaf must be
+                # deleted before its parent becomes orphan-eligible.
                 while True:
                     result = await conn.execute("""
                         DELETE FROM code_symbols
@@ -286,10 +318,9 @@ class PostgresWriteBackend(WriteBackend):
                             SELECT 1 FROM code_symbols child
                             WHERE child.repository = $1
                             AND child.symbol_type = 'Package'
-                            AND child.id LIKE code_symbols.id || '.%'
+                            AND starts_with(child.id, code_symbols.id || '.')
                         )
                     """, repository)
-                    # asyncpg returns "DELETE N"; parse the count
                     deleted = int(result.split()[-1]) if result.startswith("DELETE") else 0
                     if deleted == 0:
                         break
@@ -315,13 +346,17 @@ class PostgresWriteBackend(WriteBackend):
             return 0
         created = 0
         for entity in entities:
-            result = await conn.execute("""
+            # RETURNING (xmax = 0) AS inserted: xmax is 0 only on a true INSERT.
+            # On UPDATE (i.e. ON CONFLICT fired), xmax is the txn id, so this
+            # returns False. This gives us an exact "newly created" count
+            # matching Neo4j's MERGE ON CREATE semantics.
+            inserted = await conn.fetchval("""
                 INSERT INTO code_symbols (
                     id, repository, file_path, symbol_name, symbol_type,
                     language, line_start, line_end, signature, code,
                     docstring, return_type, modifiers, stereotypes,
                     properties, content_hash
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
                 ON CONFLICT (id) DO UPDATE SET
                     file_path    = EXCLUDED.file_path,
                     symbol_name  = EXCLUDED.symbol_name,
@@ -338,6 +373,7 @@ class PostgresWriteBackend(WriteBackend):
                     properties   = EXCLUDED.properties,
                     content_hash = EXCLUDED.content_hash,
                     updated_at   = now()
+                RETURNING (xmax = 0) AS inserted
             """,
                 entity.id, entity.repository, entity.file_path, entity.name,
                 entity.entity_type.value, entity.language,
@@ -346,7 +382,7 @@ class PostgresWriteBackend(WriteBackend):
                 entity.modifiers or [], entity.stereotypes or [],
                 json.dumps(entity.properties or {}), entity.content_hash,
             )
-            if result.endswith("1"):
+            if inserted:
                 created += 1
         return created
 
