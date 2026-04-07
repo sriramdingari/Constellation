@@ -156,3 +156,58 @@ async def test_upsert_relationships_does_not_count_double_digit_results(backend)
     # Per-row inserts should never return "INSERT 0 11", but if they did,
     # the endswith(' 1') check correctly rejects it.
     assert created == 0
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_drops_embeddings_when_dimensions_change(mock_pool):
+    """If existing code_embeddings has wrong vector dimension, drop+recreate.
+
+    Verifies the call sequence: _DDL → fetchval(pg_attribute) → DROP → CREATE.
+    The dimension check must happen after _DDL runs (which only creates the
+    non-embeddings tables) so the table inspection sees the actual production state.
+    """
+    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=768)
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    # Simulate: existing code_embeddings has 1536 dim
+    conn.fetchval = AsyncMock(return_value=1536)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    # Must have issued a DROP TABLE for code_embeddings
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    assert any("DROP TABLE" in sql and "code_embeddings" in sql for sql in executed_sql), \
+        f"Expected DROP TABLE code_embeddings; got: {executed_sql}"
+    # Must have re-created with vector(768)
+    assert any("vector(768)" in sql for sql in executed_sql)
+    # Verify ordering: DROP must come BEFORE the CREATE TABLE for code_embeddings
+    drop_idx = next(i for i, s in enumerate(executed_sql) if "DROP TABLE" in s and "code_embeddings" in s)
+    create_idx = next(i for i, s in enumerate(executed_sql) if "vector(768)" in s)
+    assert drop_idx < create_idx, "DROP must precede CREATE in the call sequence"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_pool):
+    """If existing code_embeddings already has the right dim, do not drop."""
+    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=1536)  # already correct
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    # Must NOT have issued a DROP TABLE
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    assert not any("DROP TABLE" in sql for sql in executed_sql)

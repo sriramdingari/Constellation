@@ -117,15 +117,45 @@ class PostgresWriteBackend(WriteBackend):
             raise RuntimeError("PostgresWriteBackend: call connect() before using the backend")
         return self._pool
 
+    async def _existing_embedding_dimensions(self, conn: asyncpg.Connection) -> int | None:
+        """Return the configured vector dimensions for code_embeddings.embedding,
+        or None if the table does not exist yet.
+
+        Uses to_regclass() which returns NULL for missing tables, so the join
+        silently produces zero rows → fetchval returns None. pgvector stores
+        the configured dimension directly in pg_attribute.atttypmod (verified
+        in pgvector source: vector_typmod_in returns *tl with no offset).
+        """
+        return await conn.fetchval("""
+            SELECT atttypmod
+            FROM pg_attribute
+            WHERE attrelid = to_regclass('public.code_embeddings')
+              AND attname = 'embedding'
+        """)
+
     async def initialize_schema(self) -> None:
-        """Run idempotent DDL. Safe to call on every startup."""
+        """Run idempotent DDL. Safe to call on every startup.
+
+        Handles embedding dimension drift: if code_embeddings exists with a
+        different vector dimension than configured, drop and recreate it.
+        """
         pool = self._require_pool()
         async with pool.acquire() as conn:
             # Execute the entire DDL block as one call — asyncpg supports
-            # multi-statement strings natively. Do NOT split on ";" as it
-            # breaks atomicity.
+            # multi-statement strings natively. _DDL creates everything
+            # except code_embeddings (which has a configurable dimension).
             await conn.execute(_DDL)
-            # Embeddings table uses configurable dimensions
+
+            # Check existing code_embeddings dimensions, drop+recreate if mismatched
+            existing_dim = await self._existing_embedding_dimensions(conn)
+            if existing_dim is not None and existing_dim != self._embedding_dimensions:
+                logger.warning(
+                    "Embedding dimension drift: existing=%d, configured=%d. "
+                    "Dropping and recreating code_embeddings.",
+                    existing_dim, self._embedding_dimensions,
+                )
+                await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS code_embeddings (
                     symbol_id    TEXT PRIMARY KEY REFERENCES code_symbols(id) ON DELETE CASCADE,
