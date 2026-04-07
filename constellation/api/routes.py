@@ -226,4 +226,10 @@ async def health():
         redis_status = "disconnected"
 
     overall = "ok" if backend_status == "connected" and redis_status == "connected" else "degraded"
-    return HealthResponse(status=overall, neo4j=backend_status, redis=redis_status)
+    return HealthResponse(
+        status=overall,
+        backend=backend_status,
+        backend_type=settings.storage_backend,
+        neo4j=backend_status,  # legacy alias — same value as `backend`
+        redis=redis_status,
+    )

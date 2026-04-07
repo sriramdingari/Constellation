@@ -125,14 +125,23 @@ class TestRepositoryInfo:
 
 class TestHealthResponse:
     def test_creation(self):
-        health = HealthResponse(status="ok", neo4j="connected", redis="connected")
+        health = HealthResponse(
+            status="ok",
+            backend_type="neo4j",
+            neo4j="connected",
+            redis="connected",
+        )
         assert health.status == "ok"
         assert health.neo4j == "connected"
         assert health.redis == "connected"
+        assert health.backend_type == "neo4j"
 
     def test_degraded(self):
         health = HealthResponse(
-            status="degraded", neo4j="disconnected", redis="connected"
+            status="degraded",
+            backend_type="neo4j",
+            neo4j="disconnected",
+            redis="connected",
         )
         assert health.status == "degraded"
         assert health.neo4j == "disconnected"

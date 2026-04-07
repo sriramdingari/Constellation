@@ -104,7 +104,11 @@ Verify everything is running:
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","neo4j":"connected","redis":"connected"}
+# {"status":"ok","backend":"connected","backend_type":"neo4j","neo4j":"connected","redis":"connected"}
+#
+# The `backend` and `backend_type` fields are the canonical way to check
+# storage health. The `neo4j` field is kept as a backward-compat alias and
+# always mirrors `backend`, regardless of which backend is active.
 ```
 
 ### Option 2: Local Development
@@ -381,6 +385,8 @@ Returns connectivity status for both Neo4j and Redis:
 ```json
 {
   "status": "ok",
+  "backend": "connected",
+  "backend_type": "neo4j",
   "neo4j": "connected",
   "redis": "connected"
 }
@@ -617,7 +623,7 @@ graph TB
 ### Health endpoint returns "degraded"
 
 ```json
-{"status": "degraded", "neo4j": "disconnected", "redis": "disconnected"}
+{"status": "degraded", "backend": "disconnected", "backend_type": "neo4j", "neo4j": "disconnected", "redis": "disconnected"}
 ```
 
 When running in Docker, ensure your `.env` uses container service names, not `localhost`:

@@ -306,3 +306,39 @@ class TestHealth:
         assert data["status"] == "ok"
         assert data["neo4j"] == "connected"
         assert data["redis"] == "connected"
+
+        # New canonical fields must be present
+        assert "backend" in data, f"Expected 'backend' field; got: {data}"
+        assert "backend_type" in data, f"Expected 'backend_type' field; got: {data}"
+        assert data["backend"] in ("connected", "disconnected")
+        assert data["backend_type"] in ("neo4j", "postgres")
+
+        # Legacy field still present and mirrors backend value
+        assert data["neo4j"] == data["backend"]
+
+    def test_degraded_when_backend_down(self, client):
+        """When the backend is unreachable, status is degraded and backend field
+        says 'disconnected'. Mirror invariant (neo4j == backend) holds in the
+        failure case too."""
+        from unittest.mock import patch
+
+        # Make create_write_backend raise — the health route should catch it
+        # and mark the backend as disconnected rather than 500ing.
+        with patch(
+            "constellation.api.routes.create_write_backend",
+            side_effect=Exception("backend unreachable"),
+        ):
+            with patch("constellation.api.routes.redis") as mock_redis_mod:
+                mock_redis_instance = MagicMock()
+                mock_redis_mod.from_url.return_value = mock_redis_instance
+                mock_redis_instance.ping.return_value = True
+                response = client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["backend"] == "disconnected"
+        # Mirror invariant: neo4j legacy alias must match backend even in failure
+        assert data["neo4j"] == data["backend"]
+        # backend_type should still reflect the configured setting, not a default
+        assert data["backend_type"] in ("neo4j", "postgres")

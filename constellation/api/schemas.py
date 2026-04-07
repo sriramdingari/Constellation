@@ -41,5 +41,15 @@ class RepositoryInfo(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+    # Canonical fields — prefer these for new clients and monitoring.
+    # `backend` defaults to "disconnected" because the route's exception
+    # path relies on the default. `backend_type` has NO default: any code
+    # path that constructs HealthResponse must explicitly state the active
+    # backend, since a silent default would lie on Postgres deployments.
+    backend: str = "disconnected"
+    backend_type: str
+    # Legacy alias kept for backward compatibility with existing clients
+    # and dashboards. Populated with the same value as `backend`.
+    # Deprecated; use `backend` in new code.
     neo4j: str
     redis: str
