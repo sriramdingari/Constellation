@@ -8,8 +8,6 @@ services:
     volumes:
       - repos:/app/repos
     depends_on:
-      neo4j:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -20,8 +18,6 @@ services:
     volumes:
       - repos:/app/repos
     depends_on:
-      neo4j:
-        condition: service_healthy
       redis:
         condition: service_healthy
 
@@ -60,6 +56,9 @@ services:
       timeout: 3s
       retries: 5
 
+  # PostgreSQL backend (alternative to Neo4j). Start with:
+  #   docker compose --profile postgres up -d
+  # Then set STORAGE_BACKEND=postgres and POSTGRES_DSN in .env
   postgres:
     image: pgvector/pgvector:pg16
     profiles: ["postgres"]
