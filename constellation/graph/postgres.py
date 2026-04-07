@@ -86,9 +86,16 @@ _EMBEDDABLE_TYPES = {
 class PostgresWriteBackend(WriteBackend):
     """PostgreSQL + pgvector implementation of WriteBackend."""
 
-    def __init__(self, dsn: str, embedding_dimensions: int = 1536) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        embedding_dimensions: int = 1536,
+        *,
+        embedding_model: str = "text-embedding-3-small",
+    ) -> None:
         self._dsn = dsn
         self._embedding_dimensions = embedding_dimensions
+        self._embedding_model = embedding_model
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
@@ -117,59 +124,110 @@ class PostgresWriteBackend(WriteBackend):
             raise RuntimeError("PostgresWriteBackend: call connect() before using the backend")
         return self._pool
 
-    async def _existing_embedding_dimensions(self, conn: asyncpg.Connection) -> int | None:
-        """Return the configured vector dimensions for code_embeddings.embedding,
-        or None if the table does not exist yet.
+    async def _existing_embedding_metadata(self, conn: asyncpg.Connection) -> dict | None:
+        """Return the stored embedding_metadata row, or None if empty.
 
-        Uses to_regclass() which returns NULL for missing tables, so the join
-        silently produces zero rows → fetchval returns None. pgvector stores
-        the configured dimension directly in pg_attribute.atttypmod (verified
-        in pgvector source: vector_typmod_in returns *tl with no offset).
+        The caller is responsible for ensuring the table exists first
+        (initialize_schema creates it via CREATE TABLE IF NOT EXISTS
+        before this helper is called).
         """
-        return await conn.fetchval("""
-            SELECT atttypmod
-            FROM pg_attribute
-            WHERE attrelid = to_regclass('public.code_embeddings')
-              AND attname = 'embedding'
-        """)
+        row = await conn.fetchrow(
+            "SELECT dimensions, model FROM embedding_metadata WHERE id = 1"
+        )
+        return dict(row) if row else None
 
     async def initialize_schema(self) -> None:
         """Run idempotent DDL. Safe to call on every startup.
 
-        Handles embedding dimension drift: if code_embeddings exists with a
-        different vector dimension than configured, drop and recreate it.
+        Handles embedding corpus drift via a singleton embedding_metadata
+        table. Any mismatch on dimensions OR model between configured and
+        stored values triggers a drop+recreate of code_embeddings and
+        clears File content hashes so the next indexing run regenerates
+        embeddings.
         """
         pool = self._require_pool()
         async with pool.acquire() as conn:
-            # Execute the entire DDL block as one call — asyncpg supports
-            # multi-statement strings natively. _DDL creates everything
-            # except code_embeddings (which has a configurable dimension).
+            # 1. Base schema (everything except code_embeddings, which is
+            # dimension-parameterized and created separately below)
             await conn.execute(_DDL)
 
-            # Check existing code_embeddings dimensions, drop+recreate if mismatched
-            existing_dim = await self._existing_embedding_dimensions(conn)
-            if existing_dim is not None and existing_dim != self._embedding_dimensions:
-                logger.warning(
-                    "Embedding dimension drift: existing=%d, configured=%d. "
-                    "Dropping code_embeddings and clearing File content hashes "
-                    "so the next indexing run regenerates embeddings for every file.",
-                    existing_dim, self._embedding_dimensions,
+            # 2. Embedding metadata singleton table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS embedding_metadata (
+                    id         INTEGER PRIMARY KEY CHECK (id = 1),
+                    dimensions INTEGER NOT NULL,
+                    model      TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT now()
                 )
-                await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
-                # Clear File.content_hash so get_file_hashes() returns empty for
-                # every repo, which makes the pipeline's hash comparison see every
-                # file as changed and re-parse + re-embed everything. Without this,
-                # unchanged files would silently stay embedding-less until a manual
-                # full reindex.
-                await conn.execute(
-                    "UPDATE code_symbols SET content_hash = NULL "
-                    "WHERE symbol_type = 'File'"
-                )
+            """)
 
+            # 3. Check stored metadata against configured
+            stored = await self._existing_embedding_metadata(conn)
+            configured_dim = self._embedding_dimensions
+            configured_model = self._embedding_model
+
+            if stored is None:
+                # Migration / fresh-install path.
+                # If code_embeddings already exists (and possibly has rows
+                # from a previous deployment that didn't track model
+                # metadata), we can't know what model those embeddings came
+                # from. Conservative choice: treat the migration boundary
+                # as drift and clear the corpus, forcing a full re-embed on
+                # the next indexing run. This is the same-dim edge case the
+                # new metadata table fixes going forward; for existing
+                # deployments we pay it once.
+                pre_existing_embeddings = await conn.fetchval(
+                    "SELECT to_regclass('code_embeddings')"
+                )
+                if pre_existing_embeddings is not None:
+                    logger.warning(
+                        "Migration: embedding_metadata was empty but "
+                        "code_embeddings already exists. Treating as drift "
+                        "and clearing the corpus so the next indexing run "
+                        "regenerates embeddings with the configured model=%s.",
+                        configured_model,
+                    )
+                    await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+                    await conn.execute(
+                        "UPDATE code_symbols SET content_hash = NULL "
+                        "WHERE symbol_type = 'File'"
+                    )
+                # Insert the configured values as the new baseline.
+                # ON CONFLICT DO NOTHING guards against a race where two
+                # processes start simultaneously, both see stored=None, and
+                # both try to INSERT row id=1 — without the guard, the second
+                # would fail with a PK violation.
+                await conn.execute("""
+                    INSERT INTO embedding_metadata (id, dimensions, model)
+                    VALUES (1, $1, $2)
+                    ON CONFLICT (id) DO NOTHING
+                """, configured_dim, configured_model)
+            else:
+                if stored["dimensions"] != configured_dim or stored["model"] != configured_model:
+                    logger.warning(
+                        "Embedding corpus drift: stored=(dim=%d, model=%s), "
+                        "configured=(dim=%d, model=%s). Dropping code_embeddings "
+                        "and clearing File content hashes so the next indexing "
+                        "run regenerates embeddings for every file.",
+                        stored["dimensions"], stored["model"],
+                        configured_dim, configured_model,
+                    )
+                    await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+                    await conn.execute(
+                        "UPDATE code_symbols SET content_hash = NULL "
+                        "WHERE symbol_type = 'File'"
+                    )
+                    await conn.execute("""
+                        UPDATE embedding_metadata
+                        SET dimensions = $1, model = $2, updated_at = now()
+                        WHERE id = 1
+                    """, configured_dim, configured_model)
+
+            # 4. Create code_embeddings (if it doesn't exist, or was just dropped)
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS code_embeddings (
                     symbol_id    TEXT PRIMARY KEY REFERENCES code_symbols(id) ON DELETE CASCADE,
-                    embedding    vector({self._embedding_dimensions}),
+                    embedding    vector({configured_dim}),
                     content_hash TEXT
                 )
             """)

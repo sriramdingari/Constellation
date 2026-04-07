@@ -225,13 +225,24 @@ async def test_initialize_schema_drops_embeddings_when_dimensions_change(mock_po
     The dimension check must happen after _DDL runs (which only creates the
     non-embeddings tables) so the table inspection sees the actual production state.
     """
-    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=768)
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=768,
+        embedding_model="text-embedding-3-small",
+    )
     backend._pool = mock_pool
 
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="OK")
-    # Simulate: existing code_embeddings has 1536 dim
-    conn.fetchval = AsyncMock(return_value=1536)
+    # fetchval is only called via to_regclass in the migration branch.
+    # This test takes the drift branch (fetchrow returns a row), so fetchval
+    # is never called for the dimension check — set to None defensively.
+    conn.fetchval = AsyncMock(return_value=None)
+    # Stored metadata: dim=1536 (drift!), model still matches configured
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-3-small",
+    })
     acquire_cm = AsyncMock()
     acquire_cm.__aenter__ = AsyncMock(return_value=conn)
     acquire_cm.__aexit__ = AsyncMock(return_value=False)
@@ -313,12 +324,24 @@ async def test_orphan_package_cleanup_loops_until_stable(backend, mock_pool):
 @pytest.mark.asyncio
 async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_pool):
     """If existing code_embeddings already has the right dim, do not drop."""
-    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
     backend._pool = mock_pool
 
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="OK")
-    conn.fetchval = AsyncMock(return_value=1536)  # already correct
+    # fetchval is only called via to_regclass in the migration branch.
+    # This test takes the no-drift branch (fetchrow returns matching metadata),
+    # so fetchval is never called — set to None defensively.
+    conn.fetchval = AsyncMock(return_value=None)
+    # Stored metadata exactly matches configured
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-3-small",
+    })
     acquire_cm = AsyncMock()
     acquire_cm.__aenter__ = AsyncMock(return_value=conn)
     acquire_cm.__aexit__ = AsyncMock(return_value=False)
@@ -338,12 +361,24 @@ async def test_initialize_schema_clears_file_hashes_on_dimension_drift(mock_pool
     Otherwise unchanged files keep their stored hash, skip reprocessing, and
     silently lose their embeddings.
     """
-    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=768)
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=768,
+        embedding_model="text-embedding-3-small",
+    )
     backend._pool = mock_pool
 
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="OK")
-    conn.fetchval = AsyncMock(return_value=1536)  # existing is 1536, new is 768 → drift
+    # fetchval is only called via to_regclass in the migration branch.
+    # This test takes the drift branch, so fetchval is never called —
+    # set to None defensively.
+    conn.fetchval = AsyncMock(return_value=None)
+    # Stored metadata: old dim, model still matches configured
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-3-small",
+    })
     acquire_cm = AsyncMock()
     acquire_cm.__aenter__ = AsyncMock(return_value=conn)
     acquire_cm.__aexit__ = AsyncMock(return_value=False)
@@ -372,12 +407,24 @@ async def test_initialize_schema_clears_file_hashes_on_dimension_drift(mock_pool
 @pytest.mark.asyncio
 async def test_initialize_schema_does_not_clear_hashes_when_dimensions_match(mock_pool):
     """When dimensions already match, do NOT clear File content_hash."""
-    backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
     backend._pool = mock_pool
 
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="OK")
-    conn.fetchval = AsyncMock(return_value=1536)  # matches configured
+    # fetchval is only called via to_regclass in the migration branch.
+    # This test takes the no-drift branch (fetchrow returns matching metadata),
+    # so fetchval is never called — set to None defensively.
+    conn.fetchval = AsyncMock(return_value=None)
+    # Stored metadata exactly matches configured
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-3-small",
+    })
     acquire_cm = AsyncMock()
     acquire_cm.__aenter__ = AsyncMock(return_value=conn)
     acquire_cm.__aexit__ = AsyncMock(return_value=False)
@@ -389,6 +436,206 @@ async def test_initialize_schema_does_not_clear_hashes_when_dimensions_match(moc
     # Must NOT have issued the content_hash clear
     assert not any("content_hash = NULL" in s for s in executed_sql), \
         f"Expected no UPDATE content_hash = NULL when dimensions match; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_clears_embeddings_on_model_drift(mock_pool):
+    """When embedding_model changes but dimensions stay the same, drop
+    code_embeddings and clear File content hashes so the next indexing
+    run regenerates embeddings with the new model.
+    """
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=1536)  # existing dim unchanged
+    # fetchrow returns the existing metadata row: old model, same dim
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-ada-002",  # DIFFERENT model
+    })
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must have issued DROP TABLE code_embeddings
+    assert any(
+        "DROP TABLE" in sql and "code_embeddings" in sql for sql in executed_sql
+    ), f"Expected DROP TABLE on model drift; got: {executed_sql}"
+    # Must have cleared File content hashes
+    assert any(
+        "UPDATE code_symbols" in sql
+        and "content_hash = NULL" in sql
+        and "symbol_type = 'File'" in sql
+        for sql in executed_sql
+    ), f"Expected content_hash clear on model drift; got: {executed_sql}"
+    # Must have updated embedding_metadata with new model
+    assert any(
+        "embedding_metadata" in sql and "UPDATE" in sql
+        for sql in executed_sql
+    ), f"Expected embedding_metadata UPDATE; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_drops_embeddings_when_both_dim_and_model_drift(mock_pool):
+    """When BOTH dimensions AND model change simultaneously, still trigger
+    the drift branch. Protects against a future bug where `or` gets changed
+    to `and` in the drift condition."""
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=768,
+        embedding_model="nomic-embed-text",
+    )
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=None)
+    # Stored metadata differs on BOTH fields
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,  # was OpenAI 1536
+        "model": "text-embedding-3-small",  # different model
+    })
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must have dropped code_embeddings
+    assert any(
+        "DROP TABLE" in sql and "code_embeddings" in sql for sql in executed_sql
+    ), f"Expected DROP on combined dim+model drift; got: {executed_sql}"
+    # Must have cleared File content hashes
+    assert any(
+        "content_hash = NULL" in sql for sql in executed_sql
+    ), f"Expected content_hash clear; got: {executed_sql}"
+    # Must have updated metadata with new dim+model
+    assert any(
+        "embedding_metadata" in sql and "UPDATE" in sql for sql in executed_sql
+    ), f"Expected embedding_metadata UPDATE; got: {executed_sql}"
+    # Must have re-created code_embeddings with the new dimension (768)
+    assert any("vector(768)" in sql for sql in executed_sql), \
+        f"Expected vector(768) recreation; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_no_drop_when_model_and_dim_match(mock_pool):
+    """When both dim AND model match existing metadata, do NOT drop
+    code_embeddings and do NOT clear File content hashes."""
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    conn.fetchval = AsyncMock(return_value=1536)
+    conn.fetchrow = AsyncMock(return_value={
+        "dimensions": 1536,
+        "model": "text-embedding-3-small",  # matches configured
+    })
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    assert not any("DROP TABLE" in sql for sql in executed_sql), \
+        f"Expected no DROP when model+dim match; got: {executed_sql}"
+    assert not any("content_hash = NULL" in sql for sql in executed_sql), \
+        f"Expected no content_hash clear when model+dim match; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_inserts_metadata_on_fresh_install(mock_pool):
+    """On fresh install (no embedding_metadata row, no code_embeddings),
+    insert the configured dim+model values. No drop/clear should fire."""
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    # fetchrow returns None (no metadata row yet)
+    conn.fetchrow = AsyncMock(return_value=None)
+    # fetchval returns None for to_regclass check (code_embeddings doesn't exist)
+    conn.fetchval = AsyncMock(return_value=None)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must have inserted into embedding_metadata
+    assert any(
+        "embedding_metadata" in sql and "INSERT" in sql for sql in executed_sql
+    ), f"Expected INSERT into embedding_metadata on fresh install; got: {executed_sql}"
+    # Must NOT have dropped code_embeddings (nothing to drop on fresh install)
+    assert not any(
+        "DROP TABLE" in sql and "code_embeddings" in sql for sql in executed_sql
+    ), f"Expected no DROP on fresh install; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_migration_clears_existing_embeddings_without_metadata(mock_pool):
+    """Migration boundary: if embedding_metadata is empty but code_embeddings
+    already exists (old deployment), treat as drift and clear the corpus so
+    the next indexing run regenerates embeddings with the configured model."""
+    backend = PostgresWriteBackend(
+        dsn="postgresql://test/test",
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
+    backend._pool = mock_pool
+
+    conn = AsyncMock()
+    conn.execute = AsyncMock(return_value="OK")
+    # fetchrow returns None (metadata empty) — but code_embeddings exists
+    conn.fetchrow = AsyncMock(return_value=None)
+    # fetchval returns a truthy value for the to_regclass check on code_embeddings
+    # This simulates an existing deployment with populated embeddings
+    conn.fetchval = AsyncMock(return_value="public.code_embeddings")
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.initialize_schema()
+
+    executed_sql = [call.args[0] for call in conn.execute.call_args_list]
+    # Must have dropped code_embeddings (migration drift)
+    assert any(
+        "DROP TABLE" in sql and "code_embeddings" in sql for sql in executed_sql
+    ), f"Expected DROP on migration; got: {executed_sql}"
+    # Must have cleared File content hashes
+    assert any(
+        "content_hash = NULL" in sql for sql in executed_sql
+    ), f"Expected content_hash clear on migration; got: {executed_sql}"
+    # Must have inserted baseline metadata
+    assert any(
+        "embedding_metadata" in sql and "INSERT" in sql for sql in executed_sql
+    ), f"Expected INSERT into embedding_metadata on migration; got: {executed_sql}"
 
 
 @pytest.mark.asyncio

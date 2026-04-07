@@ -61,7 +61,11 @@ async def write_backend(postgres_dsn):
     Initializes the schema and cleans up any leftover test repositories at
     the start of each test.
     """
-    backend = PostgresWriteBackend(dsn=postgres_dsn, embedding_dimensions=1536)
+    backend = PostgresWriteBackend(
+        dsn=postgres_dsn,
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
     await backend.connect()
     await backend.initialize_schema()
     # Defensive: clean up any repos from a prior failed test
@@ -392,7 +396,11 @@ async def test_fresh_deployment_can_list_repositories_without_indexing(postgres_
     """On a truly fresh Postgres DB (no indexing run yet), a backend that
     calls initialize_schema() before list_repositories() must return an
     empty list, not raise UndefinedTableError."""
-    backend = PostgresWriteBackend(dsn=postgres_dsn, embedding_dimensions=1536)
+    backend = PostgresWriteBackend(
+        dsn=postgres_dsn,
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
     try:
         await backend.connect()
         # Drop any tables left over from previous tests in this session so
@@ -455,3 +463,73 @@ async def test_delete_repository_removes_entities(write_backend):
     # Repository row should also be gone
     repo = await write_backend.get_repository("test-repo-delete")
     assert repo is None
+
+
+async def test_model_drift_drops_embeddings_and_clears_hashes(postgres_dsn):
+    """Switching embedding model (same dimension) must drop code_embeddings
+    and clear File.content_hash so the next indexing run regenerates
+    embeddings with the new model."""
+    # Fresh backend with model A
+    backend_a = PostgresWriteBackend(
+        dsn=postgres_dsn,
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-3-small",
+    )
+    try:
+        await backend_a.connect()
+        # Drop any leftover state from previous tests
+        pool = backend_a._require_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("DROP TABLE IF EXISTS code_embeddings CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_references CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_symbols CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS code_repos CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS embedding_metadata CASCADE")
+
+        await backend_a.initialize_schema()
+
+        # Seed a File entity with a content_hash so we can verify it gets cleared
+        file_entity = CodeEntity(
+            id="model-drift-test::src/foo.py",
+            name="foo.py",
+            entity_type=EntityType.FILE,
+            repository="model-drift-test",
+            file_path="src/foo.py",
+            line_number=1,
+            language="python",
+            content_hash="original-hash",
+        )
+        await backend_a.apply_indexing_changes(
+            repository="model-drift-test",
+            source="/tmp/test",
+            commit_sha=None,
+            reindex_preparations=[("src/foo.py", {file_entity.id})],
+            entities=[file_entity],
+            relationships=[],
+            stale_file_paths=[],
+        )
+        # Confirm the hash was stored
+        hashes = await backend_a.get_file_hashes("model-drift-test")
+        assert hashes.get("src/foo.py") == "original-hash"
+    finally:
+        await backend_a.close()
+
+    # New backend with model B — same dim, different model
+    backend_b = PostgresWriteBackend(
+        dsn=postgres_dsn,
+        embedding_dimensions=1536,
+        embedding_model="text-embedding-ada-002",
+    )
+    try:
+        await backend_b.connect()
+        await backend_b.initialize_schema()  # should detect drift, drop embeddings, clear hashes
+
+        # The file's content_hash should now be NULL
+        hashes_after = await backend_b.get_file_hashes("model-drift-test")
+        assert "src/foo.py" not in hashes_after, \
+            f"Expected content_hash cleared after model drift; got: {hashes_after}"
+
+        # Cleanup
+        await backend_b.delete_repository("model-drift-test")
+    finally:
+        await backend_b.close()

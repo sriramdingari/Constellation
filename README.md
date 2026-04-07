@@ -167,7 +167,11 @@ celery -A constellation.worker.celery_app worker --loglevel=info
 Notes:
 - `asyncpg` and `pgvector` are already in `requirements.txt`, so no extra install is needed.
 - The schema is created on the first API request OR the first indexing run (whichever comes first), via `initialize_schema()`. A fresh Postgres deployment can serve `GET /repositories` immediately without requiring an indexing job to run first.
-- Switching embedding providers later (e.g., OpenAI 1536 → Ollama 768) is handled automatically: the backend detects the dimension change and triggers a full re-embed on the next indexing run.
+- Switching embedding corpus later is handled automatically for both:
+  - **Dimension changes** (e.g., OpenAI 1536 → Ollama 768): the backend detects the new dimension and drops the old embeddings.
+  - **Model changes at the same dimension** (e.g., `text-embedding-3-small` → `text-embedding-ada-002`, both 1536-dim): the backend tracks the active model name in an `embedding_metadata` table and detects any change.
+
+  Either case triggers a drop of `code_embeddings`, a clear of stored File content hashes, and a full re-embed on the next indexing run.
 
 ## Quick Start
 

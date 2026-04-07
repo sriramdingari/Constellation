@@ -16,6 +16,7 @@ def create_write_backend(settings: Settings) -> WriteBackend:
         return PostgresWriteBackend(
             dsn=settings.postgres_dsn,
             embedding_dimensions=settings.resolved_embedding_dimensions(),
+            embedding_model=settings.resolved_embedding_model(),
         )
     elif settings.storage_backend == "neo4j":
         from constellation.graph.neo4j import Neo4jWriteBackend
