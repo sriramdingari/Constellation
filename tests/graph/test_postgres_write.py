@@ -100,62 +100,121 @@ async def test_delete_repository_deletes_symbols_then_repo(backend, mock_pool):
 
 
 @pytest.mark.asyncio
-async def test_upsert_relationships_skips_when_endpoint_missing(backend):
-    """Edges to non-existent symbols must be silently skipped, not abort the txn."""
-    # Mock conn.execute to return "INSERT 0 0" (no row inserted because EXISTS check failed)
+async def test_upsert_entities_batches_with_executemany(backend):
+    """_upsert_entities must use a single executemany call, not N per-row calls."""
     conn = AsyncMock()
-    conn.execute = AsyncMock(return_value="INSERT 0 0")
+    # Pre-count existing: mock returns 1 existing row (repo::A)
+    conn.fetch = AsyncMock(return_value=[{"id": "repo::A"}])
+    conn.executemany = AsyncMock(return_value=None)
+    conn.fetchval = AsyncMock()
+    conn.execute = AsyncMock()
 
-    rel = CodeRelationship(
-        source_id="repo::missing.source",
-        target_id="repo::missing.target",
-        relationship_type=RelationshipType.EXTENDS,
+    e1 = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.CLASS,
+        repository="repo", file_path="a.py", line_number=1, language="python",
     )
-    created = await backend._upsert_relationships(conn, [rel])
-
-    # Edge was skipped, but no exception raised
-    assert created == 0
-    # Verify the SQL contains specific EXISTS guards on both endpoints
-    sql = conn.execute.call_args[0][0]
-    assert "WHERE EXISTS (SELECT 1 FROM code_symbols WHERE id = $1)" in sql
-    assert "AND EXISTS (SELECT 1 FROM code_symbols WHERE id = $2)" in sql
-
-
-@pytest.mark.asyncio
-async def test_upsert_relationships_counts_inserted_when_endpoints_exist(backend):
-    """When both endpoints exist, the row is inserted and counted as created."""
-    conn = AsyncMock()
-    conn.execute = AsyncMock(return_value="INSERT 0 1")
-
-    rel = CodeRelationship(
-        source_id="repo::A",
-        target_id="repo::B",
-        relationship_type=RelationshipType.CALLS,
+    e2 = CodeEntity(
+        id="repo::B", name="B", entity_type=EntityType.CLASS,
+        repository="repo", file_path="b.py", line_number=1, language="python",
     )
-    created = await backend._upsert_relationships(conn, [rel])
+    created = await backend._upsert_entities(conn, [e1, e2])
 
+    # Only one new entity (repo::B) — repo::A was in the pre-count result
     assert created == 1
 
+    # Must have called executemany exactly once with both rows
+    assert conn.executemany.call_count == 1
+    rows_arg = conn.executemany.call_args[0][1]
+    assert len(rows_arg) == 2
+
+    # Must NOT have made per-row execute calls for the upsert
+    assert conn.execute.call_count == 0
+
 
 @pytest.mark.asyncio
-async def test_upsert_relationships_does_not_count_double_digit_results(backend):
-    """Defensive: 'INSERT 0 11' must NOT be counted as one creation.
-
-    The change from endswith('1') to endswith(' 1') is what enables this distinction.
-    """
+async def test_upsert_entities_counts_new_entities_via_prefetch(backend):
+    """_upsert_entities must compute `created` via pre-fetch, not row xmax."""
     conn = AsyncMock()
-    conn.execute = AsyncMock(return_value="INSERT 0 11")
+    # Pre-fetch returns one existing ID
+    conn.fetch = AsyncMock(return_value=[{"id": "repo::A"}])
+    conn.executemany = AsyncMock(return_value=None)
 
-    rel = CodeRelationship(
-        source_id="repo::A",
-        target_id="repo::B",
-        relationship_type=RelationshipType.CALLS,
+    e1 = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.CLASS,
+        repository="repo", file_path="a.py", line_number=1, language="python",
     )
-    created = await backend._upsert_relationships(conn, [rel])
+    e2 = CodeEntity(
+        id="repo::B", name="B", entity_type=EntityType.CLASS,
+        repository="repo", file_path="b.py", line_number=1, language="python",
+    )
+    created = await backend._upsert_entities(conn, [e1, e2])
 
-    # Per-row inserts should never return "INSERT 0 11", but if they did,
-    # the endswith(' 1') check correctly rejects it.
+    # repo::B is new, repo::A already existed → created == 1
+    assert created == 1
+
+    # Verify the pre-fetch queried the correct column/table
+    assert conn.fetch.call_count == 1
+    fetch_sql = conn.fetch.call_args[0][0]
+    assert "SELECT id FROM code_symbols" in fetch_sql
+    assert "id = ANY" in fetch_sql
+
+
+@pytest.mark.asyncio
+async def test_upsert_relationships_batches_with_executemany(backend):
+    """_upsert_relationships must batch all rows in a single executemany."""
+    conn = AsyncMock()
+    conn.executemany = AsyncMock(return_value=None)
+    # Pre-count returns 2 for both before and after (so created = 0)
+    conn.fetchval = AsyncMock(return_value=2)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock()
+
+    rels = [
+        CodeRelationship(
+            source_id="repo::A",
+            target_id="repo::B",
+            relationship_type=RelationshipType.CALLS,
+        ),
+        CodeRelationship(
+            source_id="repo::C",
+            target_id="repo::D",
+            relationship_type=RelationshipType.EXTENDS,
+        ),
+    ]
+    created = await backend._upsert_relationships(conn, rels)
+
+    # Before=2, after=2 → created=0
     assert created == 0
+
+    assert conn.executemany.call_count == 1
+    rows_arg = conn.executemany.call_args[0][1]
+    assert len(rows_arg) == 2
+    assert conn.execute.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_upsert_embeddings_batches_with_executemany(backend):
+    """_upsert_embeddings must batch all rows in a single executemany."""
+    conn = AsyncMock()
+    conn.executemany = AsyncMock(return_value=None)
+    conn.execute = AsyncMock()
+
+    e1 = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.METHOD,
+        repository="repo", file_path="a.py", line_number=1, language="python",
+        embedding=[0.1] * 1536, content_hash="h1",
+    )
+    e2 = CodeEntity(
+        id="repo::B", name="B", entity_type=EntityType.CLASS,
+        repository="repo", file_path="b.py", line_number=1, language="python",
+        embedding=[0.2] * 1536, content_hash="h2",
+    )
+    await backend._upsert_embeddings(conn, [e1, e2])
+
+    assert conn.executemany.call_count == 1
+    rows_arg = conn.executemany.call_args[0][1]
+    assert len(rows_arg) == 2
+    assert conn.execute.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -252,30 +311,6 @@ async def test_orphan_package_cleanup_loops_until_stable(backend, mock_pool):
 
 
 @pytest.mark.asyncio
-async def test_upsert_entities_uses_returning_xmax_for_create_count(backend):
-    """Reinserting an existing entity must NOT count as 'created'."""
-    conn = AsyncMock()
-    # Simulate: first call returns inserted=True (new row), second returns False (update)
-    conn.fetchval = AsyncMock(side_effect=[True, False])
-    conn.execute = AsyncMock(return_value="INSERT 0 1")
-
-    e1 = CodeEntity(
-        id="repo::A", name="A", entity_type=EntityType.CLASS,
-        repository="repo", file_path="a.py", line_number=1, language="python",
-    )
-    e2 = CodeEntity(
-        id="repo::B", name="B", entity_type=EntityType.CLASS,
-        repository="repo", file_path="b.py", line_number=1, language="python",
-    )
-    created = await backend._upsert_entities(conn, [e1, e2])
-    assert created == 1, f"Expected 1 true insert, got {created}"
-    # Verify the SQL uses RETURNING (xmax = 0) — fail loudly if implementation drifts
-    sql = conn.fetchval.call_args_list[0].args[0]
-    assert "RETURNING" in sql
-    assert "xmax = 0" in sql or "xmax=0" in sql
-
-
-@pytest.mark.asyncio
 async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_pool):
     """If existing code_embeddings already has the right dim, do not drop."""
     backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
@@ -354,3 +389,29 @@ async def test_initialize_schema_does_not_clear_hashes_when_dimensions_match(moc
     # Must NOT have issued the content_hash clear
     assert not any("content_hash = NULL" in s for s in executed_sql), \
         f"Expected no UPDATE content_hash = NULL when dimensions match; got: {executed_sql}"
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_deduplicates_input_by_id(backend):
+    """Duplicate entity IDs in the input must not overcount `created`."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])  # nothing exists yet
+    conn.executemany = AsyncMock(return_value=None)
+
+    e1 = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.CLASS,
+        repository="repo", file_path="a.py", line_number=1, language="python",
+    )
+    # Same ID appears twice
+    e1_dup = CodeEntity(
+        id="repo::A", name="A", entity_type=EntityType.CLASS,
+        repository="repo", file_path="a.py", line_number=2, language="python",
+    )
+    created = await backend._upsert_entities(conn, [e1, e1_dup])
+
+    # Only one unique ID, so created must be 1 (not 2)
+    assert created == 1
+
+    # executemany should receive exactly 1 row (last-writer-wins dedup)
+    rows_arg = conn.executemany.call_args[0][1]
+    assert len(rows_arg) == 1

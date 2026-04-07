@@ -354,79 +354,132 @@ class PostgresWriteBackend(WriteBackend):
     async def _upsert_entities(self, conn: asyncpg.Connection, entities: list[CodeEntity]) -> int:
         if not entities:
             return 0
-        created = 0
-        for entity in entities:
-            # RETURNING (xmax = 0) AS inserted: xmax is 0 only on a true INSERT.
-            # On UPDATE (i.e. ON CONFLICT fired), xmax is the txn id, so this
-            # returns False. This gives us an exact "newly created" count
-            # matching Neo4j's MERGE ON CREATE semantics.
-            inserted = await conn.fetchval("""
-                INSERT INTO code_symbols (
-                    id, repository, file_path, symbol_name, symbol_type,
-                    language, line_start, line_end, signature, code,
-                    docstring, return_type, modifiers, stereotypes,
-                    properties, content_hash
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
-                ON CONFLICT (id) DO UPDATE SET
-                    file_path    = EXCLUDED.file_path,
-                    symbol_name  = EXCLUDED.symbol_name,
-                    symbol_type  = EXCLUDED.symbol_type,
-                    language     = EXCLUDED.language,
-                    line_start   = EXCLUDED.line_start,
-                    line_end     = EXCLUDED.line_end,
-                    signature    = EXCLUDED.signature,
-                    code         = EXCLUDED.code,
-                    docstring    = EXCLUDED.docstring,
-                    return_type  = EXCLUDED.return_type,
-                    modifiers    = EXCLUDED.modifiers,
-                    stereotypes  = EXCLUDED.stereotypes,
-                    properties   = EXCLUDED.properties,
-                    content_hash = EXCLUDED.content_hash,
-                    updated_at   = now()
-                RETURNING (xmax = 0) AS inserted
-            """,
-                entity.id, entity.repository, entity.file_path, entity.name,
-                entity.entity_type.value, entity.language,
-                entity.line_number, entity.line_end,
-                entity.signature, entity.code, entity.docstring, entity.return_type,
-                entity.modifiers or [], entity.stereotypes or [],
-                json.dumps(entity.properties or {}), entity.content_hash,
+
+        # Deduplicate by id (last-writer-wins) before counting and batching.
+        # The pipeline shouldn't emit duplicates, but defensive dedup keeps
+        # `created` accurate and makes the upsert idempotent against accidental
+        # duplicates in the input list.
+        deduped: dict[str, CodeEntity] = {}
+        for e in entities:
+            deduped[e.id] = e
+        unique_entities = list(deduped.values())
+
+        # Pre-fetch: which of these IDs already exist? Used to compute the
+        # accurate `created` count (len(unique) - len(existing_ids)), since
+        # executemany does not preserve RETURNING output reliably.
+        entity_ids = list(deduped.keys())
+        existing_rows = await conn.fetch(
+            "SELECT id FROM code_symbols WHERE id = ANY($1)",
+            entity_ids,
+        )
+        existing_ids = {r["id"] for r in existing_rows}
+        created = len(unique_entities) - len(existing_ids)
+
+        # Batch upsert via executemany — pipelined into a single network write,
+        # avoiding N separate round-trips. asyncpg uses the extended query
+        # protocol (BIND+EXECUTE per row) but pipelines all rows together.
+        await conn.executemany("""
+            INSERT INTO code_symbols (
+                id, repository, file_path, symbol_name, symbol_type,
+                language, line_start, line_end, signature, code,
+                docstring, return_type, modifiers, stereotypes,
+                properties, content_hash
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16)
+            ON CONFLICT (id) DO UPDATE SET
+                file_path    = EXCLUDED.file_path,
+                symbol_name  = EXCLUDED.symbol_name,
+                symbol_type  = EXCLUDED.symbol_type,
+                language     = EXCLUDED.language,
+                line_start   = EXCLUDED.line_start,
+                line_end     = EXCLUDED.line_end,
+                signature    = EXCLUDED.signature,
+                code         = EXCLUDED.code,
+                docstring    = EXCLUDED.docstring,
+                return_type  = EXCLUDED.return_type,
+                modifiers    = EXCLUDED.modifiers,
+                stereotypes  = EXCLUDED.stereotypes,
+                properties   = EXCLUDED.properties,
+                content_hash = EXCLUDED.content_hash,
+                updated_at   = now()
+        """, [
+            (
+                e.id, e.repository, e.file_path, e.name,
+                e.entity_type.value, e.language,
+                e.line_number, e.line_end,
+                e.signature, e.code, e.docstring, e.return_type,
+                e.modifiers or [], e.stereotypes or [],
+                json.dumps(e.properties or {}), e.content_hash,
             )
-            if inserted:
-                created += 1
+            for e in unique_entities
+        ])
+
         return created
 
     async def _upsert_relationships(self, conn: asyncpg.Connection, relationships: list[CodeRelationship]) -> int:
         if not relationships:
             return 0
-        created = 0
-        for rel in relationships:
-            # Use INSERT ... SELECT ... WHERE EXISTS to silently skip edges
-            # whose endpoints are not in code_symbols. This mirrors Neo4j's
-            # MATCH (source) MATCH (target) MERGE behavior — unresolved targets
-            # (e.g. Java external superclasses, C# external::Base types,
-            # deleted-file references) are dropped, not raised.
-            result = await conn.execute("""
-                INSERT INTO code_references (source_symbol_id, target_symbol_id, ref_type, properties)
-                SELECT $1, $2, $3, $4::jsonb
-                WHERE EXISTS (SELECT 1 FROM code_symbols WHERE id = $1)
-                  AND EXISTS (SELECT 1 FROM code_symbols WHERE id = $2)
-                ON CONFLICT (source_symbol_id, target_symbol_id, ref_type) DO NOTHING
-            """, rel.source_id, rel.target_id, rel.relationship_type.value, json.dumps(rel.properties or {}))
-            if result.endswith(" 1"):
-                created += 1
-        return created
+
+        # Deduplicate by (source, target, ref_type) — the table's UNIQUE
+        # constraint means duplicates can't coexist anyway, so dedup upfront
+        # keeps the before/after count arithmetic accurate.
+        deduped: dict[tuple[str, str, str], CodeRelationship] = {}
+        for r in relationships:
+            key = (r.source_id, r.target_id, r.relationship_type.value)
+            deduped[key] = r
+        unique_rels = list(deduped.values())
+
+        # Pre-count existing edges so we can report an accurate `created` count.
+        # executemany doesn't preserve RETURNING output, so we compute it by
+        # counting existing rows before the insert and subtracting from after.
+        sources = [r.source_id for r in unique_rels]
+        targets = [r.target_id for r in unique_rels]
+        ref_types = [r.relationship_type.value for r in unique_rels]
+
+        before_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM code_references
+            WHERE (source_symbol_id, target_symbol_id, ref_type) IN (
+                SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+            )
+        """, sources, targets, ref_types)
+
+        # Batch upsert with EXISTS guards. Pipelined into a single write.
+        # INSERT...SELECT...WHERE EXISTS silently skips edges whose endpoints
+        # aren't in code_symbols (mirrors Neo4j's MATCH...MATCH...MERGE — Java
+        # external superclasses, C# external::Base types, deleted-file refs
+        # all drop silently instead of aborting the transaction).
+        await conn.executemany("""
+            INSERT INTO code_references (source_symbol_id, target_symbol_id, ref_type, properties)
+            SELECT $1, $2, $3, $4::jsonb
+            WHERE EXISTS (SELECT 1 FROM code_symbols WHERE id = $1)
+              AND EXISTS (SELECT 1 FROM code_symbols WHERE id = $2)
+            ON CONFLICT (source_symbol_id, target_symbol_id, ref_type) DO NOTHING
+        """, [
+            (r.source_id, r.target_id, r.relationship_type.value, json.dumps(r.properties or {}))
+            for r in unique_rels
+        ])
+
+        after_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM code_references
+            WHERE (source_symbol_id, target_symbol_id, ref_type) IN (
+                SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+            )
+        """, sources, targets, ref_types)
+        return after_count - before_count
 
     async def _upsert_embeddings(self, conn: asyncpg.Connection, entities: list[CodeEntity]) -> None:
         embeddable = [e for e in entities if e.entity_type in _EMBEDDABLE_TYPES and e.embedding]
-        for entity in embeddable:
-            await conn.execute("""
-                INSERT INTO code_embeddings (symbol_id, embedding, content_hash)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (symbol_id) DO UPDATE SET
-                    embedding    = EXCLUDED.embedding,
-                    content_hash = EXCLUDED.content_hash
-            """, entity.id, entity.embedding, entity.content_hash)
+        if not embeddable:
+            return
+        await conn.executemany("""
+            INSERT INTO code_embeddings (symbol_id, embedding, content_hash)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (symbol_id) DO UPDATE SET
+                embedding    = EXCLUDED.embedding,
+                content_hash = EXCLUDED.content_hash
+        """, [
+            (e.id, e.embedding, e.content_hash)
+            for e in embeddable
+        ])
 
     # ── Stats ────────────────────────────────────────────────────────────
 
