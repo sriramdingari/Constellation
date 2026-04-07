@@ -270,21 +270,29 @@ class PostgresWriteBackend(WriteBackend):
                 # 5. Upsert embeddings for embeddable entities
                 await self._upsert_embeddings(conn, entities)
 
-                # 6. Cleanup orphan packages — preserve parents with child packages
-                await conn.execute("""
-                    DELETE FROM code_symbols
-                    WHERE repository = $1 AND symbol_type = 'Package'
-                    AND id NOT IN (
-                        SELECT DISTINCT target_symbol_id FROM code_references
-                        WHERE ref_type = 'IN_PACKAGE' AND target_symbol_id IS NOT NULL
-                    )
-                    AND NOT EXISTS (
-                        SELECT 1 FROM code_symbols child
-                        WHERE child.repository = $1
-                        AND child.symbol_type = 'Package'
-                        AND child.id LIKE code_symbols.id || '.%'
-                    )
-                """, repository)
+                # 6. Cleanup orphan packages — loop until stable.
+                # Nested namespaces (e.g. C# SampleApp.Services.Auth) require
+                # multiple passes: leaf must be deleted before its parent
+                # becomes orphan-eligible. Mirrors Neo4j's _cleanup_orphan_packages_with_runner.
+                while True:
+                    result = await conn.execute("""
+                        DELETE FROM code_symbols
+                        WHERE repository = $1 AND symbol_type = 'Package'
+                        AND id NOT IN (
+                            SELECT DISTINCT target_symbol_id FROM code_references
+                            WHERE ref_type = 'IN_PACKAGE' AND target_symbol_id IS NOT NULL
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM code_symbols child
+                            WHERE child.repository = $1
+                            AND child.symbol_type = 'Package'
+                            AND child.id LIKE code_symbols.id || '.%'
+                        )
+                    """, repository)
+                    # asyncpg returns "DELETE N"; parse the count
+                    deleted = int(result.split()[-1]) if result.startswith("DELETE") else 0
+                    if deleted == 0:
+                        break
 
                 # 7. Upsert repository metadata
                 total = await conn.fetchval(

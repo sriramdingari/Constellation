@@ -193,6 +193,54 @@ async def test_initialize_schema_drops_embeddings_when_dimensions_change(mock_po
 
 
 @pytest.mark.asyncio
+async def test_orphan_package_cleanup_loops_until_stable(backend, mock_pool):
+    """Orphan package cleanup must repeat until no more rows are deleted."""
+    # With empty stale_file_paths, reindex_preparations, entities, relationships:
+    # the only conn.execute() calls in apply_indexing_changes are:
+    #   - The orphan cleanup loop (N passes until DELETE 0)
+    #   - The final repo metadata upsert (INSERT 0 1)
+    # No fetch/fetchval calls fire either because all input lists are empty.
+    conn = AsyncMock()
+    conn.execute = AsyncMock(side_effect=[
+        # orphan cleanup pass 1: deletes 2 leaf packages
+        "DELETE 2",
+        # orphan cleanup pass 2: deletes 1 parent now exposed
+        "DELETE 1",
+        # orphan cleanup pass 3: nothing more, loop terminates
+        "DELETE 0",
+        # final repository metadata upsert
+        "INSERT 0 1",
+    ])
+    conn.fetchval = AsyncMock(return_value=0)
+    tx_cm = AsyncMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_cm)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    await backend.apply_indexing_changes(
+        repository="test",
+        source="/tmp/test",
+        commit_sha=None,
+        reindex_preparations=[],
+        entities=[],
+        relationships=[],
+        stale_file_paths=[],
+    )
+
+    # Count how many DELETE calls targeted code_symbols WHERE symbol_type = 'Package'
+    package_cleanups = [
+        call for call in conn.execute.call_args_list
+        if "code_symbols" in call.args[0] and "symbol_type = 'Package'" in call.args[0]
+    ]
+    # Must have looped at least 3 times (2 deletions, 1 deletion, 0 deletions)
+    assert len(package_cleanups) >= 3, f"Expected ≥3 cleanup passes, got {len(package_cleanups)}"
+
+
+@pytest.mark.asyncio
 async def test_initialize_schema_keeps_embeddings_when_dimensions_match(mock_pool):
     """If existing code_embeddings already has the right dim, do not drop."""
     backend = PostgresWriteBackend(dsn="postgresql://test/test", embedding_dimensions=1536)
