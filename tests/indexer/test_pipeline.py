@@ -1599,6 +1599,66 @@ class TestPostgresSpoolPath:
         )
         assert mock_graph_client.apply_spooled_indexing_changes.called
 
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_workers_use_injected_registry(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """Threaded workers must use the injected registry, not built-in only."""
+        from constellation.parsers.registry import ParserRegistry
+        from constellation.parsers.base import BaseParser, ParseResult
+
+        class FooParser(BaseParser):
+            language = "foo"
+            file_extensions = [".foo"]
+            def parse_file(self, file_path, repo_name):
+                return ParseResult(
+                    file_path=str(file_path),
+                    language="foo",
+                    entities=[CodeEntity(
+                        id=f"{repo_name}::{file_path.name}#Foo",
+                        name="Foo",
+                        entity_type=EntityType.CLASS,
+                        repository=repo_name,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="foo",
+                    )],
+                    relationships=[],
+                )
+
+        custom_registry = ParserRegistry()
+        custom_registry.register(FooParser())
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=custom_registry,
+            settings=settings,
+        )
+        (tmp_path / "test.foo").write_text("foo content", encoding="utf-8")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(2, 0, 2))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            result = await pipeline.run(source=str(tmp_path))
+
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        from constellation.indexer.spool import load_run_manifest, SpoolChunkPaths, load_chunk_preparation
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices, "Expected at least one non-empty chunk"
+        chunk = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, manifest.chunk_indices[0]))
+        entity_names = {e.name for e in chunk.entities}
+        assert "Foo" in entity_names, (
+            f"FooParser entity not found — worker used built-in registry. Entities: {entity_names}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # create_fresh_registry
@@ -1616,6 +1676,33 @@ def test_create_fresh_registry_returns_distinct_parser_instances():
 
     assert parser_a is not parser_b
     assert type(parser_a) is type(parser_b)
+
+
+# ---------------------------------------------------------------------------
+# ParserRegistry.clone
+# ---------------------------------------------------------------------------
+
+def test_parser_registry_clone_preserves_custom_extensions():
+    from constellation.parsers.registry import ParserRegistry
+    from constellation.parsers.base import BaseParser, ParseResult
+
+    class FooParser(BaseParser):
+        language = "foo"
+        file_extensions = [".foo"]
+        def parse_file(self, file_path, repo_name):
+            return ParseResult(file_path=str(file_path), language="foo", entities=[], relationships=[])
+
+    registry = ParserRegistry()
+    registry.register(FooParser())
+
+    cloned = registry.clone()
+    original_parser = registry.get_parser_for_file(Path("test.foo"))
+    cloned_parser = cloned.get_parser_for_file(Path("test.foo"))
+
+    assert original_parser is not None
+    assert cloned_parser is not None
+    assert type(original_parser) is type(cloned_parser)
+    assert original_parser is not cloned_parser
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ from constellation.indexer.spool import (
     write_run_manifest,
 )
 from constellation.parsers.base import ParseResult
-from constellation.parsers.registry import ParserRegistry, create_fresh_registry
+from constellation.parsers.registry import ParserRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -742,7 +742,7 @@ class IndexingPipeline:
         Intended to be submitted to a :class:`~concurrent.futures.ThreadPoolExecutor`.
         Returns ``(chunk_index, chunk, files_delta, chunk_errors)``.
         """
-        worker_registry = create_fresh_registry()
+        worker_registry = self._registry.clone()
         chunk, files_delta, chunk_errors = self._prepare_chunk_parse_only(
             repo_name=repo_name,
             chunk_index=chunk_index,
