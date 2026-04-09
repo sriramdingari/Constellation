@@ -548,6 +548,116 @@ class IndexingPipeline:
         )
         return chunk, files_processed
 
+    def _prepare_chunk_parse_only(
+        self,
+        *,
+        repo_name: str,
+        chunk_index: int,
+        chunk_plans: list[tuple[Path, str, str, bool]],
+        needs_relationship_refresh: bool,
+        parser_registry: ParserRegistry,
+    ) -> tuple[ChunkPreparation, int, list[str]]:
+        """Synchronous parse/normalize for a single chunk — no embedding, no progress, no spool.
+
+        This method is safe to call from a :class:`~concurrent.futures.ThreadPoolExecutor`
+        worker because it only touches the provided *parser_registry* (not
+        ``self._registry``) and the thread-safe static ``_normalize_parse_result``.
+
+        Returns ``(ChunkPreparation, files_processed_delta, errors)``.
+        """
+        entities_to_upsert: list[CodeEntity] = []
+        all_relationships: list[CodeRelationship] = []
+        files_requiring_reindex_prep: list[tuple[str, set[str]]] = []
+        chunk_files: list[tuple[str, str, bool]] = []
+        files_processed = 0
+        errors: list[str] = []
+
+        for fpath, relative_path, file_hash, needs_reindex in chunk_plans:
+            if not needs_relationship_refresh and not needs_reindex:
+                continue
+
+            parser = parser_registry.get_parser_for_file(fpath)
+            file_entity_id = f"{repo_name}::{relative_path}"
+
+            if parser is None:
+                if needs_reindex:
+                    file_entity = CodeEntity(
+                        id=file_entity_id,
+                        name=fpath.name,
+                        entity_type=EntityType.FILE,
+                        repository=repo_name,
+                        file_path=relative_path,
+                        line_number=1,
+                        language=fpath.suffix.lstrip(".") or "unknown",
+                        content_hash=file_hash,
+                    )
+                    entities_to_upsert.append(file_entity)
+                    files_requiring_reindex_prep.append(
+                        (relative_path, {file_entity_id})
+                    )
+                    chunk_files.append((relative_path, file_hash, needs_reindex))
+                    files_processed += 1
+                continue
+
+            try:
+                parse_result: ParseResult = parser.parse_file(fpath, repo_name)
+            except Exception as exc:
+                err_msg = f"Exception parsing {fpath}: {exc}"
+                logger.error(err_msg)
+                errors.append(err_msg)
+                if needs_reindex:
+                    files_processed += 1
+                continue
+
+            if parse_result.errors:
+                for pe in parse_result.errors:
+                    err_msg = f"Parse error in {fpath}: {pe}"
+                    logger.warning(err_msg)
+                    errors.append(err_msg)
+                if needs_reindex:
+                    files_processed += 1
+                continue
+
+            normalized_entities, normalized_relationships = self._normalize_parse_result(
+                parse_result=parse_result,
+                relative_path=relative_path,
+                file_entity_id=file_entity_id,
+                language=parser.language,
+            )
+            all_relationships.extend(normalized_relationships)
+
+            if needs_reindex:
+                file_entity = CodeEntity(
+                    id=file_entity_id,
+                    name=fpath.name,
+                    entity_type=EntityType.FILE,
+                    repository=repo_name,
+                    file_path=relative_path,
+                    line_number=1,
+                    language=parser.language,
+                    content_hash=file_hash,
+                )
+                entities_to_upsert.append(file_entity)
+                entities_to_upsert.extend(normalized_entities)
+                files_requiring_reindex_prep.append(
+                    (
+                        relative_path,
+                        {file_entity_id}
+                        | {entity.id for entity in normalized_entities},
+                    )
+                )
+                chunk_files.append((relative_path, file_hash, needs_reindex))
+                files_processed += 1
+
+        chunk = ChunkPreparation(
+            chunk_index=chunk_index,
+            files=chunk_files,
+            reindex_preparations=files_requiring_reindex_prep,
+            entities=entities_to_upsert,
+            relationships=all_relationships,
+        )
+        return chunk, files_processed, errors
+
     @staticmethod
     def _relative_file_path(root: Path, file_path: Path) -> str:
         """Return a repository-relative path for stable file identity."""

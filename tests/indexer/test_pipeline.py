@@ -1365,6 +1365,42 @@ class TestPostgresSpoolPath:
                 f"No-op run should produce no chunk files; got indices: {manifest.chunk_indices}"
             )
 
+    def test_prepare_chunk_parse_only_returns_entities_relationships_without_embedding(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+
+        chunk, files_delta, errors = pipeline._prepare_chunk_parse_only(
+            repo_name="repo",
+            chunk_index=1,
+            chunk_plans=[(tmp_path / "a.py", "a.py", "hash-a", True)],
+            needs_relationship_refresh=True,
+            parser_registry=create_fresh_registry(),
+        )
+
+        assert {e.id for e in chunk.entities} == {"repo::a.py", "repo::a.py#A"}
+        assert [
+            (r.source_id, r.target_id, r.relationship_type)
+            for r in chunk.relationships
+        ] == [("repo::a.py", "repo::a.py#A", RelationshipType.CONTAINS)]
+        assert chunk.chunk_index == 1
+        assert files_delta == 1
+        assert errors == []
+        assert mock_embedding_provider.embed_batch.await_count == 0
+
 
 # ---------------------------------------------------------------------------
 # create_fresh_registry
