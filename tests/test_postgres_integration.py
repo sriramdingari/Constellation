@@ -8,8 +8,18 @@ import os
 import pytest
 import pytest_asyncio
 
+from pathlib import Path
+
 from constellation.config import Settings
 from constellation.graph.postgres import PostgresWriteBackend
+from constellation.indexer.spool import (
+    ChunkPreparation,
+    RunManifest,
+    SpoolChunkPaths,
+    create_spool_dir,
+    write_chunk_preparation,
+    write_run_manifest,
+)
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 
 # Try to import testcontainers; if Docker or the library is unavailable, skip
@@ -70,7 +80,8 @@ async def write_backend(postgres_dsn):
     await backend.initialize_schema()
     # Defensive: clean up any repos from a prior failed test
     for name in ["test-repo", "test-repo-delete", "stable-reindex-test",
-                 "orphan-reindex-test", "stale-rel-test", "file-hashes-test"]:
+                 "orphan-reindex-test", "stale-rel-test", "file-hashes-test",
+                 "chunked-repo"]:
         try:
             await backend.delete_repository(name)
         except Exception:
@@ -463,6 +474,80 @@ async def test_delete_repository_removes_entities(write_backend):
     # Repository row should also be gone
     repo = await write_backend.get_repository("test-repo-delete")
     assert repo is None
+
+
+async def test_apply_spooled_indexing_changes_persists_multi_chunk_run(write_backend, tmp_path: Path):
+    """Replay a 2-chunk spool against a real pgvector instance and verify
+    both file entities are persisted and retrievable via get_file_hashes."""
+    await write_backend.delete_repository("chunked-repo")
+
+    spool_dir = create_spool_dir(tmp_path, "run-int")
+    write_run_manifest(
+        spool_dir / "run_manifest.json",
+        RunManifest(
+            run_id="run-int",
+            repository="chunked-repo",
+            source="/tmp/chunked",
+            commit_sha="abc123",
+            stale_file_paths=[],
+            chunk_indices=[1, 2],
+            files_total=2,
+            files_processed=2,
+            files_skipped=0,
+        ),
+    )
+
+    chunk1 = ChunkPreparation(
+        chunk_index=1,
+        files=[("src/a.py", "ha", True)],
+        reindex_preparations=[("src/a.py", {"chunked-repo::src/a.py"})],
+        entities=[
+            CodeEntity(
+                id="chunked-repo::src/a.py",
+                name="a.py",
+                entity_type=EntityType.FILE,
+                repository="chunked-repo",
+                file_path="src/a.py",
+                line_number=1,
+                language="python",
+                content_hash="ha",
+            )
+        ],
+        relationships=[],
+    )
+    chunk2 = ChunkPreparation(
+        chunk_index=2,
+        files=[("src/b.py", "hb", True)],
+        reindex_preparations=[("src/b.py", {"chunked-repo::src/b.py"})],
+        entities=[
+            CodeEntity(
+                id="chunked-repo::src/b.py",
+                name="b.py",
+                entity_type=EntityType.FILE,
+                repository="chunked-repo",
+                file_path="src/b.py",
+                line_number=1,
+                language="python",
+                content_hash="hb",
+            )
+        ],
+        relationships=[],
+    )
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1), chunk1)
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 2), chunk2)
+
+    entities_created, rels_created, total = await write_backend.apply_spooled_indexing_changes(
+        spool_dir=spool_dir
+    )
+
+    assert entities_created == 2
+    assert rels_created == 0
+    assert total >= 2
+    hashes = await write_backend.get_file_hashes("chunked-repo")
+    assert hashes == {
+        "src/a.py": "ha",
+        "src/b.py": "hb",
+    }
 
 
 async def test_model_drift_drops_embeddings_and_clears_hashes(postgres_dsn):
