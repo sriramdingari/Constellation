@@ -201,36 +201,51 @@ class IndexingPipeline:
                     chunk_size = max(1, self._settings.files_per_chunk)
 
                     if self._settings.indexing_worker_threads > 1:
-                        # -- Threaded path: parse in workers, finalize in order --
+                        # -- Threaded path with backpressure --
                         loop = asyncio.get_running_loop()
-                        executor = ThreadPoolExecutor(
-                            max_workers=self._settings.indexing_worker_threads,
-                        )
+                        max_workers = self._settings.indexing_worker_threads
+                        executor = ThreadPoolExecutor(max_workers=max_workers)
                         try:
-                            wrapped_futures: list[asyncio.Future] = []
-
-                            for chunk_index, chunk_plans in enumerate(
+                            all_chunk_plans = list(enumerate(
                                 self._chunk_file_plans(file_plans, chunk_size),
                                 start=1,
-                            ):
-                                cfut = executor.submit(
-                                    self._run_chunk_worker,
-                                    repo_name,
-                                    chunk_index,
-                                    chunk_plans,
-                                    needs_relationship_refresh,
-                                )
-                                wrapped_futures.append(
-                                    asyncio.wrap_future(cfut, loop=loop)
-                                )
+                            ))
 
                             completed: dict[int, tuple[ChunkPreparation, int, list[str]]] = {}
                             next_chunk_to_finalize = 1
+                            submitted: list[asyncio.Future] = []
+                            submit_idx = 0
+                            max_in_flight = max_workers + 1
 
-                            for afut in asyncio.as_completed(wrapped_futures):
-                                chunk_index_key, chunk, files_delta, chunk_errors = await afut
-                                completed[chunk_index_key] = (chunk, files_delta, chunk_errors)
+                            while submit_idx < len(all_chunk_plans) or submitted:
+                                # Submit up to max_in_flight
+                                while (
+                                    submit_idx < len(all_chunk_plans)
+                                    and len(submitted) < max_in_flight
+                                ):
+                                    chunk_index, chunk_plans_item = all_chunk_plans[submit_idx]
+                                    cfut = executor.submit(
+                                        self._run_chunk_worker,
+                                        repo_name,
+                                        chunk_index,
+                                        chunk_plans_item,
+                                        needs_relationship_refresh,
+                                    )
+                                    submitted.append(asyncio.wrap_future(cfut, loop=loop))
+                                    submit_idx += 1
 
+                                # Wait for the next completion
+                                if submitted:
+                                    done, _ = await asyncio.wait(
+                                        submitted,
+                                        return_when=asyncio.FIRST_COMPLETED,
+                                    )
+                                    for fut in done:
+                                        submitted.remove(fut)
+                                        ci, chunk, fd, ce = fut.result()
+                                        completed[ci] = (chunk, fd, ce)
+
+                                # Finalize in order
                                 while next_chunk_to_finalize in completed:
                                     chunk, files_delta, chunk_errors = completed.pop(
                                         next_chunk_to_finalize

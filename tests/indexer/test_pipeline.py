@@ -1543,6 +1543,62 @@ class TestPostgresSpoolPath:
 
         assert not mock_executor.called
 
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_backpressure_limits_in_flight_chunks(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """With 2 worker threads, at most 2 workers should be active
+        concurrently. The bounded submit-wait-finalize loop must not
+        submit all chunks up front."""
+        from constellation.parsers.registry import create_fresh_registry
+        import threading
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        for i in range(5):
+            _create_py_file(tmp_path, f"f{i}.py", f"class C{i}: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(10, 0, 10)
+        )
+
+        max_concurrent = {"value": 0}
+        current_concurrent = {"value": 0}
+        lock = threading.Lock()
+
+        original_worker = pipeline._run_chunk_worker
+
+        def counting_worker(*args):
+            with lock:
+                current_concurrent["value"] += 1
+                if current_concurrent["value"] > max_concurrent["value"]:
+                    max_concurrent["value"] = current_concurrent["value"]
+            try:
+                return original_worker(*args)
+            finally:
+                with lock:
+                    current_concurrent["value"] -= 1
+
+        with patch.object(pipeline, "_run_chunk_worker", side_effect=counting_worker), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        assert max_concurrent["value"] <= 2, (
+            f"Expected at most 2 concurrent workers; saw {max_concurrent['value']}"
+        )
+        assert mock_graph_client.apply_spooled_indexing_changes.called
+
 
 # ---------------------------------------------------------------------------
 # create_fresh_registry
