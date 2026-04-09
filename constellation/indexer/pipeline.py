@@ -6,9 +6,11 @@ into a single end-to-end indexing workflow.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -35,7 +37,7 @@ from constellation.indexer.spool import (
     write_run_manifest,
 )
 from constellation.parsers.base import ParseResult
-from constellation.parsers.registry import ParserRegistry
+from constellation.parsers.registry import ParserRegistry, create_fresh_registry
 
 logger = logging.getLogger(__name__)
 
@@ -197,31 +199,86 @@ class IndexingPipeline:
                 entities_found_so_far = 0
                 try:
                     chunk_size = max(1, self._settings.files_per_chunk)
-                    for chunk_index, chunk_plans in enumerate(
-                        self._chunk_file_plans(file_plans, chunk_size),
-                        start=1,
-                    ):
-                        chunk, files_processed = await self._prepare_chunk(
-                            repo_name=repo_name,
-                            source_path=source_path,
-                            chunk_index=chunk_index,
-                            chunk_plans=chunk_plans,
-                            needs_relationship_refresh=needs_relationship_refresh,
-                            progress_callback=progress_callback,
-                            files_total=files_total,
-                            files_processed=files_processed,
-                            errors=errors,
-                            entities_found_offset=entities_found_so_far,
+
+                    if self._settings.indexing_worker_threads > 1:
+                        # -- Threaded path: parse in workers, finalize in order --
+                        loop = asyncio.get_running_loop()
+                        executor = ThreadPoolExecutor(
+                            max_workers=self._settings.indexing_worker_threads,
                         )
-                        entities_found_so_far += len(chunk.entities)
+                        try:
+                            wrapped_futures: list[asyncio.Future] = []
 
-                        # Skip empty chunks — no entities and no relationships
-                        if not chunk.entities and not chunk.relationships:
-                            continue
+                            for chunk_index, chunk_plans in enumerate(
+                                self._chunk_file_plans(file_plans, chunk_size),
+                                start=1,
+                            ):
+                                cfut = executor.submit(
+                                    self._run_chunk_worker,
+                                    repo_name,
+                                    chunk_index,
+                                    chunk_plans,
+                                    needs_relationship_refresh,
+                                )
+                                wrapped_futures.append(
+                                    asyncio.wrap_future(cfut, loop=loop)
+                                )
 
-                        chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
-                        write_chunk_preparation(chunk_paths, chunk)
-                        chunk_indices.append(chunk_index)
+                            completed: dict[int, tuple[ChunkPreparation, int, list[str]]] = {}
+                            next_chunk_to_finalize = 1
+
+                            for afut in asyncio.as_completed(wrapped_futures):
+                                chunk_index_key, chunk, files_delta, chunk_errors = await afut
+                                completed[chunk_index_key] = (chunk, files_delta, chunk_errors)
+
+                                while next_chunk_to_finalize in completed:
+                                    chunk, files_delta, chunk_errors = completed.pop(
+                                        next_chunk_to_finalize
+                                    )
+                                    files_processed += files_delta
+                                    errors.extend(chunk_errors)
+                                    entities_found_so_far += len(chunk.entities)
+                                    if progress_callback:
+                                        progress_callback(
+                                            files_total,
+                                            files_processed,
+                                            entities_found_so_far,
+                                        )
+                                    await self._finalize_prepared_chunk(
+                                        spool_dir=spool_dir, chunk=chunk
+                                    )
+                                    if chunk.entities or chunk.relationships:
+                                        chunk_indices.append(chunk.chunk_index)
+                                    next_chunk_to_finalize += 1
+                        finally:
+                            executor.shutdown(wait=True, cancel_futures=True)
+                    else:
+                        # -- Serial path (threads <= 1) --
+                        for chunk_index, chunk_plans in enumerate(
+                            self._chunk_file_plans(file_plans, chunk_size),
+                            start=1,
+                        ):
+                            chunk, files_processed = await self._prepare_chunk(
+                                repo_name=repo_name,
+                                source_path=source_path,
+                                chunk_index=chunk_index,
+                                chunk_plans=chunk_plans,
+                                needs_relationship_refresh=needs_relationship_refresh,
+                                progress_callback=progress_callback,
+                                files_total=files_total,
+                                files_processed=files_processed,
+                                errors=errors,
+                                entities_found_offset=entities_found_so_far,
+                            )
+                            entities_found_so_far += len(chunk.entities)
+
+                            # Skip empty chunks — no entities and no relationships
+                            if not chunk.entities and not chunk.relationships:
+                                continue
+
+                            chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
+                            write_chunk_preparation(chunk_paths, chunk)
+                            chunk_indices.append(chunk_index)
 
                     write_run_manifest(
                         spool_dir / "run_manifest.json",
@@ -657,6 +714,28 @@ class IndexingPipeline:
             relationships=all_relationships,
         )
         return chunk, files_processed, errors
+
+    def _run_chunk_worker(
+        self,
+        repo_name: str,
+        chunk_index: int,
+        chunk_plans: list[tuple[Path, str, str, bool]],
+        needs_relationship_refresh: bool,
+    ) -> tuple[int, ChunkPreparation, int, list[str]]:
+        """Thread-safe wrapper that runs parse-only preparation with a fresh registry.
+
+        Intended to be submitted to a :class:`~concurrent.futures.ThreadPoolExecutor`.
+        Returns ``(chunk_index, chunk, files_delta, chunk_errors)``.
+        """
+        worker_registry = create_fresh_registry()
+        chunk, files_delta, chunk_errors = self._prepare_chunk_parse_only(
+            repo_name=repo_name,
+            chunk_index=chunk_index,
+            chunk_plans=chunk_plans,
+            needs_relationship_refresh=needs_relationship_refresh,
+            parser_registry=worker_registry,
+        )
+        return chunk_index, chunk, files_delta, chunk_errors
 
     @staticmethod
     def _relative_file_path(root: Path, file_path: Path) -> str:

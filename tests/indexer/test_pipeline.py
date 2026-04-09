@@ -1401,6 +1401,49 @@ class TestPostgresSpoolPath:
         assert errors == []
         assert mock_embedding_provider.embed_batch.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_preparation_writes_chunks_in_index_order(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import load_run_manifest
+        from constellation.parsers.registry import create_fresh_registry
+        import time
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+
+        original = pipeline._run_chunk_worker
+
+        def delayed_worker(*args):
+            if args[1] == 1:  # chunk_index 1 is delayed
+                time.sleep(0.05)
+            return original(*args)
+
+        with patch.object(pipeline, "_run_chunk_worker", side_effect=delayed_worker), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices == [1, 2]
+
 
 # ---------------------------------------------------------------------------
 # create_fresh_registry
