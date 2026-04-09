@@ -23,6 +23,7 @@ def _make_settings(**overrides) -> Settings:
         embedding_batch_size=8,
         entity_batch_size=100,
         openai_api_key="test-key",
+        storage_backend="neo4j",
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -1181,3 +1182,50 @@ class TestCloneCleanupOnError:
                 pass  # Expected
 
         mock_cleanup.assert_called_once_with(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Postgres spool path
+# ---------------------------------------------------------------------------
+
+
+class TestPostgresSpoolPath:
+    @pytest.mark.asyncio
+    async def test_pipeline_spools_multiple_chunks_for_postgres(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """Postgres backend: file plans chunked, spooled, and replayed atomically."""
+        from constellation.indexer.spool import load_run_manifest
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            entity_batch_size=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir") as mock_spool_cleanup:
+            result = await pipeline.run(source=str(tmp_path))
+
+        assert result.files_total == 2
+        assert result.files_processed == 2
+        assert mock_graph_client.apply_spooled_indexing_changes.called
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
+            "spool_dir"
+        ]
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices == [1, 2]
+        mock_spool_cleanup.assert_called_once_with(spool_dir)

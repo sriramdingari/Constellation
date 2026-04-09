@@ -7,6 +7,8 @@ into a single end-to-end indexing workflow.
 from __future__ import annotations
 
 import logging
+import tempfile
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -23,6 +25,15 @@ from constellation.indexer.collector import (
     DEFAULT_EXCLUSIONS,
 )
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
+from constellation.indexer.spool import (
+    ChunkPreparation,
+    RunManifest,
+    SpoolChunkPaths,
+    cleanup_spool_dir,
+    create_spool_dir,
+    write_chunk_preparation,
+    write_run_manifest,
+)
 from constellation.parsers.base import ParseResult
 from constellation.parsers.registry import ParserRegistry
 
@@ -171,23 +182,142 @@ class IndexingPipeline:
             )
 
             # ----------------------------------------------------------
-            # 6. Parse files and collect entities/relationships
+            # 6. Parse, embed, and store — branching on backend
             # ----------------------------------------------------------
-            entities_to_upsert: list[CodeEntity] = []
-            all_relationships: list[CodeRelationship] = []
             errors: list[str] = []
             files_processed = 0
-            files_examined = 0
-            files_requiring_reindex_prep: list[tuple[str, set[str]]] = []
 
-            for fpath, relative_path, file_hash, needs_reindex in file_plans:
-                if not needs_relationship_refresh and not needs_reindex:
-                    continue
+            if self._settings.storage_backend == "postgres":
+                # ---- Spool + replay path (Postgres) ----
+                run_id = uuid.uuid4().hex
+                spool_root = Path(tempfile.gettempdir()) / "constellation-index"
+                spool_root.mkdir(parents=True, exist_ok=True)
+                spool_dir = create_spool_dir(spool_root, run_id)
+                chunk_indices: list[int] = []
+                try:
+                    chunk_size = max(1, self._settings.entity_batch_size)
+                    for chunk_index, chunk_plans in enumerate(
+                        self._chunk_file_plans(file_plans, chunk_size),
+                        start=1,
+                    ):
+                        chunk, files_processed = await self._prepare_chunk(
+                            repo_name=repo_name,
+                            source_path=source_path,
+                            chunk_index=chunk_index,
+                            chunk_plans=chunk_plans,
+                            needs_relationship_refresh=needs_relationship_refresh,
+                            progress_callback=progress_callback,
+                            files_total=files_total,
+                            files_processed=files_processed,
+                            errors=errors,
+                        )
+                        chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
+                        write_chunk_preparation(chunk_paths, chunk)
+                        chunk_indices.append(chunk_index)
 
-                parser = self._registry.get_parser_for_file(fpath)
-                file_entity_id = f"{repo_name}::{relative_path}"
+                    write_run_manifest(
+                        spool_dir / "run_manifest.json",
+                        RunManifest(
+                            run_id=run_id,
+                            repository=repo_name,
+                            source=source,
+                            commit_sha=commit_sha,
+                            stale_file_paths=stale_paths,
+                            chunk_indices=chunk_indices,
+                            files_total=files_total,
+                            files_processed=files_processed,
+                            files_skipped=files_skipped,
+                        ),
+                    )
 
-                if parser is None:
+                    entities_created, relationships_created, _ = (
+                        await self._graph.apply_spooled_indexing_changes(
+                            spool_dir=spool_dir,
+                        )
+                    )
+                finally:
+                    cleanup_spool_dir(spool_dir)
+            else:
+                # ---- Original in-memory path (Neo4j and fallback) ----
+                entities_to_upsert: list[CodeEntity] = []
+                all_relationships: list[CodeRelationship] = []
+                files_examined = 0
+                files_requiring_reindex_prep: list[tuple[str, set[str]]] = []
+
+                for fpath, relative_path, file_hash, needs_reindex in file_plans:
+                    if not needs_relationship_refresh and not needs_reindex:
+                        continue
+
+                    parser = self._registry.get_parser_for_file(fpath)
+                    file_entity_id = f"{repo_name}::{relative_path}"
+
+                    if parser is None:
+                        if needs_reindex:
+                            file_entity = CodeEntity(
+                                id=file_entity_id,
+                                name=fpath.name,
+                                entity_type=EntityType.FILE,
+                                repository=repo_name,
+                                file_path=relative_path,
+                                line_number=1,
+                                language=fpath.suffix.lstrip(".") or "unknown",
+                                content_hash=file_hash,
+                            )
+                            entities_to_upsert.append(file_entity)
+                            files_requiring_reindex_prep.append(
+                                (relative_path, {file_entity_id})
+                            )
+                            files_processed += 1
+                        files_examined += 1
+                        if progress_callback:
+                            progress_callback(
+                                files_total,
+                                files_processed,
+                                len(entities_to_upsert),
+                            )
+                        continue
+
+                    try:
+                        parse_result: ParseResult = parser.parse_file(fpath, repo_name)
+                    except Exception as exc:
+                        err_msg = f"Exception parsing {fpath}: {exc}"
+                        logger.error(err_msg)
+                        errors.append(err_msg)
+                        if needs_reindex:
+                            files_processed += 1
+                        files_examined += 1
+                        if progress_callback:
+                            progress_callback(
+                                files_total,
+                                files_processed,
+                                len(entities_to_upsert),
+                            )
+                        continue
+
+                    if parse_result.errors:
+                        for pe in parse_result.errors:
+                            err_msg = f"Parse error in {fpath}: {pe}"
+                            logger.warning(err_msg)
+                            errors.append(err_msg)
+                        if needs_reindex:
+                            files_processed += 1
+                        files_examined += 1
+                        if progress_callback:
+                            progress_callback(
+                                files_total,
+                                files_processed,
+                                len(entities_to_upsert),
+                            )
+                        continue
+
+                    normalized_entities, normalized_relationships = self._normalize_parse_result(
+                        parse_result=parse_result,
+                        relative_path=relative_path,
+                        file_entity_id=file_entity_id,
+                        language=parser.language,
+                    )
+                    all_relationships.extend(normalized_relationships)
+
                     if needs_reindex:
                         file_entity = CodeEntity(
                             id=file_entity_id,
@@ -196,116 +326,50 @@ class IndexingPipeline:
                             repository=repo_name,
                             file_path=relative_path,
                             line_number=1,
-                            language=fpath.suffix.lstrip(".") or "unknown",
+                            language=parser.language,
                             content_hash=file_hash,
                         )
                         entities_to_upsert.append(file_entity)
+                        entities_to_upsert.extend(normalized_entities)
                         files_requiring_reindex_prep.append(
-                            (relative_path, {file_entity_id})
+                            (
+                                relative_path,
+                                {file_entity_id}
+                                | {entity.id for entity in normalized_entities},
+                            )
                         )
                         files_processed += 1
                     files_examined += 1
+
                     if progress_callback:
                         progress_callback(
                             files_total,
                             files_processed,
                             len(entities_to_upsert),
                         )
-                    continue
 
+                # ----------------------------------------------------------
+                # 7. Embed entities
+                # ----------------------------------------------------------
                 try:
-                    parse_result: ParseResult = parser.parse_file(fpath, repo_name)
+                    await self._embed_entities(entities_to_upsert)
                 except Exception as exc:
-                    err_msg = f"Exception parsing {fpath}: {exc}"
+                    err_msg = f"Embedding failed: {exc}"
                     logger.error(err_msg)
                     errors.append(err_msg)
-                    if needs_reindex:
-                        files_processed += 1
-                    files_examined += 1
-                    if progress_callback:
-                        progress_callback(
-                            files_total,
-                            files_processed,
-                            len(entities_to_upsert),
-                        )
-                    continue
 
-                if parse_result.errors:
-                    for pe in parse_result.errors:
-                        err_msg = f"Parse error in {fpath}: {pe}"
-                        logger.warning(err_msg)
-                        errors.append(err_msg)
-                    if needs_reindex:
-                        files_processed += 1
-                    files_examined += 1
-                    if progress_callback:
-                        progress_callback(
-                            files_total,
-                            files_processed,
-                            len(entities_to_upsert),
-                        )
-                    continue
-
-                normalized_entities, normalized_relationships = self._normalize_parse_result(
-                    parse_result=parse_result,
-                    relative_path=relative_path,
-                    file_entity_id=file_entity_id,
-                    language=parser.language,
+                # ----------------------------------------------------------
+                # 8. Apply graph changes atomically
+                # ----------------------------------------------------------
+                entities_created, relationships_created, _ = await self._graph.apply_indexing_changes(
+                    repository=repo_name,
+                    source=source,
+                    commit_sha=commit_sha,
+                    reindex_preparations=files_requiring_reindex_prep,
+                    entities=entities_to_upsert,
+                    relationships=all_relationships,
+                    stale_file_paths=stale_paths,
                 )
-                all_relationships.extend(normalized_relationships)
-
-                if needs_reindex:
-                    file_entity = CodeEntity(
-                        id=file_entity_id,
-                        name=fpath.name,
-                        entity_type=EntityType.FILE,
-                        repository=repo_name,
-                        file_path=relative_path,
-                        line_number=1,
-                        language=parser.language,
-                        content_hash=file_hash,
-                    )
-                    entities_to_upsert.append(file_entity)
-                    entities_to_upsert.extend(normalized_entities)
-                    files_requiring_reindex_prep.append(
-                        (
-                            relative_path,
-                            {file_entity_id}
-                            | {entity.id for entity in normalized_entities},
-                        )
-                    )
-                    files_processed += 1
-                files_examined += 1
-
-                if progress_callback:
-                    progress_callback(
-                        files_total,
-                        files_processed,
-                        len(entities_to_upsert),
-                    )
-
-            # ----------------------------------------------------------
-            # 7. Embed entities
-            # ----------------------------------------------------------
-            try:
-                await self._embed_entities(entities_to_upsert)
-            except Exception as exc:
-                err_msg = f"Embedding failed: {exc}"
-                logger.error(err_msg)
-                errors.append(err_msg)
-
-            # ----------------------------------------------------------
-            # 8. Apply graph changes atomically
-            # ----------------------------------------------------------
-            entities_created, relationships_created, _ = await self._graph.apply_indexing_changes(
-                repository=repo_name,
-                source=source,
-                commit_sha=commit_sha,
-                reindex_preparations=files_requiring_reindex_prep,
-                entities=entities_to_upsert,
-                relationships=all_relationships,
-                stale_file_paths=stale_paths,
-            )
 
             return IndexingResult(
                 repository=repo_name,
@@ -322,6 +386,158 @@ class IndexingPipeline:
             # ----------------------------------------------------------
             if cloned_path is not None:
                 cleanup_clone(cloned_path)
+
+    @staticmethod
+    def _chunk_file_plans(
+        file_plans: list[tuple[Path, str, str, bool]],
+        chunk_size: int,
+    ) -> list[list[tuple[Path, str, str, bool]]]:
+        """Split file plans into chunks of at most *chunk_size*."""
+        return [
+            file_plans[i : i + chunk_size]
+            for i in range(0, len(file_plans), chunk_size)
+        ]
+
+    async def _prepare_chunk(
+        self,
+        *,
+        repo_name: str,
+        source_path: Path,
+        chunk_index: int,
+        chunk_plans: list[tuple[Path, str, str, bool]],
+        needs_relationship_refresh: bool,
+        progress_callback: Callable | None,
+        files_total: int,
+        files_processed: int,
+        errors: list[str],
+    ) -> tuple[ChunkPreparation, int]:
+        """Parse/normalize/embed a single chunk of file plans.
+
+        Returns ``(ChunkPreparation, updated_files_processed)``.
+        """
+        entities_to_upsert: list[CodeEntity] = []
+        all_relationships: list[CodeRelationship] = []
+        files_requiring_reindex_prep: list[tuple[str, set[str]]] = []
+        chunk_files: list[tuple[str, str, bool]] = []
+
+        for fpath, relative_path, file_hash, needs_reindex in chunk_plans:
+            if not needs_relationship_refresh and not needs_reindex:
+                continue
+
+            parser = self._registry.get_parser_for_file(fpath)
+            file_entity_id = f"{repo_name}::{relative_path}"
+
+            if parser is None:
+                if needs_reindex:
+                    file_entity = CodeEntity(
+                        id=file_entity_id,
+                        name=fpath.name,
+                        entity_type=EntityType.FILE,
+                        repository=repo_name,
+                        file_path=relative_path,
+                        line_number=1,
+                        language=fpath.suffix.lstrip(".") or "unknown",
+                        content_hash=file_hash,
+                    )
+                    entities_to_upsert.append(file_entity)
+                    files_requiring_reindex_prep.append(
+                        (relative_path, {file_entity_id})
+                    )
+                    chunk_files.append((relative_path, file_hash, needs_reindex))
+                    files_processed += 1
+                if progress_callback:
+                    progress_callback(
+                        files_total,
+                        files_processed,
+                        len(entities_to_upsert),
+                    )
+                continue
+
+            try:
+                parse_result: ParseResult = parser.parse_file(fpath, repo_name)
+            except Exception as exc:
+                err_msg = f"Exception parsing {fpath}: {exc}"
+                logger.error(err_msg)
+                errors.append(err_msg)
+                if needs_reindex:
+                    files_processed += 1
+                if progress_callback:
+                    progress_callback(
+                        files_total,
+                        files_processed,
+                        len(entities_to_upsert),
+                    )
+                continue
+
+            if parse_result.errors:
+                for pe in parse_result.errors:
+                    err_msg = f"Parse error in {fpath}: {pe}"
+                    logger.warning(err_msg)
+                    errors.append(err_msg)
+                if needs_reindex:
+                    files_processed += 1
+                if progress_callback:
+                    progress_callback(
+                        files_total,
+                        files_processed,
+                        len(entities_to_upsert),
+                    )
+                continue
+
+            normalized_entities, normalized_relationships = self._normalize_parse_result(
+                parse_result=parse_result,
+                relative_path=relative_path,
+                file_entity_id=file_entity_id,
+                language=parser.language,
+            )
+            all_relationships.extend(normalized_relationships)
+
+            if needs_reindex:
+                file_entity = CodeEntity(
+                    id=file_entity_id,
+                    name=fpath.name,
+                    entity_type=EntityType.FILE,
+                    repository=repo_name,
+                    file_path=relative_path,
+                    line_number=1,
+                    language=parser.language,
+                    content_hash=file_hash,
+                )
+                entities_to_upsert.append(file_entity)
+                entities_to_upsert.extend(normalized_entities)
+                files_requiring_reindex_prep.append(
+                    (
+                        relative_path,
+                        {file_entity_id}
+                        | {entity.id for entity in normalized_entities},
+                    )
+                )
+                chunk_files.append((relative_path, file_hash, needs_reindex))
+                files_processed += 1
+
+            if progress_callback:
+                progress_callback(
+                    files_total,
+                    files_processed,
+                    len(entities_to_upsert),
+                )
+
+        # Embed within the chunk
+        try:
+            await self._embed_entities(entities_to_upsert)
+        except Exception as exc:
+            err_msg = f"Embedding failed: {exc}"
+            logger.error(err_msg)
+            errors.append(err_msg)
+
+        chunk = ChunkPreparation(
+            chunk_index=chunk_index,
+            files=chunk_files,
+            reindex_preparations=files_requiring_reindex_prep,
+            entities=entities_to_upsert,
+            relationships=all_relationships,
+        )
+        return chunk, files_processed
 
     @staticmethod
     def _relative_file_path(root: Path, file_path: Path) -> str:
