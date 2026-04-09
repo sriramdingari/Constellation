@@ -444,9 +444,14 @@ class PostgresWriteBackend(WriteBackend):
                         repository, manifest.stale_file_paths,
                     )
 
-                # 2. Process each chunk sequentially from spool files.
+                # 2. Pass 1: reindex prep + entities + embeddings for ALL chunks.
+                #    Relationships are accumulated and upserted in pass 2 so that
+                #    cross-chunk edges (e.g. chunk 1 CALLS an entity in chunk 2)
+                #    are not silently dropped by _upsert_relationships' WHERE EXISTS
+                #    guards before the target entity has been created.
                 entities_created = 0
-                rels_created = 0
+                all_chunk_relationships: list[CodeRelationship] = []
+
                 for chunk_index in manifest.chunk_indices:
                     paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
                     chunk = load_chunk_preparation(paths)
@@ -476,13 +481,16 @@ class PostgresWriteBackend(WriteBackend):
                     # 2b. Upsert entities
                     entities_created += await self._upsert_entities(conn, chunk.entities)
 
-                    # 2c. Upsert relationships
-                    rels_created += await self._upsert_relationships(conn, chunk.relationships)
-
-                    # 2d. Upsert embeddings
+                    # 2c. Upsert embeddings (no cross-chunk dependency)
                     await self._upsert_embeddings(conn, chunk.entities)
 
-                # 3. Cleanup orphan packages — loop until stable.
+                    # 2d. Accumulate relationships for pass 2
+                    all_chunk_relationships.extend(chunk.relationships)
+
+                # 3. Pass 2: upsert ALL relationships (all entities now exist)
+                rels_created = await self._upsert_relationships(conn, all_chunk_relationships)
+
+                # 4. Cleanup orphan packages — loop until stable.
                 while True:
                     result = await conn.execute("""
                         DELETE FROM code_symbols
@@ -502,7 +510,7 @@ class PostgresWriteBackend(WriteBackend):
                     if deleted == 0:
                         break
 
-                # 4. Upsert repository metadata
+                # 5. Upsert repository metadata
                 total = await conn.fetchval(
                     "SELECT COUNT(*) FROM code_symbols WHERE repository = $1", repository
                 )

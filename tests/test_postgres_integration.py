@@ -81,7 +81,7 @@ async def write_backend(postgres_dsn):
     # Defensive: clean up any repos from a prior failed test
     for name in ["test-repo", "test-repo-delete", "stable-reindex-test",
                  "orphan-reindex-test", "stale-rel-test", "file-hashes-test",
-                 "chunked-repo"]:
+                 "chunked-repo", "cross-repo"]:
         try:
             await backend.delete_repository(name)
         except Exception:
@@ -618,3 +618,124 @@ async def test_model_drift_drops_embeddings_and_clears_hashes(postgres_dsn):
         await backend_b.delete_repository("model-drift-test")
     finally:
         await backend_b.close()
+
+
+async def test_apply_spooled_cross_chunk_relationship_persists(write_backend, tmp_path: Path):
+    """Cross-chunk CALLS edge must survive the two-pass replay against a real DB.
+
+    Chunk 1 declares entities A.py + Method Foo AND a CALLS edge Foo -> Bar.
+    Chunk 2 introduces entities B.py + Method Bar.
+
+    Before the fix, relationships were upserted per-chunk so the WHERE EXISTS
+    guard in _upsert_relationships silently dropped the edge because Bar hadn't
+    been created yet. After the two-pass fix, all entities are upserted first,
+    then all relationships — so the edge persists.
+    """
+    await write_backend.delete_repository("cross-repo")
+
+    spool_dir = create_spool_dir(tmp_path, "run-cross-int")
+    write_run_manifest(
+        spool_dir / "run_manifest.json",
+        RunManifest(
+            run_id="run-cross-int",
+            repository="cross-repo",
+            source="/tmp/cross-repo",
+            commit_sha="cross123",
+            stale_file_paths=[],
+            chunk_indices=[1, 2],
+            files_total=2,
+            files_processed=2,
+            files_skipped=0,
+        ),
+    )
+
+    chunk1 = ChunkPreparation(
+        chunk_index=1,
+        files=[("a.py", "ha", True)],
+        reindex_preparations=[("a.py", {"cross-repo::a.py", "cross-repo::a.py::Foo"})],
+        entities=[
+            CodeEntity(
+                id="cross-repo::a.py",
+                name="a.py",
+                entity_type=EntityType.FILE,
+                repository="cross-repo",
+                file_path="a.py",
+                line_number=1,
+                language="python",
+                content_hash="ha",
+            ),
+            CodeEntity(
+                id="cross-repo::a.py::Foo",
+                name="Foo",
+                entity_type=EntityType.METHOD,
+                repository="cross-repo",
+                file_path="a.py",
+                line_number=5,
+                language="python",
+            ),
+        ],
+        relationships=[
+            CodeRelationship(
+                source_id="cross-repo::a.py::Foo",
+                target_id="cross-repo::b.py::Bar",
+                relationship_type=RelationshipType.CALLS,
+            ),
+        ],
+    )
+
+    chunk2 = ChunkPreparation(
+        chunk_index=2,
+        files=[("b.py", "hb", True)],
+        reindex_preparations=[("b.py", {"cross-repo::b.py", "cross-repo::b.py::Bar"})],
+        entities=[
+            CodeEntity(
+                id="cross-repo::b.py",
+                name="b.py",
+                entity_type=EntityType.FILE,
+                repository="cross-repo",
+                file_path="b.py",
+                line_number=1,
+                language="python",
+                content_hash="hb",
+            ),
+            CodeEntity(
+                id="cross-repo::b.py::Bar",
+                name="Bar",
+                entity_type=EntityType.METHOD,
+                repository="cross-repo",
+                file_path="b.py",
+                line_number=5,
+                language="python",
+            ),
+        ],
+        relationships=[],
+    )
+
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1), chunk1)
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 2), chunk2)
+
+    entities_created, rels_created, total = await write_backend.apply_spooled_indexing_changes(
+        spool_dir=spool_dir,
+    )
+
+    assert entities_created == 4, f"Expected 4 new entities (2 per chunk), got {entities_created}"
+    assert rels_created == 1, (
+        f"Cross-chunk CALLS edge (Foo -> Bar) must survive; got rels_created={rels_created}. "
+        "Before the two-pass fix, WHERE EXISTS silently dropped it."
+    )
+    assert total >= 4
+
+    # Verify the edge actually exists in code_references
+    pool = write_backend._require_pool()
+    edge_count = await pool.fetchval(
+        "SELECT COUNT(*) FROM code_references "
+        "WHERE source_symbol_id = $1 AND target_symbol_id = $2 AND ref_type = $3",
+        "cross-repo::a.py::Foo",
+        "cross-repo::b.py::Bar",
+        "CALLS",
+    )
+    assert edge_count == 1, (
+        f"Expected 1 CALLS edge in code_references, got {edge_count}"
+    )
+
+    await write_backend.delete_repository("cross-repo")

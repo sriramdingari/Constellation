@@ -812,3 +812,150 @@ async def test_apply_spooled_indexing_changes_rolls_back_on_chunk_failure(
         await backend.apply_spooled_indexing_changes(spool_dir=spool_dir)
 
     conn.transaction.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_apply_spooled_cross_chunk_relationships_are_preserved(
+    backend, mock_pool, tmp_path: Path,
+):
+    """Cross-chunk relationships must survive the replay.
+
+    Chunk 1 declares entities A.py + Method Foo AND a CALLS relationship
+    from Foo -> B.py#Bar.  Chunk 2 introduces entities B.py + Method Bar.
+
+    Before the fix, relationships were upserted per-chunk inside the loop,
+    so chunk 1's CALLS edge was attempted before chunk 2's entity existed —
+    the WHERE EXISTS guard silently dropped it.
+
+    After the fix (two-pass replay), all entities are upserted first, then
+    all relationships are upserted in a second pass.
+    """
+    conn = AsyncMock()
+    # Call sequence for two-pass replay:
+    #   Pass 1 (per chunk x2):
+    #     conn.fetch  -> [] (reindex prep: existing ids for file)
+    #     conn.fetch  -> [] (_upsert_entities: pre-fetch existing)
+    #     conn.executemany   (_upsert_entities: batch upsert)
+    #     conn.executemany   (_upsert_embeddings: no embeddable => not called)
+    #   Pass 2 (all relationships):
+    #     conn.fetchval -> 0 (_upsert_relationships: before_count)
+    #     conn.executemany   (_upsert_relationships: batch upsert)
+    #     conn.fetchval -> 1 (_upsert_relationships: after_count)
+    #   After all chunks:
+    #     conn.execute -> "DELETE 0"   (package cleanup, terminates loop)
+    #     conn.fetchval -> 6           (final entity count)
+    #     conn.execute -> "INSERT 0 1" (repo metadata upsert)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.executemany = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(side_effect=[
+        "DELETE 0",      # package cleanup loop — first pass, terminates
+        "INSERT 0 1",   # repo metadata upsert
+    ])
+    # fetchval call sequence:
+    #   1. _upsert_relationships before_count -> 0
+    #   2. _upsert_relationships after_count  -> 1 (one new edge)
+    #   3. final entity count                 -> 6
+    conn.fetchval = AsyncMock(side_effect=[0, 1, 6])
+    tx_cm = AsyncMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_cm)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    # --- Set up spool directory with manifest + 2 chunks ---
+    spool_dir = create_spool_dir(tmp_path, "run-cross")
+    manifest = RunManifest(
+        run_id="run-cross",
+        repository="cross-repo",
+        source="/tmp/cross-repo",
+        commit_sha="def456",
+        stale_file_paths=[],
+        chunk_indices=[1, 2],
+        files_total=2,
+        files_processed=2,
+        files_skipped=0,
+    )
+    write_run_manifest(spool_dir / "run_manifest.json", manifest)
+
+    # Chunk 1: entities A.py + Method Foo, plus a CALLS edge Foo -> Bar
+    # (Bar doesn't exist yet — it's in chunk 2)
+    chunk1 = ChunkPreparation(
+        chunk_index=1,
+        files=[("a.py", "ha", True)],
+        reindex_preparations=[("a.py", {"cross-repo::a.py", "cross-repo::a.py::Foo"})],
+        entities=[
+            CodeEntity(
+                id="cross-repo::a.py",
+                name="a.py",
+                entity_type=EntityType.FILE,
+                repository="cross-repo",
+                file_path="a.py",
+                line_number=1,
+                language="python",
+                content_hash="ha",
+            ),
+            CodeEntity(
+                id="cross-repo::a.py::Foo",
+                name="Foo",
+                entity_type=EntityType.METHOD,
+                repository="cross-repo",
+                file_path="a.py",
+                line_number=5,
+                language="python",
+            ),
+        ],
+        relationships=[
+            CodeRelationship(
+                source_id="cross-repo::a.py::Foo",
+                target_id="cross-repo::b.py::Bar",
+                relationship_type=RelationshipType.CALLS,
+            ),
+        ],
+    )
+
+    # Chunk 2: entities B.py + Method Bar (the target of the cross-chunk edge)
+    chunk2 = ChunkPreparation(
+        chunk_index=2,
+        files=[("b.py", "hb", True)],
+        reindex_preparations=[("b.py", {"cross-repo::b.py", "cross-repo::b.py::Bar"})],
+        entities=[
+            CodeEntity(
+                id="cross-repo::b.py",
+                name="b.py",
+                entity_type=EntityType.FILE,
+                repository="cross-repo",
+                file_path="b.py",
+                line_number=1,
+                language="python",
+                content_hash="hb",
+            ),
+            CodeEntity(
+                id="cross-repo::b.py::Bar",
+                name="Bar",
+                entity_type=EntityType.METHOD,
+                repository="cross-repo",
+                file_path="b.py",
+                line_number=5,
+                language="python",
+            ),
+        ],
+        relationships=[],
+    )
+
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1), chunk1)
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 2), chunk2)
+
+    entities_created, rels_created, total = await backend.apply_spooled_indexing_changes(
+        spool_dir=spool_dir,
+    )
+
+    # 4 new entities (2 per chunk), 1 cross-chunk CALLS edge
+    assert entities_created == 4
+    assert rels_created == 1, (
+        "Cross-chunk CALLS edge (Foo -> Bar) must survive; "
+        "before the two-pass fix it was silently dropped"
+    )
+    assert total == 6
