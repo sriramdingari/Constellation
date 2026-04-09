@@ -771,3 +771,44 @@ async def test_apply_spooled_indexing_changes_replays_multiple_chunks(
     assert total == 4
     # executemany called once per chunk (entity upsert), 2 chunks total
     assert conn.executemany.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_apply_spooled_indexing_changes_rolls_back_on_chunk_failure(
+    backend, mock_pool, tmp_path,
+):
+    """When replay raises inside the transaction, asyncpg rolls back."""
+    conn = AsyncMock()
+    conn.execute = AsyncMock(side_effect=RuntimeError("boom"))
+    conn.fetch = AsyncMock(return_value=[])
+    conn.fetchval = AsyncMock(return_value=0)
+    conn.executemany = AsyncMock(return_value=None)
+    tx_cm = AsyncMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_cm)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    spool_dir = create_spool_dir(tmp_path, "run-rollback")
+    write_run_manifest(
+        spool_dir / "run_manifest.json",
+        RunManifest(
+            run_id="run-rollback",
+            repository="repo",
+            source="/tmp/repo",
+            commit_sha=None,
+            stale_file_paths=["old.py"],
+            chunk_indices=[],
+            files_total=0,
+            files_processed=0,
+            files_skipped=0,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await backend.apply_spooled_indexing_changes(spool_dir=spool_dir)
+
+    conn.transaction.assert_called_once()

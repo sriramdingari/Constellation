@@ -1229,3 +1229,39 @@ class TestPostgresSpoolPath:
         manifest = load_run_manifest(spool_dir / "run_manifest.json")
         assert manifest.chunk_indices == [1, 2]
         mock_spool_cleanup.assert_called_once_with(spool_dir)
+
+    @pytest.mark.asyncio
+    async def test_pipeline_cleans_up_spool_dir_when_replay_fails(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """Spool directory is removed even when apply_spooled_indexing_changes raises."""
+        settings = _make_settings(
+            storage_backend="postgres",
+            entity_batch_size=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+
+        async def _boom(*, spool_dir):
+            raise RuntimeError(f"replay failed for {spool_dir}")
+
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(side_effect=_boom)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError):
+                await pipeline.run(source=str(tmp_path))
+
+        spool_dir = Path(
+            mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        )
+        assert not spool_dir.exists(), (
+            f"Spool dir should be cleaned up after replay failure; still exists: {spool_dir}"
+        )
