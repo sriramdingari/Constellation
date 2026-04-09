@@ -194,6 +194,7 @@ class IndexingPipeline:
                 spool_root.mkdir(parents=True, exist_ok=True)
                 spool_dir = create_spool_dir(spool_root, run_id)
                 chunk_indices: list[int] = []
+                entities_found_so_far = 0
                 try:
                     chunk_size = max(1, self._settings.entity_batch_size)
                     for chunk_index, chunk_plans in enumerate(
@@ -210,7 +211,9 @@ class IndexingPipeline:
                             files_total=files_total,
                             files_processed=files_processed,
                             errors=errors,
+                            entities_found_offset=entities_found_so_far,
                         )
+                        entities_found_so_far += len(chunk.entities)
                         chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
                         write_chunk_preparation(chunk_paths, chunk)
                         chunk_indices.append(chunk_index)
@@ -410,6 +413,7 @@ class IndexingPipeline:
         files_total: int,
         files_processed: int,
         errors: list[str],
+        entities_found_offset: int = 0,
     ) -> tuple[ChunkPreparation, int]:
         """Parse/normalize/embed a single chunk of file plans.
 
@@ -449,7 +453,7 @@ class IndexingPipeline:
                     progress_callback(
                         files_total,
                         files_processed,
-                        len(entities_to_upsert),
+                        entities_found_offset + len(entities_to_upsert),
                     )
                 continue
 
@@ -465,7 +469,7 @@ class IndexingPipeline:
                     progress_callback(
                         files_total,
                         files_processed,
-                        len(entities_to_upsert),
+                        entities_found_offset + len(entities_to_upsert),
                     )
                 continue
 
@@ -480,7 +484,7 @@ class IndexingPipeline:
                     progress_callback(
                         files_total,
                         files_processed,
-                        len(entities_to_upsert),
+                        entities_found_offset + len(entities_to_upsert),
                     )
                 continue
 
@@ -519,7 +523,7 @@ class IndexingPipeline:
                 progress_callback(
                     files_total,
                     files_processed,
-                    len(entities_to_upsert),
+                    entities_found_offset + len(entities_to_upsert),
                 )
 
         # Embed within the chunk

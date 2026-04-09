@@ -1265,3 +1265,55 @@ class TestPostgresSpoolPath:
         assert not spool_dir.exists(), (
             f"Spool dir should be cleaned up after replay failure; still exists: {spool_dir}"
         )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_progress_entities_found_is_cumulative(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """entities_found in progress callbacks must be cumulative across
+        chunks, not reset to 0 at each chunk boundary."""
+        settings = _make_settings(
+            storage_backend="postgres",
+            entity_batch_size=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 0, 4)
+        )
+
+        progress_reports: list[tuple[int, int, int]] = []
+
+        def capture_progress(files_total, files_processed, entities_found):
+            progress_reports.append((files_total, files_processed, entities_found))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path), progress_callback=capture_progress)
+
+        # entities_found (third element) must be monotonically non-decreasing
+        entities_found_values = [r[2] for r in progress_reports]
+        for i in range(1, len(entities_found_values)):
+            assert entities_found_values[i] >= entities_found_values[i - 1], (
+                f"entities_found went backward at step {i}: "
+                f"{entities_found_values[i - 1]} -> {entities_found_values[i]}. "
+                f"Full sequence: {entities_found_values}"
+            )
+        # With batch_size=1, each file is its own chunk.  Each chunk
+        # produces 2 entities (1 file + 1 class).  The final cumulative
+        # count must reflect ALL entities across both chunks (4 total),
+        # not just the last chunk's local count (2).
+        assert entities_found_values[-1] == 4, (
+            f"Expected final cumulative entities_found to be 4, "
+            f"got {entities_found_values[-1]}. "
+            f"Full sequence: {entities_found_values}"
+        )
