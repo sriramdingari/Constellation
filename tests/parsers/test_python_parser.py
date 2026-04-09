@@ -679,3 +679,180 @@ class TestLineNumbers:
         entity = _find_entity(sample_result, "process_data", EntityType.METHOD)
         assert entity.line_end is not None
         assert entity.line_end > entity.line_number
+
+
+def test_unresolved_cross_file_call_emits_reference_entity(tmp_path):
+    """Cross-file calls that cannot be resolved to same-file entities must
+    emit a Reference entity + CALLS edge. This matches the Java parser
+    (java.py:671-687) and prevents PostgresWriteBackend from silently
+    dropping the relationship via its EXISTS filter on target_symbol_id.
+    """
+    from constellation.parsers.python_parser import PythonParser
+    from constellation.models import EntityType, RelationshipType
+
+    src = tmp_path / "caller.py"
+    src.write_text(
+        "def health():\n"
+        "    settings = get_settings()\n"
+        "    return redis.from_url(settings.redis_url).ping()\n"
+    )
+
+    parser = PythonParser()
+    result = parser.parse_file(src, "test-repo")
+
+    # Every CALLS edge must point to an entity that exists in result.entities.
+    entity_ids = {e.id for e in result.entities}
+    call_edges = [
+        r for r in result.relationships
+        if r.relationship_type == RelationshipType.CALLS
+    ]
+    assert call_edges, "Parser must emit CALLS edges for the calls in health()"
+
+    unresolved_targets = [
+        r.target_id for r in call_edges
+        if r.target_id not in entity_ids
+    ]
+    assert unresolved_targets == [], (
+        f"Every CALLS target must exist in result.entities; unresolved: "
+        f"{unresolved_targets}"
+    )
+
+    # Reference entities must exist for the unresolved names.
+    reference_entities = [
+        e for e in result.entities
+        if e.entity_type == EntityType.REFERENCE
+    ]
+    reference_names = {e.name for e in reference_entities}
+    assert "get_settings" in reference_names, (
+        f"Expected 'get_settings' as a Reference; got: {reference_names}"
+    )
+    assert "redis.from_url" in reference_names, (
+        f"Expected 'redis.from_url' as a Reference; got: {reference_names}"
+    )
+
+
+def test_intra_file_self_call_does_not_emit_reference(tmp_path):
+    """REGRESSION GUARD (forward reference): when a method calls another
+    method on the same class (via self.other_method()), the parser must
+    resolve to the real Method entity in result.entities - NOT synthesize
+    a Reference entity.
+
+    CRITICAL: In this fixture `helper` is defined AFTER `run`. A naive
+    implementation that builds a local map from result.entities at call
+    time would miss `helper` because _process_method runs _extract_calls
+    immediately after adding the method entity, so forward-referenced
+    methods haven't been added yet.
+
+    The parser must mirror the Java parser's two-pass pattern at
+    java.py:631-740 (_collect_class_call_targets runs BEFORE any method
+    body is processed).
+    """
+    from constellation.parsers.python_parser import PythonParser
+    from constellation.models import EntityType
+
+    src = tmp_path / "service.py"
+    src.write_text(
+        "class Service:\n"
+        "    def run(self):\n"
+        "        return self.helper()\n"
+        "    def helper(self):\n"
+        "        return 42\n"
+    )
+
+    parser = PythonParser()
+    result = parser.parse_file(src, "test-repo")
+
+    # The Method entity for 'helper' must exist
+    helper_methods = [
+        e for e in result.entities
+        if e.entity_type == EntityType.METHOD and e.name == "helper"
+    ]
+    assert len(helper_methods) == 1, (
+        f"Expected exactly one 'helper' Method entity; got: {helper_methods}"
+    )
+    helper_id = helper_methods[0].id
+
+    # The CALLS edge from 'run' must target the REAL 'helper' Method,
+    # not a synthesized Reference.
+    run_methods = [
+        e for e in result.entities
+        if e.entity_type == EntityType.METHOD and e.name == "run"
+    ]
+    assert len(run_methods) == 1
+    run_id = run_methods[0].id
+
+    call_edges = [
+        r for r in result.relationships
+        if r.source_id == run_id and r.relationship_type.value == "CALLS"
+    ]
+    assert call_edges, f"Expected 'run' to emit a CALLS edge; got none"
+
+    assert any(r.target_id == helper_id for r in call_edges), (
+        f"Expected run() -> helper() CALLS edge to target the real helper "
+        f"Method entity ({helper_id}); got targets: "
+        f"{[r.target_id for r in call_edges]}"
+    )
+
+    # And there should be NO Reference entity named 'Service.helper'
+    reference_entities = [
+        e for e in result.entities
+        if e.entity_type == EntityType.REFERENCE
+    ]
+    reference_names = {e.name for e in reference_entities}
+    assert "Service.helper" not in reference_names, (
+        f"Reference for 'Service.helper' should not exist because the "
+        f"parser should resolve self.helper() to the real Method; "
+        f"got references: {reference_names}"
+    )
+
+
+def test_intra_file_self_call_backward_reference(tmp_path):
+    """REGRESSION GUARD (backward reference): helper defined BEFORE the
+    caller. This is sharper diagnosis: if forward-ref fails but backward-ref
+    passes, the pre-scan isn't running before _process_method; if BOTH
+    fail, the pre-scan itself is broken (lookup key mismatch, etc.).
+    """
+    from constellation.parsers.python_parser import PythonParser
+    from constellation.models import EntityType
+
+    src = tmp_path / "service_backward.py"
+    src.write_text(
+        "class Service:\n"
+        "    def helper(self):\n"           # defined FIRST
+        "        return 42\n"
+        "    def run(self):\n"              # caller defined SECOND
+        "        return self.helper()\n"
+    )
+
+    parser = PythonParser()
+    result = parser.parse_file(src, "test-repo")
+
+    helper_methods = [
+        e for e in result.entities
+        if e.entity_type == EntityType.METHOD and e.name == "helper"
+    ]
+    assert len(helper_methods) == 1
+    helper_id = helper_methods[0].id
+
+    run_methods = [
+        e for e in result.entities
+        if e.entity_type == EntityType.METHOD and e.name == "run"
+    ]
+    assert len(run_methods) == 1
+    run_id = run_methods[0].id
+
+    call_edges = [
+        r for r in result.relationships
+        if r.source_id == run_id and r.relationship_type.value == "CALLS"
+    ]
+    assert any(r.target_id == helper_id for r in call_edges), (
+        f"Expected run() -> helper() CALLS edge to target the real helper "
+        f"Method entity; got targets: {[r.target_id for r in call_edges]}"
+    )
+
+    reference_entities = [
+        e for e in result.entities
+        if e.entity_type == EntityType.REFERENCE
+    ]
+    reference_names = {e.name for e in reference_entities}
+    assert "Service.helper" not in reference_names
