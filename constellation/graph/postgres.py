@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import asyncpg
 
 from constellation.graph.base import WriteBackend
+from constellation.indexer.spool import (
+    SpoolChunkPaths,
+    load_chunk_preparation,
+    load_run_manifest,
+)
 from constellation.models import CodeEntity, CodeRelationship, EntityType
 
 logger = logging.getLogger(__name__)
@@ -394,6 +400,109 @@ class PostgresWriteBackend(WriteBackend):
                         break
 
                 # 7. Upsert repository metadata
+                total = await conn.fetchval(
+                    "SELECT COUNT(*) FROM code_symbols WHERE repository = $1", repository
+                )
+                await conn.execute("""
+                    INSERT INTO code_repos (name, source, commit_sha, entity_count, last_indexed_at)
+                    VALUES ($1, $2, $3, $4, now())
+                    ON CONFLICT (name) DO UPDATE SET
+                        source          = EXCLUDED.source,
+                        commit_sha      = EXCLUDED.commit_sha,
+                        entity_count    = EXCLUDED.entity_count,
+                        last_indexed_at = now()
+                """, repository, source, commit_sha, total)
+
+                return entities_created, rels_created, total
+
+    async def apply_spooled_indexing_changes(
+        self, *, spool_dir: Path,
+    ) -> tuple[int, int, int]:
+        """Replay chunked spool data inside a single Postgres transaction.
+
+        Reads the ``RunManifest`` and per-chunk ``ChunkPreparation`` files
+        written by the preparation phase, then applies all changes (stale
+        cleanup, entity upsert, relationship upsert, embedding upsert,
+        package cleanup, repo metadata) atomically.
+
+        The transaction structure mirrors :meth:`apply_indexing_changes` but
+        loads data from the spool directory instead of in-memory collections.
+        """
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        repository = manifest.repository
+        source = manifest.source
+        commit_sha = manifest.commit_sha
+
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # 1. Delete stale files (files that no longer exist on disk).
+                if manifest.stale_file_paths:
+                    await conn.execute(
+                        "DELETE FROM code_symbols WHERE repository = $1 "
+                        "AND file_path = ANY($2) AND symbol_type != 'Package'",
+                        repository, manifest.stale_file_paths,
+                    )
+
+                # 2. Process each chunk sequentially from spool files.
+                entities_created = 0
+                rels_created = 0
+                for chunk_index in manifest.chunk_indices:
+                    paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
+                    chunk = load_chunk_preparation(paths)
+
+                    # 2a. Per-file reindex preparation: delete stale refs/symbols
+                    for file_path, current_entity_ids in chunk.reindex_preparations:
+                        existing_rows = await conn.fetch(
+                            "SELECT id FROM code_symbols WHERE repository = $1 "
+                            "AND file_path = $2 AND symbol_type != 'Package'",
+                            repository, file_path,
+                        )
+                        existing_ids = {r["id"] for r in existing_rows}
+
+                        if existing_ids:
+                            await conn.execute(
+                                "DELETE FROM code_references WHERE source_symbol_id = ANY($1)",
+                                list(existing_ids),
+                            )
+
+                        stale_ids = list(existing_ids - current_entity_ids)
+                        if stale_ids:
+                            await conn.execute(
+                                "DELETE FROM code_symbols WHERE id = ANY($1)",
+                                stale_ids,
+                            )
+
+                    # 2b. Upsert entities
+                    entities_created += await self._upsert_entities(conn, chunk.entities)
+
+                    # 2c. Upsert relationships
+                    rels_created += await self._upsert_relationships(conn, chunk.relationships)
+
+                    # 2d. Upsert embeddings
+                    await self._upsert_embeddings(conn, chunk.entities)
+
+                # 3. Cleanup orphan packages — loop until stable.
+                while True:
+                    result = await conn.execute("""
+                        DELETE FROM code_symbols
+                        WHERE repository = $1 AND symbol_type = 'Package'
+                        AND id NOT IN (
+                            SELECT DISTINCT target_symbol_id FROM code_references
+                            WHERE ref_type = 'IN_PACKAGE' AND target_symbol_id IS NOT NULL
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM code_symbols child
+                            WHERE child.repository = $1
+                            AND child.symbol_type = 'Package'
+                            AND starts_with(child.id, code_symbols.id || '.')
+                        )
+                    """, repository)
+                    deleted = int(result.split()[-1]) if result.startswith("DELETE") else 0
+                    if deleted == 0:
+                        break
+
+                # 4. Upsert repository metadata
                 total = await conn.fetchval(
                     "SELECT COUNT(*) FROM code_symbols WHERE repository = $1", repository
                 )

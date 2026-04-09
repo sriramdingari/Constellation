@@ -1,9 +1,19 @@
 """Unit tests for PostgresWriteBackend — mocked asyncpg pool."""
+from pathlib import Path
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from constellation.graph.postgres import PostgresWriteBackend
 from constellation.graph.base import WriteBackend
+from constellation.indexer.spool import (
+    ChunkPreparation,
+    RunManifest,
+    SpoolChunkPaths,
+    create_spool_dir,
+    write_chunk_preparation,
+    write_run_manifest,
+)
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 
 
@@ -662,3 +672,102 @@ async def test_upsert_entities_deduplicates_input_by_id(backend):
     # executemany should receive exactly 1 row (last-writer-wins dedup)
     rows_arg = conn.executemany.call_args[0][1]
     assert len(rows_arg) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_spooled_indexing_changes_replays_multiple_chunks(
+    backend, mock_pool, tmp_path: Path,
+):
+    """apply_spooled_indexing_changes reads a RunManifest + per-chunk spool
+    files and replays all changes inside a single Postgres transaction."""
+    conn = AsyncMock()
+    # Call sequence (no stale files, 2 chunks each with 1 FILE entity, 0 rels):
+    #   Per chunk (x2):
+    #     conn.fetch  -> [] (reindex prep: existing ids for file)
+    #     conn.fetch  -> [] (_upsert_entities: pre-fetch existing)
+    #     conn.executemany   (_upsert_entities: batch upsert)
+    #   After all chunks:
+    #     conn.execute -> "DELETE 0"   (package cleanup, terminates loop)
+    #     conn.fetchval -> 4           (final entity count)
+    #     conn.execute -> "INSERT 0 1" (repo metadata upsert)
+    conn.fetch = AsyncMock(return_value=[])
+    conn.executemany = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(side_effect=[
+        "DELETE 0",      # package cleanup loop — first pass, terminates
+        "INSERT 0 1",   # repo metadata upsert
+    ])
+    conn.fetchval = AsyncMock(return_value=4)
+    tx_cm = AsyncMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=None)
+    tx_cm.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=tx_cm)
+    acquire_cm = AsyncMock()
+    acquire_cm.__aenter__ = AsyncMock(return_value=conn)
+    acquire_cm.__aexit__ = AsyncMock(return_value=False)
+    mock_pool.acquire = MagicMock(return_value=acquire_cm)
+
+    # --- Set up spool directory with manifest + 2 chunks ---
+    spool_dir = create_spool_dir(tmp_path, "run-1")
+    manifest = RunManifest(
+        run_id="run-1",
+        repository="repo",
+        source="/tmp/repo",
+        commit_sha="abc123",
+        stale_file_paths=[],
+        chunk_indices=[1, 2],
+        files_total=2,
+        files_processed=2,
+        files_skipped=0,
+    )
+    write_run_manifest(spool_dir / "run_manifest.json", manifest)
+
+    chunk1 = ChunkPreparation(
+        chunk_index=1,
+        files=[("a.py", "ha", True)],
+        reindex_preparations=[("a.py", {"repo::a.py"})],
+        entities=[
+            CodeEntity(
+                id="repo::a.py",
+                name="a.py",
+                entity_type=EntityType.FILE,
+                repository="repo",
+                file_path="a.py",
+                line_number=1,
+                language="python",
+                content_hash="ha",
+            )
+        ],
+        relationships=[],
+    )
+    chunk2 = ChunkPreparation(
+        chunk_index=2,
+        files=[("b.py", "hb", True)],
+        reindex_preparations=[("b.py", {"repo::b.py"})],
+        entities=[
+            CodeEntity(
+                id="repo::b.py",
+                name="b.py",
+                entity_type=EntityType.FILE,
+                repository="repo",
+                file_path="b.py",
+                line_number=1,
+                language="python",
+                content_hash="hb",
+            )
+        ],
+        relationships=[],
+    )
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1), chunk1)
+    write_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 2), chunk2)
+
+    entities_created, rels_created, total = await backend.apply_spooled_indexing_changes(
+        spool_dir=spool_dir,
+    )
+
+    # Each chunk has 1 new entity, _upsert_entities returns 1 per chunk -> 2 total
+    assert entities_created == 2
+    assert rels_created == 0
+    # fetchval returns 4 as the final entity count
+    assert total == 4
+    # executemany called once per chunk (entity upsert), 2 chunks total
+    assert conn.executemany.call_count >= 2
