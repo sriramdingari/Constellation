@@ -81,7 +81,7 @@ async def write_backend(postgres_dsn):
     # Defensive: clean up any repos from a prior failed test
     for name in ["test-repo", "test-repo-delete", "stable-reindex-test",
                  "orphan-reindex-test", "stale-rel-test", "file-hashes-test",
-                 "chunked-repo", "cross-repo"]:
+                 "chunked-repo", "cross-repo", "threaded-test"]:
         try:
             await backend.delete_repository(name)
         except Exception:
@@ -739,3 +739,54 @@ async def test_apply_spooled_cross_chunk_relationship_persists(write_backend, tm
     )
 
     await write_backend.delete_repository("cross-repo")
+
+
+async def test_threaded_chunk_preparation_matches_serial_replay(
+    write_backend, postgres_dsn, tmp_path: Path,
+):
+    """End-to-end: threaded chunk preparation with indexing_worker_threads=2
+    spools and replays against real pgvector, producing the correct result."""
+    from constellation.embeddings.base import BaseEmbeddingProvider
+    from constellation.indexer.pipeline import IndexingPipeline
+    from constellation.parsers.registry import get_default_registry
+
+    class StaticEmbeddingProvider(BaseEmbeddingProvider):
+        @property
+        def model_name(self) -> str:
+            return "static-test"
+
+        @property
+        def dimensions(self) -> int:
+            return 1536
+
+        async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            return [[0.1] * 1536 for _ in texts]
+
+    await write_backend.delete_repository("threaded-test")
+
+    settings = Settings(
+        storage_backend="postgres",
+        postgres_dsn=postgres_dsn,
+        files_per_chunk=1,
+        indexing_worker_threads=2,
+    )
+
+    pipeline = IndexingPipeline(
+        graph_client=write_backend,
+        embedding_provider=StaticEmbeddingProvider(),
+        parser_registry=get_default_registry(),
+        settings=settings,
+    )
+
+    (tmp_path / "a.py").write_text("class A: pass", encoding="utf-8")
+    (tmp_path / "b.py").write_text("class B: pass", encoding="utf-8")
+
+    result = await pipeline.run(source=str(tmp_path), name="threaded-test")
+
+    assert result.files_processed == 2
+    hashes = await write_backend.get_file_hashes("threaded-test")
+    assert len(hashes) == 2
+    assert "a.py" in hashes
+    assert "b.py" in hashes
+
+    await write_backend.delete_repository("threaded-test")
