@@ -214,6 +214,11 @@ class IndexingPipeline:
                             entities_found_offset=entities_found_so_far,
                         )
                         entities_found_so_far += len(chunk.entities)
+
+                        # Skip empty chunks — no entities and no relationships
+                        if not chunk.entities and not chunk.relationships:
+                            continue
+
                         chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk_index)
                         write_chunk_preparation(chunk_paths, chunk)
                         chunk_indices.append(chunk_index)

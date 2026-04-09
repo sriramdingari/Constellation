@@ -1317,3 +1317,50 @@ class TestPostgresSpoolPath:
             f"got {entities_found_values[-1]}. "
             f"Full sequence: {entities_found_values}"
         )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_skips_empty_chunks(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """When all files in a chunk are unchanged, the chunk should NOT be
+        written to the spool or included in the manifest's chunk_indices."""
+        from constellation.indexer.collector import compute_file_hash
+        from constellation.indexer.spool import load_run_manifest
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            entity_batch_size=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        # All files already indexed with matching hashes -> nothing to do
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={
+            "a.py": compute_file_hash(tmp_path / "a.py"),
+            "b.py": compute_file_hash(tmp_path / "b.py"),
+        })
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            result = await pipeline.run(source=str(tmp_path))
+
+        assert result.files_processed == 0
+
+        if mock_graph_client.apply_spooled_indexing_changes.called:
+            spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
+                "spool_dir"
+            ]
+            manifest = load_run_manifest(spool_dir / "run_manifest.json")
+            assert manifest.chunk_indices == [], (
+                f"No-op run should produce no chunk files; got indices: {manifest.chunk_indices}"
+            )
