@@ -386,6 +386,30 @@ class TestReindexMode:
 
 class TestGithubSource:
     @pytest.mark.asyncio
+    async def test_github_url_forwards_github_token_when_present(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        settings = _make_settings(github_token="ghp_test_token")
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "cloned.py")
+
+        with patch("constellation.indexer.pipeline.clone_repository", return_value=tmp_path) as mock_clone, \
+             patch("constellation.indexer.pipeline.cleanup_clone"), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="sha123"), \
+             patch("constellation.indexer.pipeline.is_github_url", return_value=True):
+            await pipeline.run(source="https://github.com/user/repo")
+
+        mock_clone.assert_called_once_with(
+            "https://github.com/user/repo",
+            github_token="ghp_test_token",
+        )
+
+    @pytest.mark.asyncio
     async def test_github_url_clones_and_cleans_up(
         self, pipeline, mock_graph_client, tmp_path
     ):

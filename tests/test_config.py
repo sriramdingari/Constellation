@@ -64,6 +64,15 @@ class TestSettings:
         s = _settings_without_env_file()
         assert s.openai_api_key == ""
 
+    def test_default_github_token(self):
+        s = _settings_without_env_file()
+        assert s.github_token == ""
+
+    @patch.dict(os.environ, {"GITHUB_TOKEN": "ghp_test_token"}, clear=False)
+    def test_github_token_override_from_env(self):
+        s = _settings_without_env_file()
+        assert s.github_token == "ghp_test_token"
+
     @patch.dict(os.environ, {"NEO4J_URI": "bolt://custom:7687"})
     def test_override_from_env(self):
         s = _settings_without_env_file()

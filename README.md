@@ -14,9 +14,11 @@ graph LR
     D --> E[Embedder]
     E --> F[Graph Writer]
     F --> G[(Neo4j)]
+    F --> P[(Postgres + pgvector)]
     B -.-> H[(Redis)]
 
     style G fill:#4C8BF5,color:#fff
+    style P fill:#336791,color:#fff
     style H fill:#DC382D,color:#fff
 ```
 
@@ -25,7 +27,7 @@ graph LR
 | **Collector** | Discovers source files, filters by extension and exclusion patterns, computes MD5 hashes for change detection |
 | **Parser** | Extracts entities (classes, methods, fields, constructors, interfaces) and relationships (calls, inheritance, implementations) using tree-sitter |
 | **Embedder** | Generates vector embeddings for semantic search on methods, classes, interfaces, and constructors |
-| **Graph Writer** | Batch upserts entities and relationships into Neo4j using MERGE queries |
+| **Graph Writer** | Batch upserts entities, relationships, and embeddings into the configured backend. Default: Neo4j (`MERGE`). Alternative: PostgreSQL + pgvector (`INSERT ... ON CONFLICT`). See [Option 3](#option-3-postgresql-backend-alternative-to-neo4j). |
 
 ## Table of Contents
 
@@ -63,6 +65,9 @@ Edit `.env` and set your embedding provider credentials:
 ```bash
 # For OpenAI (default)
 OPENAI_API_KEY=sk-your-key-here
+
+# Optional: enables cloning private GitHub repositories during indexing
+# GITHUB_TOKEN=ghp_your_token_here
 
 # For LiteLLM proxy
 OPENAI_API_KEY=sk-your-litellm-key
@@ -183,11 +188,13 @@ curl -X POST http://localhost:8000/repositories/index \
   -H "Content-Type: application/json" \
   -d '{"source": "/path/to/your/repo"}'
 
-# Index a public GitHub repository
+# Index a GitHub repository
 curl -X POST http://localhost:8000/repositories/index \
   -H "Content-Type: application/json" \
   -d '{"source": "https://github.com/user/repo"}'
 ```
+
+Set `GITHUB_TOKEN` on the API/worker process if you want the same endpoint to work for private GitHub repositories.
 
 Response:
 
@@ -235,7 +242,7 @@ curl -X POST http://localhost:8000/repositories/index \
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `source` | Yes | Local filesystem path or public GitHub URL |
+| `source` | Yes | Local filesystem path or GitHub URL |
 | `name` | No | Repository name in the graph. Derived from `source` if omitted |
 | `exclude_patterns` | No | Additional glob patterns to skip. Merged with built-in defaults (`node_modules`, `venv`, `__pycache__`, `.git`, `build`, `dist`, etc.) |
 | `reindex` | No | Set to `true` to bypass change detection and reprocess all files |
@@ -250,7 +257,7 @@ volumes:
 
 Then use `/code` as the source path in the API call.
 
-**GitHub URLs:** Public repos are shallow-cloned, indexed, and automatically cleaned up. Private repositories are not currently supported.
+**GitHub URLs:** Repos are shallow-cloned, indexed, and automatically cleaned up. If `GITHUB_TOKEN` is set on the server, private GitHub repositories are supported too. The API request shape stays the same.
 
 ### Listing Repositories
 
@@ -328,9 +335,11 @@ All settings are configured through environment variables or a `.env` file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
+| `STORAGE_BACKEND` | `neo4j` | `neo4j` or `postgres` — selects which graph backend the writer uses |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI (when `STORAGE_BACKEND=neo4j`) |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | `constellation` | Neo4j password |
+| `POSTGRES_DSN` | — | Postgres + pgvector DSN (required when `STORAGE_BACKEND=postgres`) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 
 ### Embedding Settings
@@ -558,7 +567,10 @@ constellation/
 │   ├── ollama.py            # Ollama provider
 │   └── factory.py           # Provider factory
 ├── graph/
-│   ├── client.py            # Neo4j async client
+│   ├── base.py              # WriteBackend abstract interface
+│   ├── factory.py           # Backend selection from STORAGE_BACKEND env var
+│   ├── neo4j.py             # Neo4j write backend (default)
+│   ├── postgres.py          # Postgres + pgvector write backend
 │   ├── schema.py            # Graph constraints and indexes
 │   └── queries.py           # Cypher query templates
 ├── indexer/
@@ -620,7 +632,7 @@ graph TB
 - **Stale file cleanup** — After indexing, files present in Neo4j but absent from the filesystem are removed along with all their contained entities.
 - **Parse error isolation** — Errors in individual files are skipped and reported in the job result. They never abort the pipeline.
 - **Retry logic** — Celery tasks retry up to 2 times with exponential backoff on transient failures.
-- **Clone lifecycle** — GitHub URLs are shallow-cloned to a temp directory, indexed, and cleaned up even if the pipeline fails.
+- **Clone lifecycle** — GitHub URLs are shallow-cloned to a temp directory, indexed, and cleaned up even if the pipeline fails. When `GITHUB_TOKEN` is present, GitHub clones use it automatically.
 
 ## Troubleshooting
 
@@ -664,7 +676,7 @@ Check that the worker is running and connected to the same Redis instance as the
 
 ### GitHub clone fails
 
-Only public repositories are supported. The cloner uses `git clone --depth 1` without authentication.
+Check the repository URL first. For private GitHub repositories, set `GITHUB_TOKEN` on both the API and worker environment. Public GitHub repositories continue to work without any token.
 
 ## License
 

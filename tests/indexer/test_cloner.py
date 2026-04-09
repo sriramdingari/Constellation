@@ -1,3 +1,4 @@
+import base64
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,78 @@ class TestCloneRepository:
     def test_clone_raises_on_invalid_url(self, mock_run, mock_mkdtemp, mock_rmtree):
         with pytest.raises(subprocess.CalledProcessError):
             clone_repository("https://invalid-url/not-a-repo")
+
+        mock_rmtree.assert_called_once_with("/tmp/constellation_abc123", ignore_errors=True)
+
+    @patch("constellation.indexer.cloner.tempfile.mkdtemp", return_value="/tmp/constellation_abc123")
+    @patch("constellation.indexer.cloner.subprocess.run")
+    def test_clone_uses_git_config_env_for_github_token(self, mock_run, mock_mkdtemp):
+        clone_repository(
+            "https://github.com/user/repo",
+            github_token="ghp_test_token",
+        )
+
+        args, kwargs = mock_run.call_args
+        assert args[0] == [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/user/repo",
+            "/tmp/constellation_abc123",
+        ]
+        assert kwargs["check"] is True
+        assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
+
+        env = kwargs["env"]
+        expected = base64.b64encode(
+            b"x-access-token:ghp_test_token"
+        ).decode()
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraHeader"
+        assert env["GIT_CONFIG_VALUE_0"] == f"Authorization: Basic {expected}"
+        assert "ghp_test_token" not in " ".join(args[0])
+
+    @patch("constellation.indexer.cloner.tempfile.mkdtemp", return_value="/tmp/constellation_abc123")
+    @patch("constellation.indexer.cloner.subprocess.run")
+    def test_clone_does_not_use_token_for_non_github_https_url(self, mock_run, mock_mkdtemp):
+        clone_repository(
+            "https://gitlab.com/user/repo",
+            github_token="ghp_test_token",
+        )
+
+        _, kwargs = mock_run.call_args
+        assert "env" not in kwargs
+
+    @patch("constellation.indexer.cloner.tempfile.mkdtemp", return_value="/tmp/constellation_abc123")
+    @patch("constellation.indexer.cloner.subprocess.run")
+    def test_clone_normalizes_github_ssh_url_when_token_present(self, mock_run, mock_mkdtemp):
+        clone_repository(
+            "git@github.com:user/repo.git",
+            github_token="ghp_test_token",
+        )
+
+        args, kwargs = mock_run.call_args
+        assert args[0] == [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "https://github.com/user/repo.git",
+            "/tmp/constellation_abc123",
+        ]
+        assert "env" in kwargs
+
+    @patch("constellation.indexer.cloner.shutil.rmtree")
+    @patch("constellation.indexer.cloner.tempfile.mkdtemp", return_value="/tmp/constellation_abc123")
+    @patch("constellation.indexer.cloner.subprocess.run", side_effect=subprocess.CalledProcessError(128, "git"))
+    def test_authenticated_clone_cleans_up_on_failure(self, mock_run, mock_mkdtemp, mock_rmtree):
+        with pytest.raises(subprocess.CalledProcessError):
+            clone_repository(
+                "https://github.com/user/private-repo",
+                github_token="ghp_test_token",
+            )
 
         mock_rmtree.assert_called_once_with("/tmp/constellation_abc123", ignore_errors=True)
 

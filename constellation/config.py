@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     embedding_dimensions: int = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS
     openai_api_key: str = ""
     openai_base_url: str = ""
+    github_token: str = ""
     ollama_base_url: str = "http://localhost:11434"
     ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS

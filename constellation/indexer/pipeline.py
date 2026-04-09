@@ -104,7 +104,13 @@ class IndexingPipeline:
             # 1. Determine source path
             # ----------------------------------------------------------
             if is_github_url(source):
-                cloned_path = clone_repository(source)
+                if self._settings.github_token:
+                    cloned_path = clone_repository(
+                        source,
+                        github_token=self._settings.github_token,
+                    )
+                else:
+                    cloned_path = clone_repository(source)
                 source_path = cloned_path
             else:
                 source_path = Path(source)
