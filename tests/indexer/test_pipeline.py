@@ -1364,3 +1364,21 @@ class TestPostgresSpoolPath:
             assert manifest.chunk_indices == [], (
                 f"No-op run should produce no chunk files; got indices: {manifest.chunk_indices}"
             )
+
+
+# ---------------------------------------------------------------------------
+# create_fresh_registry
+# ---------------------------------------------------------------------------
+
+def test_create_fresh_registry_returns_distinct_parser_instances():
+    from constellation.parsers.registry import create_fresh_registry
+    from pathlib import Path
+
+    registry_a = create_fresh_registry()
+    registry_b = create_fresh_registry()
+
+    parser_a = registry_a.get_parser_for_file(Path("a.py"))
+    parser_b = registry_b.get_parser_for_file(Path("a.py"))
+
+    assert parser_a is not parser_b
+    assert type(parser_a) is type(parser_b)

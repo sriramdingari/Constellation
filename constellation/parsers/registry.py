@@ -61,6 +61,17 @@ def _register_default_parsers(registry: ParserRegistry) -> None:
         registry.register(parser_cls())
 
 
+def create_fresh_registry() -> ParserRegistry:
+    """Create a new ParserRegistry with all built-in parsers.
+
+    Each call returns a distinct registry with distinct parser instances.
+    Use this for thread-isolated indexing workers.
+    """
+    registry = ParserRegistry()
+    _register_default_parsers(registry)
+    return registry
+
+
 def get_default_registry() -> ParserRegistry:
     """Return the default :class:`ParserRegistry` (lazy singleton).
 
