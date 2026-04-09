@@ -812,3 +812,20 @@ class IndexingPipeline:
             vectors = await self._embedder.embed_batch(texts)
             for entity, vector in zip(batch, vectors):
                 entity.embedding = vector
+
+    async def _finalize_prepared_chunk(
+        self,
+        *,
+        spool_dir: Path,
+        chunk: ChunkPreparation,
+    ) -> None:
+        """Embed entities and write a prepared chunk to the spool directory.
+
+        Called from the main thread after a worker completes parse-only
+        preparation. Embedding and spool writes are serial (not threaded).
+        """
+        if not chunk.entities and not chunk.relationships:
+            return
+        await self._embed_entities(chunk.entities)
+        chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk.chunk_index)
+        write_chunk_preparation(chunk_paths, chunk)

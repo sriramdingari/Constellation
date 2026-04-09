@@ -1418,3 +1418,100 @@ def test_create_fresh_registry_returns_distinct_parser_instances():
 
     assert parser_a is not parser_b
     assert type(parser_a) is type(parser_b)
+
+
+# ---------------------------------------------------------------------------
+# _finalize_prepared_chunk
+# ---------------------------------------------------------------------------
+
+class TestFinalizePreparedChunk:
+    @pytest.mark.asyncio
+    async def test_finalize_chunk_embeds_then_writes_spool(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import (
+            ChunkPreparation,
+            SpoolChunkPaths,
+            create_spool_dir,
+            load_chunk_preparation,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        file_entity = CodeEntity(
+            id="repo::a.py", name="a.py", entity_type=EntityType.FILE,
+            repository="repo", file_path="a.py", line_number=1,
+            language="python", content_hash="hash-a",
+        )
+        class_entity = CodeEntity(
+            id="repo::a.py#A", name="A", entity_type=EntityType.CLASS,
+            repository="repo", file_path="a.py", line_number=1, language="python",
+        )
+        contains_rel = CodeRelationship(
+            source_id="repo::a.py", target_id="repo::a.py#A",
+            relationship_type=RelationshipType.CONTAINS,
+        )
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "hash-a", True)],
+            reindex_preparations=[("a.py", {"repo::a.py", "repo::a.py#A"})],
+            entities=[file_entity, class_entity],
+            relationships=[contains_rel],
+        )
+
+        spool_dir = create_spool_dir(tmp_path, "run-1")
+        await pipeline._finalize_prepared_chunk(spool_dir=spool_dir, chunk=chunk)
+
+        loaded = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1))
+        assert loaded.chunk_index == 1
+        assert [e.id for e in loaded.entities] == ["repo::a.py", "repo::a.py#A"]
+        assert loaded.entities[1].embedding == [0.1] * 1536
+        mock_embedding_provider.embed_batch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_chunk_skips_empty(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import (
+            ChunkPreparation,
+            SpoolChunkPaths,
+            create_spool_dir,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "hash-a", True)],
+            reindex_preparations=[],
+            entities=[],
+            relationships=[],
+        )
+
+        spool_dir = create_spool_dir(tmp_path, "run-1")
+        await pipeline._finalize_prepared_chunk(spool_dir=spool_dir, chunk=chunk)
+
+        # Should not have written anything to spool
+        chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, 1)
+        assert not chunk_paths.entities_path.exists()
+        mock_embedding_provider.embed_batch.assert_not_awaited()
