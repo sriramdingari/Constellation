@@ -57,7 +57,18 @@ class TestSettings:
 
     def test_default_entity_batch_size(self):
         s = _settings_without_env_file()
-        assert s.entity_batch_size == 100
+        assert s.files_per_chunk == 100
+
+    def test_files_per_chunk_replaces_entity_batch_size(self):
+        """files_per_chunk is the canonical name; entity_batch_size env var still works."""
+        s = _settings_without_env_file()
+        assert s.files_per_chunk == 100  # default
+
+    def test_entity_batch_size_env_var_backward_compat(self, monkeypatch):
+        """Legacy ENTITY_BATCH_SIZE env var must still populate files_per_chunk."""
+        monkeypatch.setenv("ENTITY_BATCH_SIZE", "42")
+        s = Settings(_env_file=None, storage_backend="neo4j")
+        assert s.files_per_chunk == 42
 
     @patch.dict(os.environ, {"OPENAI_API_KEY": ""}, clear=False)
     def test_openai_api_key_defaults_empty(self):

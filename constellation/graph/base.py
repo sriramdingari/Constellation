@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 from constellation.models import CodeEntity, CodeRelationship
 
@@ -86,6 +87,24 @@ class WriteBackend(ABC):
         Returns (entities_created, relationships_created, total_entity_count).
         """
         ...
+
+    async def apply_spooled_indexing_changes(
+        self,
+        *,
+        spool_dir: Path,
+    ) -> tuple[int, int, int]:
+        """Atomically replay pre-prepared spool files.
+
+        Only backends that support chunked spool-and-replay need to
+        override this.  The default raises NotImplementedError so callers
+        that check storage_backend before calling are safe, and any
+        future backend that forgets to implement it fails loudly.
+
+        Returns (entities_created, relationships_created, total_entity_count).
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support spooled indexing"
+        )
 
     # -- Stats ----------------------------------------------------------------
 

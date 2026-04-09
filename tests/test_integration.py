@@ -43,7 +43,7 @@ def integration_settings():
         embedding_model="fake",
         embedding_dimensions=8,
         embedding_batch_size=4,
-        entity_batch_size=50,
+        files_per_chunk=50,
     )
 
 

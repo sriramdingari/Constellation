@@ -196,7 +196,7 @@ class IndexingPipeline:
                 chunk_indices: list[int] = []
                 entities_found_so_far = 0
                 try:
-                    chunk_size = max(1, self._settings.entity_batch_size)
+                    chunk_size = max(1, self._settings.files_per_chunk)
                     for chunk_index, chunk_plans in enumerate(
                         self._chunk_file_plans(file_plans, chunk_size),
                         start=1,

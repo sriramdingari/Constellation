@@ -21,7 +21,7 @@ def _make_settings(**overrides) -> Settings:
         neo4j_user="neo4j",
         neo4j_password="test",
         embedding_batch_size=8,
-        entity_batch_size=100,
+        files_per_chunk=100,
         openai_api_key="test-key",
         storage_backend="neo4j",
     )
@@ -1199,7 +1199,7 @@ class TestPostgresSpoolPath:
 
         settings = _make_settings(
             storage_backend="postgres",
-            entity_batch_size=1,
+            files_per_chunk=1,
             postgres_dsn="postgresql://test:test@localhost:5432/test",
         )
         pipeline = IndexingPipeline(
@@ -1237,7 +1237,7 @@ class TestPostgresSpoolPath:
         """Spool directory is removed even when apply_spooled_indexing_changes raises."""
         settings = _make_settings(
             storage_backend="postgres",
-            entity_batch_size=1,
+            files_per_chunk=1,
             postgres_dsn="postgresql://test:test@localhost:5432/test",
         )
         pipeline = IndexingPipeline(
@@ -1274,7 +1274,7 @@ class TestPostgresSpoolPath:
         chunks, not reset to 0 at each chunk boundary."""
         settings = _make_settings(
             storage_backend="postgres",
-            entity_batch_size=1,
+            files_per_chunk=1,
             postgres_dsn="postgresql://test:test@localhost:5432/test",
         )
         pipeline = IndexingPipeline(
@@ -1329,7 +1329,7 @@ class TestPostgresSpoolPath:
 
         settings = _make_settings(
             storage_backend="postgres",
-            entity_batch_size=1,
+            files_per_chunk=1,
             postgres_dsn="postgresql://test:test@localhost:5432/test",
         )
         pipeline = IndexingPipeline(

@@ -671,7 +671,7 @@ class TestApplyIndexingChanges:
             neo4j_user="neo4j",
             neo4j_password="testpass",
             embedding_dimensions=1536,
-            entity_batch_size=1,
+            files_per_chunk=1,
         )
         client = Neo4jWriteBackend(settings)
         client._driver = mock_driver

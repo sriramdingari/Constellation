@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 
 DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS
     embedding_batch_size: int = 8
-    entity_batch_size: int = 100
+    files_per_chunk: int = Field(
+        100,
+        validation_alias=AliasChoices("files_per_chunk", "entity_batch_size"),
+    )
     storage_backend: Literal["neo4j", "postgres"] = "neo4j"
     postgres_dsn: str = ""
 

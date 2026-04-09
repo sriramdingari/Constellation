@@ -60,3 +60,32 @@ def test_factory_passes_embedding_model_to_postgres_backend():
         kwargs = mock_postgres_cls.call_args.kwargs
         assert kwargs["embedding_model"] == "text-embedding-3-small"
         assert kwargs["embedding_dimensions"] == 1536
+
+
+def test_write_backend_has_apply_spooled_indexing_changes():
+    """WriteBackend must declare apply_spooled_indexing_changes
+    so the interface contract is honest."""
+    assert hasattr(WriteBackend, "apply_spooled_indexing_changes")
+
+
+@pytest.mark.asyncio
+async def test_write_backend_default_spooled_raises():
+    """Default implementation raises NotImplementedError for backends
+    that don't support spooled indexing."""
+    from pathlib import Path
+
+    class DummyBackend(WriteBackend):
+        async def connect(self): pass
+        async def close(self): pass
+        async def initialize_schema(self): pass
+        async def upsert_repository(self, **kw): pass
+        async def get_repository(self, name): pass
+        async def list_repositories(self): pass
+        async def delete_repository(self, name): pass
+        async def get_file_hashes(self, repo): return {}
+        async def apply_indexing_changes(self, **kw): return (0, 0, 0)
+        async def count_repository_entities(self, repo): return 0
+
+    backend = DummyBackend()
+    with pytest.raises(NotImplementedError, match="DummyBackend"):
+        await backend.apply_spooled_indexing_changes(spool_dir=Path("/tmp/fake"))
