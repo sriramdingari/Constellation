@@ -793,16 +793,20 @@ def test_intra_file_self_call_does_not_emit_reference(tmp_path):
         f"{[r.target_id for r in call_edges]}"
     )
 
-    # And there should be NO Reference entity named 'Service.helper'
-    reference_entities = [
-        e for e in result.entities
+    # None of run's CALLS edges may point at a Reference entity - all
+    # must resolve to real Method entities. This directly verifies the
+    # pre-scan is working for forward references without depending on
+    # how the Reference name is formatted (which can include the module
+    # prefix e.g. 'service.Service.helper').
+    reference_ids = {
+        e.id for e in result.entities
         if e.entity_type == EntityType.REFERENCE
-    ]
-    reference_names = {e.name for e in reference_entities}
-    assert "Service.helper" not in reference_names, (
-        f"Reference for 'Service.helper' should not exist because the "
-        f"parser should resolve self.helper() to the real Method; "
-        f"got references: {reference_names}"
+    }
+    run_call_targets = {r.target_id for r in call_edges}
+    reference_targets_from_run = run_call_targets & reference_ids
+    assert not reference_targets_from_run, (
+        f"Expected no Reference-typed CALLS targets from run(); got: "
+        f"{reference_targets_from_run}"
     )
 
 
@@ -850,9 +854,13 @@ def test_intra_file_self_call_backward_reference(tmp_path):
         f"Method entity; got targets: {[r.target_id for r in call_edges]}"
     )
 
-    reference_entities = [
-        e for e in result.entities
+    reference_ids = {
+        e.id for e in result.entities
         if e.entity_type == EntityType.REFERENCE
-    ]
-    reference_names = {e.name for e in reference_entities}
-    assert "Service.helper" not in reference_names
+    }
+    run_call_targets = {r.target_id for r in call_edges}
+    reference_targets_from_run = run_call_targets & reference_ids
+    assert not reference_targets_from_run, (
+        f"Expected no Reference-typed CALLS targets from run(); got: "
+        f"{reference_targets_from_run}"
+    )
