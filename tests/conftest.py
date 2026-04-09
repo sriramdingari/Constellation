@@ -4,6 +4,30 @@ from unittest.mock import AsyncMock
 from constellation.models import CodeEntity, EntityType
 
 
+@pytest.fixture(autouse=True)
+def _isolate_settings_from_dotenv(monkeypatch, request):
+    """Prevent .env values from leaking into unit tests.
+
+    Settings (Pydantic BaseSettings) reads .env automatically via
+    model_config = {"env_file": ".env"}.  Production .env may contain
+    STORAGE_BACKEND=postgres, POSTGRES_DSN, GITHUB_TOKEN, etc. that
+    change test behaviour.
+
+    We use ``monkeypatch.setenv`` (not ``delenv``) because Pydantic
+    reads the .env *file* independently of ``os.environ``.  Setting
+    the env vars explicitly makes them take priority over the file
+    values, effectively resetting them to the code defaults.
+
+    Integration tests marked with ``postgres_integration`` are excluded
+    because they manage their own database connections (via testcontainers).
+    """
+    if "postgres_integration" in [m.name for m in request.node.iter_markers()]:
+        return
+    monkeypatch.setenv("STORAGE_BACKEND", "neo4j")
+    monkeypatch.setenv("POSTGRES_DSN", "")
+    monkeypatch.setenv("GITHUB_TOKEN", "")
+
+
 @pytest.fixture
 def sample_class_entity():
     return CodeEntity(
