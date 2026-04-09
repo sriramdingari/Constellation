@@ -64,6 +64,14 @@ class TestSettings:
         s = _settings_without_env_file()
         assert s.files_per_chunk == 100  # default
 
+    def test_default_indexing_worker_threads(self):
+        s = _settings_without_env_file()
+        assert s.indexing_worker_threads == 1
+
+    def test_indexing_worker_threads_can_be_overridden(self):
+        s = _settings_without_env_file(indexing_worker_threads=4)
+        assert s.indexing_worker_threads == 4
+
     def test_entity_batch_size_env_var_backward_compat(self, monkeypatch):
         """Legacy ENTITY_BATCH_SIZE env var must still populate files_per_chunk."""
         monkeypatch.setenv("ENTITY_BATCH_SIZE", "42")

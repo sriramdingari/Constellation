@@ -28,6 +28,7 @@ class Settings(BaseSettings):
         100,
         validation_alias=AliasChoices("files_per_chunk", "entity_batch_size"),
     )
+    indexing_worker_threads: int = 1
     storage_backend: Literal["neo4j", "postgres"] = "neo4j"
     postgres_dsn: str = ""
 
