@@ -4,10 +4,14 @@ version = "0.1.0"
 description = "Code indexing engine — parses, embeds, and graphs source code in Neo4j"
 requires-python = ">=3.12"
 
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.29", "pgvector>=0.3"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "integration: requires running Neo4j and Redis",
+    "integration: requires running Neo4j or Redis services",
+    "postgres_integration: requires Docker (auto-managed via testcontainers)",
 ]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"

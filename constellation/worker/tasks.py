@@ -8,7 +8,7 @@ import redis
 
 from constellation.config import get_settings
 from constellation.embeddings.factory import create_embedding_provider
-from constellation.graph.client import GraphClient
+from constellation.graph.factory import create_write_backend
 from constellation.indexer.collector import derive_repo_name
 from constellation.indexer.pipeline import IndexingPipeline
 from constellation.locking import (
@@ -112,7 +112,7 @@ def index_repository(
 async def _run_indexing(source, name, exclude_patterns, reindex, progress_callback):
     """Run the indexing pipeline asynchronously."""
     task_settings = get_settings()
-    graph_client = GraphClient(task_settings)
+    graph_client = create_write_backend(task_settings)
     embedding_provider = create_embedding_provider(
         task_settings.embedding_provider, task_settings
     )

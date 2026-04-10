@@ -14,9 +14,11 @@ graph LR
     D --> E[Embedder]
     E --> F[Graph Writer]
     F --> G[(Neo4j)]
+    F --> P[(Postgres + pgvector)]
     B -.-> H[(Redis)]
 
     style G fill:#4C8BF5,color:#fff
+    style P fill:#336791,color:#fff
     style H fill:#DC382D,color:#fff
 ```
 
@@ -25,7 +27,7 @@ graph LR
 | **Collector** | Discovers source files, filters by extension and exclusion patterns, computes MD5 hashes for change detection |
 | **Parser** | Extracts entities (classes, methods, fields, constructors, interfaces) and relationships (calls, inheritance, implementations) using tree-sitter |
 | **Embedder** | Generates vector embeddings for semantic search on methods, classes, interfaces, and constructors |
-| **Graph Writer** | Batch upserts entities and relationships into Neo4j using MERGE queries |
+| **Graph Writer** | Batch upserts entities, relationships, and embeddings into the configured backend. Default: Neo4j (`MERGE`). Alternative: PostgreSQL + pgvector (`INSERT ... ON CONFLICT`). See [Option 3](#option-3-postgresql-backend-alternative-to-neo4j). |
 
 ## Table of Contents
 
@@ -63,6 +65,9 @@ Edit `.env` and set your embedding provider credentials:
 ```bash
 # For OpenAI (default)
 OPENAI_API_KEY=sk-your-key-here
+
+# Optional: enables cloning private GitHub repositories during indexing
+# GITHUB_TOKEN=ghp_your_token_here
 
 # For LiteLLM proxy
 OPENAI_API_KEY=sk-your-litellm-key
@@ -104,7 +109,11 @@ Verify everything is running:
 
 ```bash
 curl http://localhost:8000/health
-# {"status":"ok","neo4j":"connected","redis":"connected"}
+# {"status":"ok","backend":"connected","backend_type":"neo4j","neo4j":"connected","redis":"connected"}
+#
+# The `backend` and `backend_type` fields are the canonical way to check
+# storage health. The `neo4j` field is kept as a backward-compat alias and
+# always mirrors `backend`, regardless of which backend is active.
 ```
 
 ### Option 2: Local Development
@@ -137,6 +146,38 @@ source .venv/bin/activate
 celery -A constellation.worker.celery_app worker --loglevel=info
 ```
 
+### Option 3: PostgreSQL Backend (Alternative to Neo4j)
+
+Constellation supports PostgreSQL + pgvector as an alternative storage backend. Neo4j is
+still the default; switching to Postgres is a single environment-variable flip.
+
+```bash
+# Start Postgres via the compose profile (requires Docker)
+docker compose --profile postgres up -d postgres
+
+# Configure the app to use it
+cat >> .env <<EOF
+STORAGE_BACKEND=postgres
+POSTGRES_DSN=postgresql://constellation:secret@localhost:5432/constellation
+EOF
+
+# Start Redis (still required for Celery job state)
+docker compose up -d redis
+
+# Run the API server and worker as before
+uvicorn constellation.main:app --host 0.0.0.0 --port 8000
+celery -A constellation.worker.celery_app worker --loglevel=info
+```
+
+Notes:
+- `asyncpg` and `pgvector` are already in `requirements.txt`, so no extra install is needed.
+- The schema is created on the first API request OR the first indexing run (whichever comes first), via `initialize_schema()`. A fresh Postgres deployment can serve `GET /repositories` immediately without requiring an indexing job to run first.
+- Switching embedding corpus later is handled automatically for both:
+  - **Dimension changes** (e.g., OpenAI 1536 → Ollama 768): the backend detects the new dimension and drops the old embeddings.
+  - **Model changes at the same dimension** (e.g., `text-embedding-3-small` → `text-embedding-ada-002`, both 1536-dim): the backend tracks the active model name in an `embedding_metadata` table and detects any change.
+
+  Either case triggers a drop of `code_embeddings`, a clear of stored File content hashes, and a full re-embed on the next indexing run.
+
 ## Quick Start
 
 Once the services are running, index a repository with a single curl:
@@ -147,11 +188,13 @@ curl -X POST http://localhost:8000/repositories/index \
   -H "Content-Type: application/json" \
   -d '{"source": "/path/to/your/repo"}'
 
-# Index a public GitHub repository
+# Index a GitHub repository
 curl -X POST http://localhost:8000/repositories/index \
   -H "Content-Type: application/json" \
   -d '{"source": "https://github.com/user/repo"}'
 ```
+
+Set `GITHUB_TOKEN` on the API/worker process if you want the same endpoint to work for private GitHub repositories.
 
 Response:
 
@@ -199,7 +242,7 @@ curl -X POST http://localhost:8000/repositories/index \
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `source` | Yes | Local filesystem path or public GitHub URL |
+| `source` | Yes | Local filesystem path or GitHub URL |
 | `name` | No | Repository name in the graph. Derived from `source` if omitted |
 | `exclude_patterns` | No | Additional glob patterns to skip. Merged with built-in defaults (`node_modules`, `venv`, `__pycache__`, `.git`, `build`, `dist`, etc.) |
 | `reindex` | No | Set to `true` to bypass change detection and reprocess all files |
@@ -214,7 +257,7 @@ volumes:
 
 Then use `/code` as the source path in the API call.
 
-**GitHub URLs:** Public repos are shallow-cloned, indexed, and automatically cleaned up. Private repositories are not currently supported.
+**GitHub URLs:** Repos are shallow-cloned, indexed, and automatically cleaned up. If `GITHUB_TOKEN` is set on the server, private GitHub repositories are supported too. The API request shape stays the same.
 
 ### Listing Repositories
 
@@ -292,9 +335,11 @@ All settings are configured through environment variables or a `.env` file.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
+| `STORAGE_BACKEND` | `neo4j` | `neo4j` or `postgres` — selects which graph backend the writer uses |
+| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI (when `STORAGE_BACKEND=neo4j`) |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | `constellation` | Neo4j password |
+| `POSTGRES_DSN` | — | Postgres + pgvector DSN (required when `STORAGE_BACKEND=postgres`) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection URL |
 
 ### Embedding Settings
@@ -353,6 +398,8 @@ Returns connectivity status for both Neo4j and Redis:
 ```json
 {
   "status": "ok",
+  "backend": "connected",
+  "backend_type": "neo4j",
   "neo4j": "connected",
   "redis": "connected"
 }
@@ -520,7 +567,10 @@ constellation/
 │   ├── ollama.py            # Ollama provider
 │   └── factory.py           # Provider factory
 ├── graph/
-│   ├── client.py            # Neo4j async client
+│   ├── base.py              # WriteBackend abstract interface
+│   ├── factory.py           # Backend selection from STORAGE_BACKEND env var
+│   ├── neo4j.py             # Neo4j write backend (default)
+│   ├── postgres.py          # Postgres + pgvector write backend
 │   ├── schema.py            # Graph constraints and indexes
 │   └── queries.py           # Cypher query templates
 ├── indexer/
@@ -582,14 +632,14 @@ graph TB
 - **Stale file cleanup** — After indexing, files present in Neo4j but absent from the filesystem are removed along with all their contained entities.
 - **Parse error isolation** — Errors in individual files are skipped and reported in the job result. They never abort the pipeline.
 - **Retry logic** — Celery tasks retry up to 2 times with exponential backoff on transient failures.
-- **Clone lifecycle** — GitHub URLs are shallow-cloned to a temp directory, indexed, and cleaned up even if the pipeline fails.
+- **Clone lifecycle** — GitHub URLs are shallow-cloned to a temp directory, indexed, and cleaned up even if the pipeline fails. When `GITHUB_TOKEN` is present, GitHub clones use it automatically.
 
 ## Troubleshooting
 
 ### Health endpoint returns "degraded"
 
 ```json
-{"status": "degraded", "neo4j": "disconnected", "redis": "disconnected"}
+{"status": "degraded", "backend": "disconnected", "backend_type": "neo4j", "neo4j": "disconnected", "redis": "disconnected"}
 ```
 
 When running in Docker, ensure your `.env` uses container service names, not `localhost`:
@@ -626,7 +676,7 @@ Check that the worker is running and connected to the same Redis instance as the
 
 ### GitHub clone fails
 
-Only public repositories are supported. The cloner uses `git clone --depth 1` without authentication.
+Check the repository URL first. For private GitHub repositories, set `GITHUB_TOKEN` on both the API and worker environment. Public GitHub repositories continue to work without any token.
 
 ## License
 

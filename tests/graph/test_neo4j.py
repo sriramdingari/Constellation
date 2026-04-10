@@ -1,4 +1,4 @@
-"""Tests for constellation.graph.client — Neo4j async graph client."""
+"""Tests for constellation.graph.neo4j — Neo4jWriteBackend."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from constellation.config import Settings
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 from constellation.graph import schema, queries
-from constellation.graph.client import GraphClient
+from constellation.graph.neo4j import Neo4jWriteBackend
 
 
 @pytest.fixture
@@ -62,22 +62,22 @@ def mock_driver(mock_session, mock_tx):
 
 @pytest.fixture
 def client(settings, mock_driver):
-    """Create a GraphClient with a pre-injected mock driver."""
-    c = GraphClient(settings)
+    """Create a Neo4jWriteBackend with a pre-injected mock driver."""
+    c = Neo4jWriteBackend(settings)
     c._driver = mock_driver
     return c
 
 
 class TestConnect:
-    """Test GraphClient.connect()."""
+    """Test Neo4jWriteBackend.connect()."""
 
     async def test_connect_creates_driver_and_verifies(self, settings):
-        with patch("constellation.graph.client.AsyncGraphDatabase") as mock_agd:
+        with patch("constellation.graph.neo4j.AsyncGraphDatabase") as mock_agd:
             mock_drv = AsyncMock()
             mock_drv.verify_connectivity = AsyncMock()
             mock_agd.driver.return_value = mock_drv
 
-            client = GraphClient(settings)
+            client = Neo4jWriteBackend(settings)
             await client.connect()
 
             mock_agd.driver.assert_called_once_with(
@@ -89,7 +89,7 @@ class TestConnect:
 
 
 class TestClose:
-    """Test GraphClient.close()."""
+    """Test Neo4jWriteBackend.close()."""
 
     async def test_close_closes_driver(self, client, mock_driver):
         await client.close()
@@ -97,13 +97,13 @@ class TestClose:
         assert client._driver is None
 
     async def test_close_when_not_connected_no_error(self, settings):
-        client = GraphClient(settings)
+        client = Neo4jWriteBackend(settings)
         assert client._driver is None
         await client.close()  # Should not raise
 
 
 class TestQuery:
-    """Test GraphClient.query()."""
+    """Test Neo4jWriteBackend.query()."""
 
     async def test_query_runs_cypher_and_returns_records(
         self, client, mock_session, mock_result
@@ -135,7 +135,7 @@ class TestQuery:
         assert len(result) == 1001
 
     async def test_query_auto_connects_if_not_connected(self, settings):
-        with patch("constellation.graph.client.AsyncGraphDatabase") as mock_agd:
+        with patch("constellation.graph.neo4j.AsyncGraphDatabase") as mock_agd:
             mock_result = AsyncMock()
             mock_result.__aiter__.return_value = []
 
@@ -149,7 +149,7 @@ class TestQuery:
             mock_drv.session = MagicMock(return_value=mock_sess)
             mock_agd.driver.return_value = mock_drv
 
-            client = GraphClient(settings)
+            client = Neo4jWriteBackend(settings)
             assert client._driver is None
 
             result = await client.query("RETURN 1")
@@ -161,7 +161,7 @@ class TestQuery:
 
 
 class TestInitializeSchema:
-    """Test GraphClient.initialize_schema()."""
+    """Test Neo4jWriteBackend.initialize_schema()."""
 
     async def test_initialize_schema_runs_all_constraints_indexes_vectors(
         self, client, mock_session, mock_result
@@ -209,7 +209,7 @@ class TestInitializeSchema:
             embedding_dimensions=1536,
             ollama_embedding_dimensions=768,
         )
-        client = GraphClient(settings)
+        client = Neo4jWriteBackend(settings)
         client._driver = AsyncMock()
         client._driver.session = MagicMock(return_value=mock_session)
 
@@ -254,7 +254,7 @@ class TestInitializeSchema:
 
 
 class TestUpsertEntities:
-    """Test GraphClient.upsert_entities()."""
+    """Test Neo4jWriteBackend.upsert_entities()."""
 
     async def test_upsert_entities_groups_by_label_and_calls_query(
         self, client, mock_session, mock_result
@@ -351,7 +351,7 @@ class TestUpsertEntities:
 
 
 class TestCreateRelationships:
-    """Test GraphClient.create_relationships()."""
+    """Test Neo4jWriteBackend.create_relationships()."""
 
     async def test_create_relationships_groups_by_type(
         self, client, mock_session, mock_result
@@ -425,7 +425,7 @@ class TestCreateRelationships:
 
 
 class TestGetFileHashes:
-    """Test GraphClient.get_file_hashes()."""
+    """Test Neo4jWriteBackend.get_file_hashes()."""
 
     async def test_get_file_hashes_returns_dict(
         self, client, mock_session, mock_result
@@ -451,7 +451,7 @@ class TestGetFileHashes:
 
 
 class TestDeleteStaleFiles:
-    """Test GraphClient.delete_stale_files()."""
+    """Test Neo4jWriteBackend.delete_stale_files()."""
 
     async def test_delete_stale_files_calls_query(
         self, client, mock_session, mock_result
@@ -485,7 +485,7 @@ class TestDeleteStaleFiles:
 
 
 class TestPrepareFileReindex:
-    """Test GraphClient.prepare_file_reindex()."""
+    """Test Neo4jWriteBackend.prepare_file_reindex()."""
 
     async def test_prepare_file_reindex_replaces_stale_entities_only(
         self, client, mock_session
@@ -565,7 +565,7 @@ class TestPrepareFileReindex:
 
 
 class TestApplyIndexingChanges:
-    """Test GraphClient.apply_indexing_changes()."""
+    """Test Neo4jWriteBackend.apply_indexing_changes()."""
 
     async def test_apply_indexing_changes_uses_single_transaction(
         self, client, mock_session, mock_tx
@@ -671,9 +671,9 @@ class TestApplyIndexingChanges:
             neo4j_user="neo4j",
             neo4j_password="testpass",
             embedding_dimensions=1536,
-            entity_batch_size=1,
+            files_per_chunk=1,
         )
-        client = GraphClient(settings)
+        client = Neo4jWriteBackend(settings)
         client._driver = mock_driver
 
         empty_result = AsyncMock()
@@ -741,7 +741,7 @@ class TestApplyIndexingChanges:
 
 
 class TestCleanupOrphanPackages:
-    """Test GraphClient.cleanup_orphan_packages()."""
+    """Test Neo4jWriteBackend.cleanup_orphan_packages()."""
 
     async def test_cleanup_orphan_packages_repeats_until_stable(
         self, client, mock_session
@@ -770,7 +770,7 @@ class TestCleanupOrphanPackages:
 
 
 class TestCountRepositoryEntities:
-    """Test GraphClient.count_repository_entities()."""
+    """Test Neo4jWriteBackend.count_repository_entities()."""
 
     async def test_count_repository_entities_returns_count(
         self, client, mock_session, mock_result
@@ -798,7 +798,7 @@ class TestCountRepositoryEntities:
 
 
 class TestUpsertRepository:
-    """Test GraphClient.upsert_repository()."""
+    """Test Neo4jWriteBackend.upsert_repository()."""
 
     async def test_upsert_repository_calls_query(
         self, client, mock_session, mock_result
@@ -824,7 +824,7 @@ class TestUpsertRepository:
 
 
 class TestGetRepository:
-    """Test GraphClient.get_repository()."""
+    """Test Neo4jWriteBackend.get_repository()."""
 
     async def test_get_repository_returns_dict(
         self, client, mock_session, mock_result
@@ -850,7 +850,7 @@ class TestGetRepository:
 
 
 class TestListRepositories:
-    """Test GraphClient.list_repositories()."""
+    """Test Neo4jWriteBackend.list_repositories()."""
 
     async def test_list_repositories_returns_list(
         self, client, mock_session, mock_result
@@ -868,7 +868,7 @@ class TestListRepositories:
 
 
 class TestDeleteRepository:
-    """Test GraphClient.delete_repository()."""
+    """Test Neo4jWriteBackend.delete_repository()."""
 
     async def test_delete_repository_calls_query(
         self, client, mock_session, mock_result

@@ -1,5 +1,6 @@
 """Tests for the indexing pipeline orchestrator."""
 
+import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,8 +22,9 @@ def _make_settings(**overrides) -> Settings:
         neo4j_user="neo4j",
         neo4j_password="test",
         embedding_batch_size=8,
-        entity_batch_size=100,
+        files_per_chunk=100,
         openai_api_key="test-key",
+        storage_backend="neo4j",
     )
     defaults.update(overrides)
     return Settings(**defaults)
@@ -385,6 +387,30 @@ class TestReindexMode:
 
 
 class TestGithubSource:
+    @pytest.mark.asyncio
+    async def test_github_url_forwards_github_token_when_present(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        settings = _make_settings(github_token="ghp_test_token")
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "cloned.py")
+
+        with patch("constellation.indexer.pipeline.clone_repository", return_value=tmp_path) as mock_clone, \
+             patch("constellation.indexer.pipeline.cleanup_clone"), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="sha123"), \
+             patch("constellation.indexer.pipeline.is_github_url", return_value=True):
+            await pipeline.run(source="https://github.com/user/repo")
+
+        mock_clone.assert_called_once_with(
+            "https://github.com/user/repo",
+            github_token="ghp_test_token",
+        )
+
     @pytest.mark.asyncio
     async def test_github_url_clones_and_cleans_up(
         self, pipeline, mock_graph_client, tmp_path
@@ -1157,3 +1183,1269 @@ class TestCloneCleanupOnError:
                 pass  # Expected
 
         mock_cleanup.assert_called_once_with(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Postgres spool path
+# ---------------------------------------------------------------------------
+
+
+class TestPostgresSpoolPath:
+    @pytest.mark.asyncio
+    async def test_pipeline_spools_multiple_chunks_for_postgres(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """Postgres backend: file plans chunked, spooled, and replayed atomically."""
+        from constellation.indexer.spool import load_run_manifest
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir") as mock_spool_cleanup:
+            result = await pipeline.run(source=str(tmp_path))
+
+        assert result.files_total == 2
+        assert result.files_processed == 2
+        assert mock_graph_client.apply_spooled_indexing_changes.called
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
+            "spool_dir"
+        ]
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices == [1, 2]
+        mock_spool_cleanup.assert_called_once_with(spool_dir)
+
+    @pytest.mark.asyncio
+    async def test_pipeline_cleans_up_spool_dir_when_replay_fails(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """Spool directory is removed even when apply_spooled_indexing_changes raises."""
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+
+        async def _boom(*, spool_dir):
+            raise RuntimeError(f"replay failed for {spool_dir}")
+
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(side_effect=_boom)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError):
+                await pipeline.run(source=str(tmp_path))
+
+        spool_dir = Path(
+            mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        )
+        assert not spool_dir.exists(), (
+            f"Spool dir should be cleaned up after replay failure; still exists: {spool_dir}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_progress_entities_found_is_cumulative(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """entities_found in progress callbacks must be cumulative across
+        chunks, not reset to 0 at each chunk boundary."""
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 0, 4)
+        )
+
+        progress_reports: list[tuple[int, int, int]] = []
+
+        def capture_progress(files_total, files_processed, entities_found):
+            progress_reports.append((files_total, files_processed, entities_found))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path), progress_callback=capture_progress)
+
+        # entities_found (third element) must be monotonically non-decreasing
+        entities_found_values = [r[2] for r in progress_reports]
+        for i in range(1, len(entities_found_values)):
+            assert entities_found_values[i] >= entities_found_values[i - 1], (
+                f"entities_found went backward at step {i}: "
+                f"{entities_found_values[i - 1]} -> {entities_found_values[i]}. "
+                f"Full sequence: {entities_found_values}"
+            )
+        # With batch_size=1, each file is its own chunk.  Each chunk
+        # produces 2 entities (1 file + 1 class).  The final cumulative
+        # count must reflect ALL entities across both chunks (4 total),
+        # not just the last chunk's local count (2).
+        assert entities_found_values[-1] == 4, (
+            f"Expected final cumulative entities_found to be 4, "
+            f"got {entities_found_values[-1]}. "
+            f"Full sequence: {entities_found_values}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_skips_empty_chunks(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        """When all files in a chunk are unchanged, the chunk should NOT be
+        written to the spool or included in the manifest's chunk_indices."""
+        from constellation.indexer.collector import compute_file_hash
+        from constellation.indexer.spool import load_run_manifest
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+
+        # All files already indexed with matching hashes -> nothing to do
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={
+            "a.py": compute_file_hash(tmp_path / "a.py"),
+            "b.py": compute_file_hash(tmp_path / "b.py"),
+        })
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            result = await pipeline.run(source=str(tmp_path))
+
+        assert result.files_processed == 0
+
+        if mock_graph_client.apply_spooled_indexing_changes.called:
+            spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
+                "spool_dir"
+            ]
+            manifest = load_run_manifest(spool_dir / "run_manifest.json")
+            assert manifest.chunk_indices == [], (
+                f"No-op run should produce no chunk files; got indices: {manifest.chunk_indices}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_parse_result_errors_abort_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_parser.parse_file = MagicMock(
+            return_value=ParseResult(
+                file_path=str(tmp_path / "bad.py"),
+                language="python",
+                errors=["Syntax error at line 1"],
+            )
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_parse_exception_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_parser.parse_file = MagicMock(side_effect=RuntimeError("parser boom"))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_embedding_failure_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "embed_fail.py", "class EmbedMe: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_embedding_provider.embed_batch = AsyncMock(
+            side_effect=RuntimeError("embed boom")
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Embedding failed: embed boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    def test_prepare_chunk_parse_only_returns_entities_relationships_without_embedding(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+
+        chunk, files_delta, errors = pipeline._prepare_chunk_parse_only(
+            repo_name="repo",
+            chunk_index=1,
+            chunk_plans=[(tmp_path / "a.py", "a.py", "hash-a", True)],
+            needs_relationship_refresh=True,
+            parser_registry=create_fresh_registry(),
+        )
+
+        assert {e.id for e in chunk.entities} == {"repo::a.py", "repo::a.py#A"}
+        assert [
+            (r.source_id, r.target_id, r.relationship_type)
+            for r in chunk.relationships
+        ] == [("repo::a.py", "repo::a.py#A", RelationshipType.CONTAINS)]
+        assert chunk.chunk_index == 1
+        assert files_delta == 1
+        assert errors == []
+        assert mock_embedding_provider.embed_batch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_preparation_writes_chunks_in_index_order(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import load_run_manifest
+        from constellation.parsers.registry import create_fresh_registry
+        import time
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+
+        original = pipeline._run_chunk_worker
+
+        def delayed_worker(*args):
+            if args[1] == 1:  # chunk_index 1 is delayed
+                time.sleep(0.05)
+            return original(*args)
+
+        with patch.object(pipeline, "_run_chunk_worker", side_effect=delayed_worker), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_postgres_concurrent_embedding_preserves_chunk_order(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import load_run_manifest
+        from constellation.parsers.registry import create_fresh_registry
+        import asyncio
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            embedding_concurrency=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+
+        original_embed_entities = pipeline._embed_entities
+        chunk1_started = asyncio.Event()
+        chunk2_finished = asyncio.Event()
+        embedding_completion_order: list[int] = []
+
+        async def delayed_embed_entities(entities):
+            chunk_index = (
+                1 if any(entity.file_path.endswith("a.py") for entity in entities) else 2
+            )
+            if chunk_index == 1:
+                chunk1_started.set()
+                await chunk2_finished.wait()
+            else:
+                await chunk1_started.wait()
+            await original_embed_entities(entities)
+            embedding_completion_order.append(chunk_index)
+            if chunk_index == 2:
+                chunk2_finished.set()
+
+        with patch.object(
+            pipeline,
+            "_embed_entities",
+            side_effect=delayed_embed_entities,
+        ), patch(
+            "constellation.indexer.pipeline.get_commit_sha",
+            return_value="abc123",
+        ), patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await asyncio.wait_for(pipeline.run(source=str(tmp_path)), timeout=0.2)
+
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
+            "spool_dir"
+        ]
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert embedding_completion_order == [2, 1]
+        assert manifest.chunk_indices == [1, 2]
+
+    @pytest.mark.asyncio
+    async def test_postgres_bounds_parse_submission(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from concurrent.futures import Future
+        from constellation.parsers.registry import create_fresh_registry
+        import threading
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        _create_py_file(tmp_path, "c.py", "class C: pass")
+        _create_py_file(tmp_path, "d.py", "class D: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(8, 4, 8)
+        )
+
+        submit_calls: list[int] = []
+        active_futures: list[Future] = []
+        lock = threading.Lock()
+        max_active = 0
+
+        class RecordingExecutor:
+            def __init__(self, max_workers):
+                self.max_workers = max_workers
+
+            def submit(self, fn, *args, **kwargs):
+                nonlocal max_active
+                chunk_index = args[1]
+                with lock:
+                    active_workers = sum(
+                        1 for future in active_futures if not future.done()
+                    )
+                    if active_workers >= self.max_workers:
+                        raise AssertionError(
+                            f"submitted chunk {chunk_index} while {active_workers} "
+                            f"workers were active"
+                        )
+                    submit_calls.append(chunk_index)
+                    future = Future()
+                    active_futures.append(future)
+                    max_active = max(max_active, active_workers + 1)
+
+                def complete_work():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except Exception as exc:
+                        future.set_exception(exc)
+
+                threading.Timer(0.01, complete_work).start()
+                return future
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                return None
+
+        with patch(
+            "constellation.indexer.pipeline.ThreadPoolExecutor",
+            RecordingExecutor,
+        ), patch(
+            "constellation.indexer.pipeline.get_commit_sha",
+            return_value="abc123",
+        ), patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        assert submit_calls == [1, 2, 3, 4]
+        assert max_active <= settings.indexing_worker_threads
+
+    @pytest.mark.asyncio
+    async def test_postgres_concurrent_embedding_failure_aborts(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            embedding_concurrency=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(4, 2, 4)
+        )
+        mock_embedding_provider.embed_batch = AsyncMock(
+            side_effect=RuntimeError("embed boom")
+        )
+
+        with patch(
+            "constellation.indexer.pipeline.get_commit_sha",
+            return_value="abc123",
+        ):
+            with pytest.raises(RuntimeError, match="embed boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_progress_is_monotonic(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(4, 2, 4))
+
+        progress_reports = []
+        def capture_progress(files_total, files_processed, entities_found):
+            progress_reports.append((files_total, files_processed, entities_found))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path), progress_callback=capture_progress)
+
+        assert [p[1] for p in progress_reports] == sorted([p[1] for p in progress_reports])
+        assert [p[2] for p in progress_reports] == sorted([p[2] for p in progress_reports])
+        assert progress_reports[-1][2] >= 4
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_worker_failure_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
+
+        original = pipeline._run_chunk_worker
+
+        def flaky_worker(*args):
+            if args[1] == 2:
+                raise RuntimeError("boom from worker")
+            return original(*args)
+
+        with patch.object(pipeline, "_run_chunk_worker", side_effect=flaky_worker), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="boom from worker"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_parse_result_errors_abort_before_replay(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.base import BaseParser
+        from constellation.parsers.registry import ParserRegistry
+
+        class BrokenParser(BaseParser):
+            language = "python"
+            file_extensions = [".py"]
+
+            def parse_file(self, file_path, repo_name):
+                return ParseResult(
+                    file_path=str(file_path),
+                    language="python",
+                    errors=["Syntax error at line 1"],
+                )
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        registry = ParserRegistry()
+        registry.register(BrokenParser())
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_parse_exception_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.base import BaseParser
+        from constellation.parsers.registry import ParserRegistry
+
+        class CrashingParser(BaseParser):
+            language = "python"
+            file_extensions = [".py"]
+
+            def parse_file(self, file_path, repo_name):
+                raise RuntimeError("parser boom")
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        registry = ParserRegistry()
+        registry.register(CrashingParser())
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_thread_count_one_preserves_serial_behavior(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(2, 0, 2))
+
+        with patch("constellation.indexer.pipeline.ThreadPoolExecutor") as mock_executor, \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        assert not mock_executor.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_backpressure_limits_in_flight_chunks(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """With 2 worker threads, at most 2 workers should be active
+        concurrently. The bounded submit-wait-finalize loop must not
+        submit all chunks up front."""
+        from constellation.parsers.registry import create_fresh_registry
+        import threading
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        for i in range(5):
+            _create_py_file(tmp_path, f"f{i}.py", f"class C{i}: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(10, 0, 10)
+        )
+
+        max_concurrent = {"value": 0}
+        current_concurrent = {"value": 0}
+        lock = threading.Lock()
+
+        original_worker = pipeline._run_chunk_worker
+
+        def counting_worker(*args):
+            with lock:
+                current_concurrent["value"] += 1
+                if current_concurrent["value"] > max_concurrent["value"]:
+                    max_concurrent["value"] = current_concurrent["value"]
+            try:
+                return original_worker(*args)
+            finally:
+                with lock:
+                    current_concurrent["value"] -= 1
+
+        with patch.object(pipeline, "_run_chunk_worker", side_effect=counting_worker), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        assert max_concurrent["value"] <= 2, (
+            f"Expected at most 2 concurrent workers; saw {max_concurrent['value']}"
+        )
+        assert mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_submission_respects_downstream_pressure(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import ChunkPreparation
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            embedding_concurrency=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        for i in range(5):
+            _create_py_file(tmp_path, f"f{i}.py", f"class C{i}: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(10, 0, 10)
+        )
+
+        outstanding_chunks = 0
+        max_outstanding_chunks = 0
+        downstream_capacity = (
+            settings.indexing_worker_threads + settings.embedding_concurrency
+        )
+        release_embeddings = asyncio.Event()
+
+        def make_chunk(chunk_index: int, file_name: str) -> ChunkPreparation:
+            relative_path = f"{file_name}.py"
+            return ChunkPreparation(
+                chunk_index=chunk_index,
+                files=[(relative_path, f"hash-{chunk_index}", True)],
+                reindex_preparations=[(relative_path, {f"repo::{relative_path}"})],
+                entities=[
+                    CodeEntity(
+                        id=f"repo::{relative_path}",
+                        name=file_name,
+                        entity_type=EntityType.CLASS,
+                        repository="repo",
+                        file_path=relative_path,
+                        line_number=1,
+                        language="python",
+                    )
+                ],
+                relationships=[],
+            )
+
+        def fake_submit_parse_chunk(
+            *,
+            loop,
+            executor,
+            repo_name,
+            chunk_index,
+            chunk_plans,
+            needs_relationship_refresh,
+            thread_local,
+        ):
+            nonlocal outstanding_chunks, max_outstanding_chunks
+            outstanding_chunks += 1
+            max_outstanding_chunks = max(max_outstanding_chunks, outstanding_chunks)
+            assert outstanding_chunks <= downstream_capacity, (
+                "parse submission exceeded the global in-flight chunk bound"
+            )
+            if outstanding_chunks == downstream_capacity:
+                release_embeddings.set()
+            future = loop.create_future()
+            future.set_result(
+                (
+                    chunk_index,
+                    make_chunk(chunk_index, chunk_plans[0][0].stem),
+                    1,
+                    [],
+                )
+            )
+            return future
+
+        async def delayed_embed_prepared_chunk(*, chunk, embed_semaphore):
+            await release_embeddings.wait()
+            return chunk
+
+        async def record_finalize_prepared_chunk(*, spool_dir, chunk):
+            nonlocal outstanding_chunks
+            outstanding_chunks -= 1
+
+        with patch.object(
+            pipeline,
+            "_submit_parse_chunk",
+            side_effect=fake_submit_parse_chunk,
+        ), patch.object(
+            pipeline,
+            "_embed_prepared_chunk",
+            side_effect=delayed_embed_prepared_chunk,
+        ), patch.object(
+            pipeline,
+            "_finalize_prepared_chunk",
+            side_effect=record_finalize_prepared_chunk,
+        ), patch(
+            "constellation.indexer.pipeline.get_commit_sha",
+            return_value="abc",
+        ):
+            await pipeline.run(source=str(tmp_path), name="repo")
+
+        assert max_outstanding_chunks == downstream_capacity
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_cancellation_awaits_outstanding_cleanup(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            embedding_concurrency=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "a.py", "class A: pass")
+        _create_py_file(tmp_path, "b.py", "class B: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+
+        submitted_tasks: list[asyncio.Task] = []
+        cleanup_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def blocking_parse(chunk_index: int):
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.sleep(0)
+                cleanup_finished.set()
+                raise
+
+        def fake_submit_parse_chunk(
+            *,
+            loop,
+            executor,
+            repo_name,
+            chunk_index,
+            chunk_plans,
+            needs_relationship_refresh,
+            thread_local,
+        ):
+            task = asyncio.create_task(blocking_parse(chunk_index))
+            submitted_tasks.append(task)
+            return task
+
+        with patch.object(
+            pipeline,
+            "_submit_parse_chunk",
+            side_effect=fake_submit_parse_chunk,
+        ), patch(
+            "constellation.indexer.pipeline.get_commit_sha",
+            return_value="abc",
+        ):
+            run_task = asyncio.create_task(pipeline.run(source=str(tmp_path), name="repo"))
+            try:
+                for _ in range(20):
+                    if len(submitted_tasks) == 2:
+                        break
+                    await asyncio.sleep(0)
+                assert len(submitted_tasks) == 2
+
+                run_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await run_task
+
+                assert cleanup_started.is_set()
+                assert cleanup_finished.is_set()
+                assert all(task.done() for task in submitted_tasks)
+            finally:
+                for task in submitted_tasks:
+                    task.cancel()
+                if submitted_tasks:
+                    await asyncio.gather(*submitted_tasks, return_exceptions=True)
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_workers_use_injected_registry(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """Threaded workers must use the injected registry, not built-in only."""
+        from constellation.parsers.registry import ParserRegistry
+        from constellation.parsers.base import BaseParser, ParseResult
+
+        class FooParser(BaseParser):
+            language = "foo"
+            file_extensions = [".foo"]
+            def parse_file(self, file_path, repo_name):
+                return ParseResult(
+                    file_path=str(file_path),
+                    language="foo",
+                    entities=[CodeEntity(
+                        id=f"{repo_name}::{file_path.name}#Foo",
+                        name="Foo",
+                        entity_type=EntityType.CLASS,
+                        repository=repo_name,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="foo",
+                    )],
+                    relationships=[],
+                )
+
+        custom_registry = ParserRegistry()
+        custom_registry.register(FooParser())
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=custom_registry,
+            settings=settings,
+        )
+        (tmp_path / "test.foo").write_text("foo content", encoding="utf-8")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(2, 0, 2))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            result = await pipeline.run(source=str(tmp_path))
+
+        spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs["spool_dir"]
+        from constellation.indexer.spool import load_run_manifest, SpoolChunkPaths, load_chunk_preparation
+        manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert manifest.chunk_indices, "Expected at least one non-empty chunk"
+        chunk = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, manifest.chunk_indices[0]))
+        entity_names = {e.name for e in chunk.entities}
+        assert "Foo" in entity_names, (
+            f"FooParser entity not found — worker used built-in registry. Entities: {entity_names}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_registry_reused_per_thread(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """Each thread should clone the registry once and reuse it,
+        not clone per chunk."""
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        custom_registry = create_fresh_registry()
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=custom_registry,
+            settings=settings,
+        )
+        for i in range(4):
+            _create_py_file(tmp_path, f"f{i}.py", f"class C{i}: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(8, 0, 8)
+        )
+
+        clone_count = {"value": 0}
+        original_clone = custom_registry.clone
+
+        def counting_clone():
+            clone_count["value"] += 1
+            return original_clone()
+
+        with patch.object(custom_registry, "clone", side_effect=counting_clone), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        # 2 threads -> at most 2 clone() calls (one per thread)
+        assert clone_count["value"] <= 2, (
+            f"Expected at most 2 registry clones (one per thread); "
+            f"got {clone_count['value']}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# create_fresh_registry
+# ---------------------------------------------------------------------------
+
+def test_create_fresh_registry_returns_distinct_parser_instances():
+    from constellation.parsers.registry import create_fresh_registry
+    from pathlib import Path
+
+    registry_a = create_fresh_registry()
+    registry_b = create_fresh_registry()
+
+    parser_a = registry_a.get_parser_for_file(Path("a.py"))
+    parser_b = registry_b.get_parser_for_file(Path("a.py"))
+
+    assert parser_a is not parser_b
+    assert type(parser_a) is type(parser_b)
+
+
+# ---------------------------------------------------------------------------
+# ParserRegistry.clone
+# ---------------------------------------------------------------------------
+
+def test_parser_registry_clone_preserves_custom_extensions():
+    from constellation.parsers.registry import ParserRegistry
+    from constellation.parsers.base import BaseParser, ParseResult
+
+    class FooParser(BaseParser):
+        language = "foo"
+        file_extensions = [".foo"]
+        def parse_file(self, file_path, repo_name):
+            return ParseResult(file_path=str(file_path), language="foo", entities=[], relationships=[])
+
+    registry = ParserRegistry()
+    registry.register(FooParser())
+
+    cloned = registry.clone()
+    original_parser = registry.get_parser_for_file(Path("test.foo"))
+    cloned_parser = cloned.get_parser_for_file(Path("test.foo"))
+
+    assert original_parser is not None
+    assert cloned_parser is not None
+    assert type(original_parser) is type(cloned_parser)
+    assert original_parser is not cloned_parser
+
+
+# ---------------------------------------------------------------------------
+# _finalize_prepared_chunk
+# ---------------------------------------------------------------------------
+
+class TestFinalizePreparedChunk:
+    @pytest.mark.asyncio
+    async def test_embed_prepared_chunk_then_finalize_writes_spool(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import (
+            ChunkPreparation,
+            SpoolChunkPaths,
+            create_spool_dir,
+            load_chunk_preparation,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        file_entity = CodeEntity(
+            id="repo::a.py", name="a.py", entity_type=EntityType.FILE,
+            repository="repo", file_path="a.py", line_number=1,
+            language="python", content_hash="hash-a",
+        )
+        class_entity = CodeEntity(
+            id="repo::a.py#A", name="A", entity_type=EntityType.CLASS,
+            repository="repo", file_path="a.py", line_number=1, language="python",
+        )
+        contains_rel = CodeRelationship(
+            source_id="repo::a.py", target_id="repo::a.py#A",
+            relationship_type=RelationshipType.CONTAINS,
+        )
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "hash-a", True)],
+            reindex_preparations=[("a.py", {"repo::a.py", "repo::a.py#A"})],
+            entities=[file_entity, class_entity],
+            relationships=[contains_rel],
+        )
+
+        spool_dir = create_spool_dir(tmp_path, "run-1")
+        embedded_chunk = await pipeline._embed_prepared_chunk(
+            chunk=chunk,
+            embed_semaphore=asyncio.Semaphore(1),
+        )
+        await pipeline._finalize_prepared_chunk(
+            spool_dir=spool_dir,
+            chunk=embedded_chunk,
+        )
+
+        loaded = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1))
+        assert loaded.chunk_index == 1
+        assert [e.id for e in loaded.entities] == ["repo::a.py", "repo::a.py#A"]
+        assert loaded.entities[1].embedding == [0.1] * 1536
+        mock_embedding_provider.embed_batch.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_chunk_skips_empty(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import (
+            ChunkPreparation,
+            SpoolChunkPaths,
+            create_spool_dir,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "hash-a", True)],
+            reindex_preparations=[],
+            entities=[],
+            relationships=[],
+        )
+
+        spool_dir = create_spool_dir(tmp_path, "run-1")
+        await pipeline._finalize_prepared_chunk(spool_dir=spool_dir, chunk=chunk)
+
+        # Should not have written anything to spool
+        chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, 1)
+        assert not chunk_paths.entities_path.exists()
+        mock_embedding_provider.embed_batch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_embed_prepared_chunk_propagates_embedding_errors(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.indexer.spool import (
+            ChunkPreparation,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres", files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        mock_embedding_provider.embed_batch = AsyncMock(
+            side_effect=RuntimeError("embed boom")
+        )
+
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "ha", True)],
+            reindex_preparations=[("a.py", {"repo::a.py"})],
+            entities=[
+                CodeEntity(id="repo::a.py", name="a.py", entity_type=EntityType.FILE,
+                           repository="repo", file_path="a.py", line_number=1,
+                           language="python", content_hash="ha"),
+                CodeEntity(id="repo::a.py#A", name="A", entity_type=EntityType.CLASS,
+                           repository="repo", file_path="a.py", line_number=1,
+                           language="python"),
+            ],
+            relationships=[],
+        )
+
+        with pytest.raises(RuntimeError, match="embed boom"):
+            await pipeline._embed_prepared_chunk(
+                chunk=chunk,
+                embed_semaphore=asyncio.Semaphore(1),
+            )

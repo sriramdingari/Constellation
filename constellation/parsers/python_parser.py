@@ -176,6 +176,13 @@ class PythonParser(BaseParser):
         result: ParseResult,
     ) -> None:
         """Extract class and function definitions from the root level."""
+        # Pre-scan: compute module-level function ids so _extract_calls
+        # can resolve forward references to top-level functions that
+        # haven't been added to result.entities yet.
+        ctx.module_function_ids = self._collect_local_function_targets(
+            root, ctx, ctx.module_name,
+        )
+
         for child in root.children:
             if child.type == "class_definition":
                 self._process_class(child, ctx, result, decorators=[])
@@ -300,6 +307,14 @@ class PythonParser(BaseParser):
         result: ParseResult,
     ) -> None:
         """Process the body of a class definition."""
+        # Pre-scan: compute method ids for all methods in this class body
+        # before processing any of them. Mirrors Java's two-pass pattern
+        # (java.py:255-261, :689-720) so _extract_calls can resolve
+        # forward references to methods defined later in the same class.
+        class_ctx.local_method_ids = self._collect_local_function_targets(
+            body, ctx, class_ctx.class_full_name,
+        )
+
         for child in body.children:
             if child.type == "function_definition":
                 self._process_method(child, ctx, class_ctx, result, decorators=[])
@@ -524,6 +539,58 @@ class PythonParser(BaseParser):
             ))
 
     # ------------------------------------------------------------------
+    # Pre-scan: collect same-scope function/method targets
+    # ------------------------------------------------------------------
+
+    def _collect_local_function_targets(
+        self,
+        body: Node,
+        ctx: _ParsingContext,
+        scope_full_name: str,
+    ) -> dict[str, str]:
+        """Pre-scan phase: walk direct function_definition children of a
+        body node (class body or module root) and compute each one's
+        full_name and entity_id without emitting any entities.
+
+        This mirrors the Java parser's _collect_class_call_targets
+        (java.py:689-720). It runs BEFORE _process_method /
+        _process_top_level_function so that _extract_calls can resolve
+        forward references to same-scope functions that haven't been
+        added to result.entities yet.
+
+        `scope_full_name` is the dotted prefix for nesting:
+        - For a class body: the class's full_name (e.g., "module.Service")
+        - For the module root: the module name (e.g., "module")
+
+        Returns {full_name: entity_id} keyed on the dotted full name that
+        _extract_calls computes for self.method() and module-level calls.
+        """
+        targets: dict[str, str] = {}
+        for child in body.children:
+            func_node: Node | None = None
+            if child.type == "function_definition":
+                func_node = child
+            elif child.type == "decorated_definition":
+                # Unwrap the decorator to get the inner function definition
+                for inner in child.children:
+                    if inner.type == "function_definition":
+                        func_node = inner
+                        break
+            if func_node is None:
+                continue
+            name_node = func_node.child_by_field_name("name")
+            if not name_node:
+                continue
+            method_name = self._get_text(name_node, ctx.code)
+            full_name = (
+                f"{scope_full_name}.{method_name}" if scope_full_name
+                else method_name
+            )
+            entity_id = f"{ctx.repository}::{full_name}"
+            targets[full_name] = entity_id
+        return targets
+
+    # ------------------------------------------------------------------
     # CALLS extraction
     # ------------------------------------------------------------------
 
@@ -535,7 +602,34 @@ class PythonParser(BaseParser):
         class_ctx: _ClassContext | None,
         result: ParseResult,
     ) -> None:
-        """Extract function/method calls from a function body."""
+        """Extract function/method calls from a function body.
+
+        Resolution strategy (mirrors java.py:631-740):
+
+        1. Compute called_name for each call. For `self.method()` inside a
+           class, called_name = "ClassFullName.method" (matches
+           _ClassContext.local_method_ids). For plain `function()` at
+           module level, called_name = "function" - matched against
+           _ParsingContext.module_function_ids using either the bare
+           name or the scope-qualified form "module.function".
+        2. Look up the called_name in the pre-scanned maps populated by
+           _collect_local_function_targets. Both maps are populated
+           BEFORE any method bodies are processed, so forward references
+           to methods/functions defined later in the same scope resolve
+           correctly.
+        3. If local resolution succeeds, point the CALLS edge at the real
+           entity id. No Reference entity is created.
+        4. If local resolution fails (cross-file / library / unknown
+           object call), synthesize a Reference entity as the fallback
+           target. This matches java.py:671-687 and prevents
+           PostgresWriteBackend's EXISTS filter from silently dropping
+           the relationship.
+
+        DO NOT build the local map from result.entities at call time.
+        _process_method runs _extract_calls immediately after adding the
+        method entity, so forward-referenced methods won't be in
+        result.entities yet. The pre-scan is the only correct approach.
+        """
         seen: set[str] = set()
 
         for call_node in self._find_nodes(body_node, "call"):
@@ -544,7 +638,6 @@ class PythonParser(BaseParser):
                 continue
 
             called_name: str | None = None
-
             if func_node.type == "identifier":
                 called_name = self._get_text(func_node, ctx.code)
             elif func_node.type == "attribute":
@@ -558,14 +651,40 @@ class PythonParser(BaseParser):
                     else:
                         called_name = f"{obj_text}.{method_name}"
 
-            if called_name and called_name not in seen:
-                seen.add(called_name)
-                target_id = f"{ctx.repository}::{called_name}"
-                result.add_relationship(CodeRelationship(
-                    source_id=caller_entity_id,
-                    target_id=target_id,
-                    relationship_type=RelationshipType.CALLS,
+            if not called_name or called_name in seen:
+                continue
+            seen.add(called_name)
+
+            # Step 1: Resolve against pre-scanned same-scope targets.
+            target_id: str | None = None
+            if class_ctx is not None:
+                target_id = class_ctx.local_method_ids.get(called_name)
+            if target_id is None:
+                target_id = ctx.module_function_ids.get(called_name)
+                if target_id is None and ctx.module_name:
+                    qualified = f"{ctx.module_name}.{called_name}"
+                    target_id = ctx.module_function_ids.get(qualified)
+
+            # Step 2: Fallback - synthesize a Reference entity.
+            if target_id is None:
+                target_id = f"{caller_entity_id}::ref:{called_name}"
+                result.add_entity(CodeEntity(
+                    id=target_id,
+                    name=called_name,
+                    entity_type=EntityType.REFERENCE,
+                    repository=ctx.repository,
+                    file_path=ctx.file_path,
+                    line_number=call_node.start_point[0] + 1,
+                    language=self.language,
+                    properties={"symbol": called_name},
                 ))
+
+            # Step 3: Emit the CALLS relationship
+            result.add_relationship(CodeRelationship(
+                source_id=caller_entity_id,
+                target_id=target_id,
+                relationship_type=RelationshipType.CALLS,
+            ))
 
     # ------------------------------------------------------------------
     # Base class extraction
@@ -749,7 +868,14 @@ class PythonParser(BaseParser):
 class _ParsingContext:
     """Holds mutable state during parsing of a single file."""
 
-    __slots__ = ("file_path", "code", "module_name", "repository", "file_entity_id")
+    __slots__ = (
+        "file_path",
+        "code",
+        "module_name",
+        "repository",
+        "file_entity_id",
+        "module_function_ids",
+    )
 
     def __init__(
         self,
@@ -764,12 +890,20 @@ class _ParsingContext:
         self.module_name = module_name
         self.repository = repository
         self.file_entity_id = file_entity_id
+        self.module_function_ids: dict[str, str] = {}
 
 
 class _ClassContext:
     """Context for the class currently being processed."""
 
-    __slots__ = ("class_name", "class_full_name", "class_entity_id", "bases", "decorators")
+    __slots__ = (
+        "class_name",
+        "class_full_name",
+        "class_entity_id",
+        "bases",
+        "decorators",
+        "local_method_ids",
+    )
 
     def __init__(
         self,
@@ -778,9 +912,11 @@ class _ClassContext:
         class_entity_id: str,
         bases: list[str],
         decorators: list[str],
+        local_method_ids: dict[str, str] | None = None,
     ) -> None:
         self.class_name = class_name
         self.class_full_name = class_full_name
         self.class_entity_id = class_entity_id
         self.bases = bases
         self.decorators = decorators
+        self.local_method_ids = local_method_ids or {}

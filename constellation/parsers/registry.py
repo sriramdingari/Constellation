@@ -32,6 +32,13 @@ class ParserRegistry:
         """Return the parser that handles *file_path*, or ``None``."""
         return self._extension_map.get(file_path.suffix)
 
+    def clone(self) -> "ParserRegistry":
+        """Create a new registry with fresh instances of the same parser classes."""
+        new = ParserRegistry()
+        for parser in self._parsers.values():
+            new.register(type(parser)())
+        return new
+
     @property
     def supported_extensions(self) -> set[str]:
         """Set of all currently registered file extensions."""
@@ -59,6 +66,17 @@ def _register_default_parsers(registry: ParserRegistry) -> None:
         DotNetParser,
     ):
         registry.register(parser_cls())
+
+
+def create_fresh_registry() -> ParserRegistry:
+    """Create a new ParserRegistry with all built-in parsers.
+
+    Each call returns a distinct registry with distinct parser instances.
+    Use this for thread-isolated indexing workers.
+    """
+    registry = ParserRegistry()
+    _register_default_parsers(registry)
+    return registry
 
 
 def get_default_registry() -> ParserRegistry:

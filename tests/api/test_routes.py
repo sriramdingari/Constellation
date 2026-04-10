@@ -43,7 +43,7 @@ def mock_graph_client():
     mock_client.list_repositories = AsyncMock(return_value=[])
     mock_client.delete_repository = AsyncMock()
     with patch(
-        "constellation.api.routes.GraphClient", return_value=mock_client
+        "constellation.api.routes.create_write_backend", return_value=mock_client
     ):
         yield mock_client
 
@@ -263,6 +263,37 @@ class TestGetJobStatus:
         assert "Connection refused" in data["error"]
 
 
+@pytest.mark.asyncio
+async def test_get_backend_initializes_schema_on_first_call(monkeypatch):
+    """_get_backend must call initialize_schema() on the first acquisition
+    so a fresh deployment can serve /repositories before any indexing job
+    has run. Subsequent calls must NOT re-initialize."""
+    from constellation.api import routes
+
+    # Reset the module-level flag via monkeypatch so it's restored at teardown
+    monkeypatch.setattr(routes, "_schema_initialized", False)
+
+    fake_backend = MagicMock()
+    fake_backend.connect = AsyncMock()
+    fake_backend.initialize_schema = AsyncMock()
+    fake_backend.close = AsyncMock()
+
+    def fake_factory(settings):
+        return fake_backend
+
+    monkeypatch.setattr(routes, "create_write_backend", fake_factory)
+
+    # First call: schema init must fire
+    backend1 = await routes._get_backend()
+    assert backend1 is fake_backend
+    assert fake_backend.initialize_schema.await_count == 1
+
+    # Second call: schema init must NOT fire again (flag guards it)
+    backend2 = await routes._get_backend()
+    assert fake_backend.initialize_schema.await_count == 1, \
+        "initialize_schema must run once per process, not per call"
+
+
 class TestHealth:
     def test_returns_health_status(self, client, mock_graph_client):
         with patch("constellation.api.routes.redis") as mock_redis_mod:
@@ -275,3 +306,39 @@ class TestHealth:
         assert data["status"] == "ok"
         assert data["neo4j"] == "connected"
         assert data["redis"] == "connected"
+
+        # New canonical fields must be present
+        assert "backend" in data, f"Expected 'backend' field; got: {data}"
+        assert "backend_type" in data, f"Expected 'backend_type' field; got: {data}"
+        assert data["backend"] in ("connected", "disconnected")
+        assert data["backend_type"] in ("neo4j", "postgres")
+
+        # Legacy field still present and mirrors backend value
+        assert data["neo4j"] == data["backend"]
+
+    def test_degraded_when_backend_down(self, client):
+        """When the backend is unreachable, status is degraded and backend field
+        says 'disconnected'. Mirror invariant (neo4j == backend) holds in the
+        failure case too."""
+        from unittest.mock import patch
+
+        # Make create_write_backend raise — the health route should catch it
+        # and mark the backend as disconnected rather than 500ing.
+        with patch(
+            "constellation.api.routes.create_write_backend",
+            side_effect=Exception("backend unreachable"),
+        ):
+            with patch("constellation.api.routes.redis") as mock_redis_mod:
+                mock_redis_instance = MagicMock()
+                mock_redis_mod.from_url.return_value = mock_redis_instance
+                mock_redis_instance.ping.return_value = True
+                response = client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "degraded"
+        assert data["backend"] == "disconnected"
+        # Mirror invariant: neo4j legacy alias must match backend even in failure
+        assert data["neo4j"] == data["backend"]
+        # backend_type should still reflect the configured setting, not a default
+        assert data["backend_type"] in ("neo4j", "postgres")

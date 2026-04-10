@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-import redis
+import asyncio
+import logging
 from uuid import uuid4
+
+import redis
 from celery.result import AsyncResult
 from fastapi import APIRouter, HTTPException
 
@@ -16,7 +19,7 @@ from constellation.api.schemas import (
     RepositoryInfo,
 )
 from constellation.config import get_settings
-from constellation.graph.client import GraphClient
+from constellation.graph.factory import create_write_backend
 from constellation.indexer.collector import derive_repo_name
 from constellation.locking import (
     INDEX_LOCK_TTL_SECONDS,
@@ -27,7 +30,22 @@ from constellation.locking import (
 from constellation.worker.celery_app import celery_app
 from constellation.worker.tasks import index_repository
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Process-local flag: the first API call that acquires a backend also runs
+# initialize_schema() so the DB is ready for repository queries before the
+# first indexing job. Subsequent calls skip the init because it has already
+# run in this process. The operation is idempotent (CREATE TABLE IF NOT
+# EXISTS throughout), and an asyncio.Lock serializes concurrent first-call
+# coroutines so only one pays the DDL cost.
+#
+# Known limitation: if the DB is wiped while the server is running, this
+# flag stays True and queries will fail with UndefinedTableError until a
+# worker restart. Documented trade-off vs adding retry logic everywhere.
+_schema_initialized: bool = False
+_schema_init_lock: asyncio.Lock = asyncio.Lock()
 
 # Map Celery states to API-facing status strings.
 _STATE_MAP = {
@@ -41,12 +59,35 @@ _STATE_MAP = {
 }
 
 
-async def _get_graph_client() -> GraphClient:
-    """Create and connect a GraphClient. Caller must close it."""
+async def _get_backend():
+    """Create and connect a WriteBackend. Caller must close it.
+
+    On the first call per process, also runs initialize_schema() so that
+    a fresh Postgres deployment can serve repository queries before any
+    indexing job has run. Subsequent calls skip the init.
+
+    If initialize_schema() raises, the flag stays False so the next call
+    retries the init. Concurrent coroutines racing on the first call are
+    serialized by an asyncio.Lock — only one coroutine pays the DDL cost.
+    """
+    global _schema_initialized
     settings = get_settings()
-    client = GraphClient(settings)
-    await client.connect()
-    return client
+    backend = create_write_backend(settings)
+    await backend.connect()
+    if not _schema_initialized:
+        async with _schema_init_lock:
+            # Double-check after acquiring the lock: another coroutine may
+            # have initialized the schema while we were waiting.
+            if not _schema_initialized:
+                try:
+                    await backend.initialize_schema()
+                    _schema_initialized = True
+                except Exception:
+                    logger.exception(
+                        "Failed to initialize backend schema on first API acquisition"
+                    )
+                    raise
+    return backend
 
 
 @router.post("/repositories/index", status_code=202, response_model=IndexResponse)
@@ -92,42 +133,42 @@ async def index_repo(request: IndexRequest):
 @router.get("/repositories", response_model=list[RepositoryInfo])
 async def list_repos():
     """List all indexed repositories."""
-    client = await _get_graph_client()
+    backend = await _get_backend()
     try:
-        repos = await client.list_repositories()
+        repos = await backend.list_repositories()
         return [RepositoryInfo(**repo) for repo in repos]
     finally:
-        await client.close()
+        await backend.close()
 
 
 @router.get("/repositories/{name}", response_model=RepositoryInfo)
 async def get_repo(name: str):
     """Get information about a specific repository."""
-    client = await _get_graph_client()
+    backend = await _get_backend()
     try:
-        repo = await client.get_repository(name)
+        repo = await backend.get_repository(name)
         if repo is None:
             raise HTTPException(
                 status_code=404, detail=f"Repository '{name}' not found"
             )
         return RepositoryInfo(**repo)
     finally:
-        await client.close()
+        await backend.close()
 
 
 @router.delete("/repositories/{name}", status_code=204)
 async def delete_repo(name: str):
     """Delete a repository and all its indexed data."""
-    client = await _get_graph_client()
+    backend = await _get_backend()
     try:
-        repo = await client.get_repository(name)
+        repo = await backend.get_repository(name)
         if repo is None:
             raise HTTPException(
                 status_code=404, detail=f"Repository '{name}' not found"
             )
-        await client.delete_repository(name)
+        await backend.delete_repository(name)
     finally:
-        await client.close()
+        await backend.close()
 
 
 @router.get("/jobs/{job_id}", response_model=JobStatus)
@@ -163,28 +204,32 @@ async def get_job(job_id: str):
 
 @router.get("/health", response_model=HealthResponse)
 async def health():
-    """Check health of Neo4j and Redis dependencies."""
-    neo4j_status = "disconnected"
-    redis_status = "disconnected"
+    """Check health of backend and Redis dependencies."""
+    settings = get_settings()
+    backend_status = "disconnected"
 
-    # Check Neo4j
     try:
-        client = await _get_graph_client()
+        backend = await _get_backend()
         try:
-            neo4j_status = "connected"
+            backend_status = "connected"
         finally:
-            await client.close()
+            await backend.close()
     except Exception:
-        neo4j_status = "disconnected"
+        backend_status = "disconnected"
 
-    # Check Redis
+    redis_status = "disconnected"
     try:
-        settings = get_settings()
         r = redis.from_url(settings.redis_url)
         r.ping()
         redis_status = "connected"
     except Exception:
         redis_status = "disconnected"
 
-    overall = "ok" if neo4j_status == "connected" and redis_status == "connected" else "degraded"
-    return HealthResponse(status=overall, neo4j=neo4j_status, redis=redis_status)
+    overall = "ok" if backend_status == "connected" and redis_status == "connected" else "degraded"
+    return HealthResponse(
+        status=overall,
+        backend=backend_status,
+        backend_type=settings.storage_backend,
+        neo4j=backend_status,  # legacy alias — same value as `backend`
+        redis=redis_status,
+    )

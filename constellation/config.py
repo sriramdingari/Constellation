@@ -1,3 +1,6 @@
+from typing import Literal
+
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings
 
 DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-3-small"
@@ -16,11 +19,33 @@ class Settings(BaseSettings):
     embedding_dimensions: int = DEFAULT_OPENAI_EMBEDDING_DIMENSIONS
     openai_api_key: str = ""
     openai_base_url: str = ""
+    github_token: str = ""
     ollama_base_url: str = "http://localhost:11434"
     ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS
     embedding_batch_size: int = 8
-    entity_batch_size: int = 100
+    embedding_concurrency: int = 1
+    files_per_chunk: int = Field(
+        100,
+        validation_alias=AliasChoices("files_per_chunk", "entity_batch_size"),
+    )
+    indexing_worker_threads: int = 1
+    storage_backend: Literal["neo4j", "postgres"] = "neo4j"
+    postgres_dsn: str = ""
+
+    @model_validator(mode="after")
+    def _validate_postgres_dsn(self) -> "Settings":
+        """When storage_backend is postgres, postgres_dsn must be set.
+
+        Fails fast at config load time instead of deferring to an opaque
+        asyncpg connection error when the factory tries to dial an empty DSN.
+        """
+        if self.storage_backend == "postgres" and not self.postgres_dsn:
+            raise ValueError(
+                "storage_backend='postgres' requires postgres_dsn to be set. "
+                "Example: postgresql://user:pass@host:5432/dbname"
+            )
+        return self
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

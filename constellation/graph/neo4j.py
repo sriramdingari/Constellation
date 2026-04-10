@@ -1,14 +1,15 @@
-"""Neo4j async graph client for the Constellation code knowledge graph."""
+"""Neo4j write backend for the Constellation code knowledge graph."""
 
 from neo4j import AsyncGraphDatabase
 
 from constellation.config import Settings
 from constellation.graph import schema, queries
+from constellation.graph.base import WriteBackend
 from constellation.models import CodeEntity, CodeRelationship
 
 
-class GraphClient:
-    """Async wrapper around the Neo4j driver for code graph operations."""
+class Neo4jWriteBackend(WriteBackend):
+    """Neo4j implementation of WriteBackend."""
 
     def __init__(self, settings: Settings):
         self._settings = settings
@@ -104,7 +105,7 @@ class GraphClient:
         total = 0
         for label, ents in by_label.items():
             q = queries.upsert_entities_query(label)
-            for batch in self._chunked(ents, self._settings.entity_batch_size):
+            for batch in self._chunked(ents, self._settings.files_per_chunk):
                 entity_dicts = []
                 for e in batch:
                     props: dict = {
@@ -172,7 +173,7 @@ class GraphClient:
         total = 0
         for rel_type, rels in by_type.items():
             q = queries.create_relationships_query(rel_type)
-            for batch in self._chunked(rels, self._settings.entity_batch_size):
+            for batch in self._chunked(rels, self._settings.files_per_chunk):
                 rel_dicts = [
                     {
                         "source_id": r.source_id,
