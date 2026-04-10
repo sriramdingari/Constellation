@@ -26,6 +26,7 @@ def _isolate_settings_from_dotenv(monkeypatch, request):
     monkeypatch.setenv("STORAGE_BACKEND", "neo4j")
     monkeypatch.setenv("POSTGRES_DSN", "")
     monkeypatch.setenv("GITHUB_TOKEN", "")
+    monkeypatch.setenv("INDEXING_WORKER_THREADS", "1")
 
 
 @pytest.fixture
