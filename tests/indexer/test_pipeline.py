@@ -1800,3 +1800,54 @@ class TestFinalizePreparedChunk:
         chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, 1)
         assert not chunk_paths.entities_path.exists()
         mock_embedding_provider.embed_batch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_finalize_chunk_swallows_embedding_errors(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """Must catch embedding failures and record in errors list, not abort."""
+        from constellation.indexer.spool import (
+            ChunkPreparation, SpoolChunkPaths, create_spool_dir, load_chunk_preparation,
+        )
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres", files_per_chunk=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=create_fresh_registry(),
+            settings=settings,
+        )
+        mock_embedding_provider.embed_batch = AsyncMock(
+            side_effect=RuntimeError("embed boom")
+        )
+
+        chunk = ChunkPreparation(
+            chunk_index=1,
+            files=[("a.py", "ha", True)],
+            reindex_preparations=[("a.py", {"repo::a.py"})],
+            entities=[
+                CodeEntity(id="repo::a.py", name="a.py", entity_type=EntityType.FILE,
+                           repository="repo", file_path="a.py", line_number=1,
+                           language="python", content_hash="ha"),
+                CodeEntity(id="repo::a.py#A", name="A", entity_type=EntityType.CLASS,
+                           repository="repo", file_path="a.py", line_number=1,
+                           language="python"),
+            ],
+            relationships=[],
+        )
+
+        spool_dir = create_spool_dir(tmp_path, "run-embed-fail")
+        errors: list[str] = []
+
+        await pipeline._finalize_prepared_chunk(
+            spool_dir=spool_dir, chunk=chunk, errors=errors,
+        )
+
+        assert len(errors) == 1
+        assert "embed boom" in errors[0]
+        loaded = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1))
+        assert loaded.chunk_index == 1

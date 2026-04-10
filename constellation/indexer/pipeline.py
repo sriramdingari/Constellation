@@ -260,7 +260,8 @@ class IndexingPipeline:
                                             entities_found_so_far,
                                         )
                                     await self._finalize_prepared_chunk(
-                                        spool_dir=spool_dir, chunk=chunk
+                                        spool_dir=spool_dir, chunk=chunk,
+                                        errors=errors,
                                     )
                                     if chunk.entities or chunk.relationships:
                                         chunk_indices.append(chunk.chunk_index)
@@ -912,6 +913,7 @@ class IndexingPipeline:
         *,
         spool_dir: Path,
         chunk: ChunkPreparation,
+        errors: list[str] | None = None,
     ) -> None:
         """Embed entities and write a prepared chunk to the spool directory.
 
@@ -920,6 +922,12 @@ class IndexingPipeline:
         """
         if not chunk.entities and not chunk.relationships:
             return
-        await self._embed_entities(chunk.entities)
+        try:
+            await self._embed_entities(chunk.entities)
+        except Exception as exc:
+            err_msg = f"Embedding failed for chunk {chunk.chunk_index}: {exc}"
+            logger.error(err_msg)
+            if errors is not None:
+                errors.append(err_msg)
         chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk.chunk_index)
         write_chunk_preparation(chunk_paths, chunk)
