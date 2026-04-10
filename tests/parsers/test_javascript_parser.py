@@ -508,13 +508,17 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
         assert call_targets <= reference_entities.keys()
-        reference_names = {reference_entities[target_id].name for target_id in call_targets}
-        reference_symbols = {
-            reference_entities[target_id].properties["symbol"]
+        reference_pairs = {
+            (
+                reference_entities[target_id].name,
+                reference_entities[target_id].properties["symbol"],
+            )
             for target_id in call_targets
         }
-        assert reference_names == {"missing", "client.ping"}
-        assert reference_symbols == {"missing", "client.ping"}
+        assert reference_pairs == {
+            ("missing", "missing"),
+            ("client.ping", "client.ping"),
+        }
 
     def test_unresolved_calls_in_different_places_get_distinct_reference_ids(self, parser, tmp_path):
         source = tmp_path / "distinct_references.ts"
