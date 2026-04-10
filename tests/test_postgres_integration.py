@@ -856,5 +856,14 @@ async def test_concurrent_embedding_matches_serial_replay(
     assert provider.max_inflight >= 2
     hashes = await write_backend.get_file_hashes("concurrent-embedding-test")
     assert hashes.keys() == {"a.py", "b.py"}
+    pool = write_backend._require_pool()
+    embedding_rows = await pool.fetchval(
+        "SELECT COUNT(*) "
+        "FROM code_embeddings embeddings "
+        "JOIN code_symbols symbols ON symbols.id = embeddings.symbol_id "
+        "WHERE symbols.repository = $1",
+        "concurrent-embedding-test",
+    )
+    assert embedding_rows >= 2
 
     await write_backend.delete_repository("concurrent-embedding-test")
