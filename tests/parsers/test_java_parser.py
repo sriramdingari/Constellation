@@ -586,6 +586,38 @@ class TestCallsRelationships:
         assert reference_entities[second_target].name == "com.example.Worker.missing"
         assert reference_entities[second_target].properties["symbol"] == "com.example.Worker.missing"
 
+    def test_unresolved_java_calls_at_different_sites_in_same_method_get_distinct_reference_ids(self, parser, tmp_path):
+        sample = tmp_path / "DistinctUnresolvedSites.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void run() {\n"
+            "        missing();\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        run_id = f"{REPO}::com.example.Worker.run()"
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == run_id
+        ]
+
+        assert len(call_targets) == 2
+        assert len(set(call_targets)) == 2
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities(result, EntityType.REFERENCE)
+        }
+        assert set(call_targets) <= reference_entities.keys()
+        for target_id in call_targets:
+            assert reference_entities[target_id].name == "com.example.Worker.missing"
+            assert reference_entities[target_id].properties["symbol"] == "com.example.Worker.missing"
+
 
 # ===========================================================================
 # Docstring / Javadoc Capture
