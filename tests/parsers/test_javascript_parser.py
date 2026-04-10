@@ -508,6 +508,29 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
 
+    def test_default_import_call_resolves_to_declaration_target(self, parser, tmp_path):
+        source = tmp_path / "default_import.ts"
+        source.write_text(
+            "import helper from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::default_import.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
     def test_namespace_imported_member_call_resolves_to_declaration_target(self, parser, tmp_path):
         source = tmp_path / "namespace_import.ts"
         source.write_text(
@@ -665,6 +688,73 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
         assert not (call_targets & reference_ids)
+
+    def test_nested_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "nested_local_calls.ts"
+        source.write_text(
+            "function outer(): number {\n"
+            "  function helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        outer_id = f"{REPOSITORY}::nested_local_calls.outer"
+        helper_id = f"{REPOSITORY}::nested_local_calls.outer.helper"
+
+        helper_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.id == helper_id
+        ]
+        assert len(helper_entities) == 1
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, outer_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_parenthesized_call_site_is_not_dropped(self, parser, tmp_path):
+        source = tmp_path / "parenthesized_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  return (helper)();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::parenthesized_calls.run"
+        helper_id = f"{REPOSITORY}::parenthesized_calls.helper"
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert len(call_targets) == 1
+
+        target_id = call_targets[0]
+        if target_id == helper_id:
+            return
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
 
 
 # ===========================================================================
