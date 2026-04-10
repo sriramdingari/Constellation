@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -216,6 +217,7 @@ class IndexingPipeline:
                             submitted: list[asyncio.Future] = []
                             submit_idx = 0
                             max_in_flight = max_workers + 1
+                            tls = threading.local()
 
                             while submit_idx < len(all_chunk_plans) or submitted:
                                 # Submit up to max_in_flight
@@ -230,6 +232,7 @@ class IndexingPipeline:
                                         chunk_index,
                                         chunk_plans_item,
                                         needs_relationship_refresh,
+                                        tls,
                                     )
                                     submitted.append(asyncio.wrap_future(cfut, loop=loop))
                                     submit_idx += 1
@@ -737,13 +740,18 @@ class IndexingPipeline:
         chunk_index: int,
         chunk_plans: list[tuple[Path, str, str, bool]],
         needs_relationship_refresh: bool,
+        thread_local: threading.local,
     ) -> tuple[int, ChunkPreparation, int, list[str]]:
-        """Thread-safe wrapper that runs parse-only preparation with a fresh registry.
+        """Thread-safe wrapper that runs parse-only preparation with a cached registry.
 
         Intended to be submitted to a :class:`~concurrent.futures.ThreadPoolExecutor`.
+        Each worker thread clones the registry once on first use and reuses
+        it for subsequent chunks, avoiding redundant parser instantiation.
         Returns ``(chunk_index, chunk, files_delta, chunk_errors)``.
         """
-        worker_registry = self._registry.clone()
+        if not hasattr(thread_local, "registry"):
+            thread_local.registry = self._registry.clone()
+        worker_registry = thread_local.registry
         chunk, files_delta, chunk_errors = self._prepare_chunk_parse_only(
             repo_name=repo_name,
             chunk_index=chunk_index,

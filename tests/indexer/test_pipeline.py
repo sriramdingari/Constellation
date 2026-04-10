@@ -1659,6 +1659,52 @@ class TestPostgresSpoolPath:
             f"FooParser entity not found — worker used built-in registry. Entities: {entity_names}"
         )
 
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_registry_reused_per_thread(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        """Each thread should clone the registry once and reuse it,
+        not clone per chunk."""
+        from constellation.parsers.registry import create_fresh_registry
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        custom_registry = create_fresh_registry()
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=custom_registry,
+            settings=settings,
+        )
+        for i in range(4):
+            _create_py_file(tmp_path, f"f{i}.py", f"class C{i}: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(8, 0, 8)
+        )
+
+        clone_count = {"value": 0}
+        original_clone = custom_registry.clone
+
+        def counting_clone():
+            clone_count["value"] += 1
+            return original_clone()
+
+        with patch.object(custom_registry, "clone", side_effect=counting_clone), \
+             patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc"), \
+             patch("constellation.indexer.pipeline.cleanup_spool_dir"):
+            await pipeline.run(source=str(tmp_path))
+
+        # 2 threads -> at most 2 clone() calls (one per thread)
+        assert clone_count["value"] <= 2, (
+            f"Expected at most 2 registry clones (one per thread); "
+            f"got {clone_count['value']}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # create_fresh_registry
