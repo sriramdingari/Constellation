@@ -91,7 +91,8 @@ class _ParsingContext:
     imported_namespace_modules: dict[str, str] = field(default_factory=dict)
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     current_class_method_ids: dict[str, str] = field(default_factory=dict)
-    local_callable_scopes: list[dict[str, str]] = field(default_factory=list)
+    local_callable_scopes: list[dict[str, str | None]] = field(default_factory=list)
+    local_instance_scopes: list[dict[str, str]] = field(default_factory=list)
 
     def entity_id(self, *parts: str) -> str:
         """Build an entity ID in the format ``{repository}::{qualified.name}``."""
@@ -712,12 +713,15 @@ class JavaScriptParser(BaseParser):
         scope_parts: list[str],
     ) -> None:
         local_callable_ids = self._collect_scope_callable_ids(body, ctx, scope_parts)
+        local_instance_ids = self._collect_scope_instance_ids(body, ctx)
         ctx.local_callable_scopes.append(local_callable_ids)
+        ctx.local_instance_scopes.append(local_instance_ids)
         try:
             self._process_nested_callables(body, ctx, result, source_id, scope_parts)
             self._extract_calls(body, ctx, result, source_id)
             self._extract_hook_calls(body, ctx, result, source_id)
         finally:
+            ctx.local_instance_scopes.pop()
             ctx.local_callable_scopes.pop()
 
     def _collect_scope_callable_ids(
@@ -725,8 +729,8 @@ class JavaScriptParser(BaseParser):
         node: Node,
         ctx: _ParsingContext,
         scope_parts: list[str],
-    ) -> dict[str, str]:
-        callable_ids: dict[str, str] = {}
+    ) -> dict[str, str | None]:
+        callable_ids = self._collect_parameter_bindings(node, ctx.code)
         for current in self._iter_scope_nodes(node):
             if current.type == "function_declaration":
                 name_node = current.child_by_field_name("name")
@@ -736,6 +740,32 @@ class JavaScriptParser(BaseParser):
                 callable_ids[func_name] = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
                 continue
 
+            if current.type == "class_declaration":
+                name_node = current.child_by_field_name("name")
+                if name_node:
+                    callable_ids[self._get_text(name_node, ctx.code)] = None
+                continue
+
+            if current.type != "variable_declarator":
+                continue
+
+            name_node = current.child_by_field_name("name")
+            value_node = current.child_by_field_name("value")
+            if not name_node or name_node.type != "identifier":
+                continue
+            func_name = self._get_text(name_node, ctx.code)
+            if not value_node:
+                callable_ids[func_name] = None
+                continue
+            if self._resolve_function_value(value_node) is None:
+                callable_ids[func_name] = None
+                continue
+            callable_ids[func_name] = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
+        return callable_ids
+
+    def _collect_scope_instance_ids(self, node: Node, ctx: _ParsingContext) -> dict[str, str]:
+        instance_ids: dict[str, str] = {}
+        for current in self._iter_scope_nodes(node):
             if current.type != "variable_declarator":
                 continue
 
@@ -743,10 +773,41 @@ class JavaScriptParser(BaseParser):
             value_node = current.child_by_field_name("value")
             if not name_node or name_node.type != "identifier" or not value_node:
                 continue
-            if self._resolve_function_value(value_node) is None:
+            if value_node.type != "new_expression":
                 continue
-            func_name = self._get_text(name_node, ctx.code)
-            callable_ids[func_name] = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
+
+            constructor_node = value_node.child_by_field_name("constructor")
+            if constructor_node is None:
+                continue
+            constructor_node = self._unwrap_call_target(constructor_node)
+            if constructor_node.type != "identifier":
+                continue
+
+            class_name = self._get_text(constructor_node, ctx.code)
+            if class_name not in ctx.class_method_ids:
+                continue
+            instance_ids[self._get_text(name_node, ctx.code)] = class_name
+        return instance_ids
+
+    def _collect_parameter_bindings(self, body: Node, code: bytes) -> dict[str, str | None]:
+        callable_ids: dict[str, str | None] = {}
+        parent = body.parent
+        if parent is None:
+            return callable_ids
+
+        parameters = parent.child_by_field_name("parameters")
+        if parameters is None:
+            return callable_ids
+
+        for child in parameters.children:
+            pattern = child
+            if child.type in ("required_parameter", "optional_parameter"):
+                next_pattern = child.child_by_field_name("pattern")
+                if next_pattern is None:
+                    continue
+                pattern = next_pattern
+            if pattern.type == "identifier":
+                callable_ids[self._get_text(pattern, code)] = None
         return callable_ids
 
     def _process_nested_callables(
@@ -937,6 +998,8 @@ class JavaScriptParser(BaseParser):
                     properties = {"symbol": called_symbol}
                     if receiver_text:
                         properties["receiver"] = receiver_text
+                    properties["enclosing_declaration_id"] = source_id
+                    properties["enclosing_declaration_name"] = self._enclosing_declaration_name(source_id)
                     result.add_entity(CodeEntity(
                         id=target_id,
                         name=called_symbol,
@@ -960,9 +1023,8 @@ class JavaScriptParser(BaseParser):
 
     def _resolve_identifier_callable(self, call_name: str, ctx: _ParsingContext) -> str | None:
         for scope in reversed(ctx.local_callable_scopes):
-            target_id = scope.get(call_name)
-            if target_id is not None:
-                return target_id
+            if call_name in scope:
+                return scope[call_name]
 
         target_id = ctx.module_callable_ids.get(call_name)
         if target_id is not None:
@@ -983,6 +1045,13 @@ class JavaScriptParser(BaseParser):
 
         if object_text in {"this", ctx.current_class}:
             return called_symbol, ctx.current_class_method_ids.get(property_name)
+        for scope in reversed(ctx.local_instance_scopes):
+            class_name = scope.get(object_text)
+            if class_name is not None:
+                return called_symbol, ctx.class_method_ids.get(class_name, {}).get(property_name)
+        for scope in reversed(ctx.local_callable_scopes):
+            if object_text in scope:
+                return called_symbol, None
         imported_module = ctx.imported_namespace_modules.get(object_text)
         if imported_module:
             return called_symbol, ctx.entity_id(imported_module, property_name)
@@ -992,6 +1061,11 @@ class JavaScriptParser(BaseParser):
         line_number = call_node.start_point[0] + 1
         column_number = call_node.start_point[1] + 1
         return f"{source_id}::ref:{line_number}:{column_number}:{called_symbol}"
+
+    @staticmethod
+    def _enclosing_declaration_name(source_id: str) -> str:
+        local_id = source_id.split("::", 1)[-1]
+        return local_id.rsplit(".", 1)[-1]
 
     def _unwrap_call_target(self, node: Node) -> Node:
         current = node

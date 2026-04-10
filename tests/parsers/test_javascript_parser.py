@@ -756,6 +756,100 @@ class TestCallsAndReferences:
         assert reference_entities[target_id].name == "helper"
         assert reference_entities[target_id].properties["symbol"] == "helper"
 
+    def test_non_callable_local_shadowing_keeps_call_unresolved(self, parser, tmp_path):
+        source = tmp_path / "shadowed_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "\n"
+            "function run(): void {\n"
+            "  const helper = 1;\n"
+            "  helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::shadowed_calls.run"
+        helper_id = f"{REPOSITORY}::shadowed_calls.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_same_file_instance_receiver_call_resolves_to_class_method(self, parser, tmp_path):
+        source = tmp_path / "instance_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  const worker = new Worker();\n"
+            "  return worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::instance_calls.run"
+        helper_id = f"{REPOSITORY}::instance_calls.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_unresolved_reference_includes_enclosing_declaration_context(self, parser, tmp_path):
+        source = tmp_path / "context_metadata.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::context_metadata.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+        reference = reference_entities[target_id]
+        assert reference.properties["symbol"] == "missing"
+        assert reference.properties["enclosing_declaration_id"] == run_id
+        assert reference.properties["enclosing_declaration_name"] == "run"
+
 
 # ===========================================================================
 # Entity ID format
