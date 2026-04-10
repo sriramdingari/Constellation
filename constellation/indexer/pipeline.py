@@ -214,9 +214,12 @@ class IndexingPipeline:
                                 )
                             )
 
-                            embed_semaphore = asyncio.Semaphore(
-                                max(1, self._settings.embedding_concurrency)
-                            )
+                            embed_limit = max(1, self._settings.embedding_concurrency)
+                            embed_semaphore = asyncio.Semaphore(embed_limit)
+                            # Bound total unfinished chunks across parse, embed,
+                            # and write buffering so parse cannot outrun
+                            # downstream preparation stages.
+                            max_in_flight_chunks = max_workers + embed_limit
                             chunk_metadata: dict[int, tuple[int, list[str]]] = {}
                             embedded_chunks: dict[int, ChunkPreparation] = {}
                             next_chunk_to_write = 1
@@ -227,15 +230,35 @@ class IndexingPipeline:
                             submit_idx = 0
                             tls = threading.local()
 
+                            def unfinished_chunk_count() -> int:
+                                return len(parse_futures) + len(chunk_metadata)
+
+                            async def cleanup_outstanding_work() -> None:
+                                for future in parse_futures.values():
+                                    future.cancel()
+                                for task in embed_tasks.values():
+                                    task.cancel()
+                                pending_cleanup = [
+                                    *parse_futures.values(),
+                                    *embed_tasks.values(),
+                                ]
+                                if pending_cleanup:
+                                    await asyncio.gather(
+                                        *pending_cleanup,
+                                        return_exceptions=True,
+                                    )
+
                             while (
                                 submit_idx < len(all_chunk_plans)
                                 or parse_futures
                                 or embed_tasks
                             ):
-                                # Keep parse submission bounded to worker capacity.
+                                # Keep parse submission bounded to worker capacity
+                                # and downstream unfinished-chunk capacity.
                                 while (
                                     submit_idx < len(all_chunk_plans)
                                     and len(parse_futures) < max_workers
+                                    and unfinished_chunk_count() < max_in_flight_chunks
                                 ):
                                     chunk_index, chunk_plans_item = all_chunk_plans[submit_idx]
                                     parse_futures[chunk_index] = self._submit_parse_chunk(
@@ -300,21 +323,8 @@ class IndexingPipeline:
                                         if chunk.entities or chunk.relationships:
                                             chunk_indices.append(chunk.chunk_index)
                                         next_chunk_to_write += 1
-                                except Exception:
-                                    for future in parse_futures.values():
-                                        future.cancel()
-                                    for task in embed_tasks.values():
-                                        task.cancel()
-                                    if parse_futures:
-                                        await asyncio.gather(
-                                            *parse_futures.values(),
-                                            return_exceptions=True,
-                                        )
-                                    if embed_tasks:
-                                        await asyncio.gather(
-                                            *embed_tasks.values(),
-                                            return_exceptions=True,
-                                        )
+                                except BaseException:
+                                    await cleanup_outstanding_work()
                                     raise
                         finally:
                             executor.shutdown(wait=True, cancel_futures=True)
