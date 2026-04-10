@@ -207,68 +207,115 @@ class IndexingPipeline:
                         max_workers = self._settings.indexing_worker_threads
                         executor = ThreadPoolExecutor(max_workers=max_workers)
                         try:
-                            all_chunk_plans = list(enumerate(
-                                self._chunk_file_plans(file_plans, chunk_size),
-                                start=1,
-                            ))
+                            all_chunk_plans = list(
+                                enumerate(
+                                    self._chunk_file_plans(file_plans, chunk_size),
+                                    start=1,
+                                )
+                            )
 
-                            completed: dict[int, tuple[ChunkPreparation, int, list[str]]] = {}
-                            next_chunk_to_finalize = 1
-                            submitted: list[asyncio.Future] = []
+                            embed_semaphore = asyncio.Semaphore(
+                                max(1, self._settings.embedding_concurrency)
+                            )
+                            chunk_metadata: dict[int, tuple[int, list[str]]] = {}
+                            embedded_chunks: dict[int, ChunkPreparation] = {}
+                            next_chunk_to_write = 1
+                            parse_futures: dict[
+                                int, asyncio.Future[tuple[int, ChunkPreparation, int, list[str]]]
+                            ] = {}
+                            embed_tasks: dict[int, asyncio.Task[ChunkPreparation]] = {}
                             submit_idx = 0
-                            max_in_flight = max_workers + 1
                             tls = threading.local()
 
-                            while submit_idx < len(all_chunk_plans) or submitted:
-                                # Submit up to max_in_flight
+                            while (
+                                submit_idx < len(all_chunk_plans)
+                                or parse_futures
+                                or embed_tasks
+                            ):
+                                # Keep parse submission bounded to worker capacity.
                                 while (
                                     submit_idx < len(all_chunk_plans)
-                                    and len(submitted) < max_in_flight
+                                    and len(parse_futures) < max_workers
                                 ):
                                     chunk_index, chunk_plans_item = all_chunk_plans[submit_idx]
-                                    cfut = executor.submit(
-                                        self._run_chunk_worker,
-                                        repo_name,
-                                        chunk_index,
-                                        chunk_plans_item,
-                                        needs_relationship_refresh,
-                                        tls,
+                                    parse_futures[chunk_index] = self._submit_parse_chunk(
+                                        loop=loop,
+                                        executor=executor,
+                                        repo_name=repo_name,
+                                        chunk_index=chunk_index,
+                                        chunk_plans=chunk_plans_item,
+                                        needs_relationship_refresh=needs_relationship_refresh,
+                                        thread_local=tls,
                                     )
-                                    submitted.append(asyncio.wrap_future(cfut, loop=loop))
                                     submit_idx += 1
 
-                                # Wait for the next completion
-                                if submitted:
+                                pending_work = [
+                                    *parse_futures.values(),
+                                    *embed_tasks.values(),
+                                ]
+                                if not pending_work:
+                                    continue
+
+                                try:
                                     done, _ = await asyncio.wait(
-                                        submitted,
+                                        pending_work,
                                         return_when=asyncio.FIRST_COMPLETED,
                                     )
-                                    for fut in done:
-                                        submitted.remove(fut)
-                                        ci, chunk, fd, ce = fut.result()
-                                        completed[ci] = (chunk, fd, ce)
 
-                                # Finalize in order
-                                while next_chunk_to_finalize in completed:
-                                    chunk, files_delta, chunk_errors = completed.pop(
-                                        next_chunk_to_finalize
-                                    )
-                                    files_processed += files_delta
-                                    errors.extend(chunk_errors)
-                                    entities_found_so_far += len(chunk.entities)
-                                    if progress_callback:
-                                        progress_callback(
-                                            files_total,
-                                            files_processed,
-                                            entities_found_so_far,
+                                    for future in done:
+                                        if future in parse_futures.values():
+                                            ci, chunk, files_delta, chunk_errors = future.result()
+                                            parse_futures.pop(ci, None)
+                                            chunk_metadata[ci] = (files_delta, chunk_errors)
+                                            embed_tasks[ci] = asyncio.create_task(
+                                                self._embed_prepared_chunk(
+                                                    chunk=chunk,
+                                                    embed_semaphore=embed_semaphore,
+                                                )
+                                            )
+                                            continue
+
+                                        chunk = future.result()
+                                        embed_tasks.pop(chunk.chunk_index, None)
+                                        embedded_chunks[chunk.chunk_index] = chunk
+
+                                    while next_chunk_to_write in embedded_chunks:
+                                        chunk = embedded_chunks.pop(next_chunk_to_write)
+                                        files_delta, chunk_errors = chunk_metadata.pop(
+                                            next_chunk_to_write
                                         )
-                                    await self._finalize_prepared_chunk(
-                                        spool_dir=spool_dir, chunk=chunk,
-                                        errors=errors,
-                                    )
-                                    if chunk.entities or chunk.relationships:
-                                        chunk_indices.append(chunk.chunk_index)
-                                    next_chunk_to_finalize += 1
+                                        files_processed += files_delta
+                                        errors.extend(chunk_errors)
+                                        entities_found_so_far += len(chunk.entities)
+                                        if progress_callback:
+                                            progress_callback(
+                                                files_total,
+                                                files_processed,
+                                                entities_found_so_far,
+                                            )
+                                        await self._finalize_prepared_chunk(
+                                            spool_dir=spool_dir,
+                                            chunk=chunk,
+                                        )
+                                        if chunk.entities or chunk.relationships:
+                                            chunk_indices.append(chunk.chunk_index)
+                                        next_chunk_to_write += 1
+                                except Exception:
+                                    for future in parse_futures.values():
+                                        future.cancel()
+                                    for task in embed_tasks.values():
+                                        task.cancel()
+                                    if parse_futures:
+                                        await asyncio.gather(
+                                            *parse_futures.values(),
+                                            return_exceptions=True,
+                                        )
+                                    if embed_tasks:
+                                        await asyncio.gather(
+                                            *embed_tasks.values(),
+                                            return_exceptions=True,
+                                        )
+                                    raise
                         finally:
                             executor.shutdown(wait=True, cancel_futures=True)
                     else:
@@ -761,6 +808,28 @@ class IndexingPipeline:
         )
         return chunk_index, chunk, files_delta, chunk_errors
 
+    def _submit_parse_chunk(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        executor: ThreadPoolExecutor,
+        repo_name: str,
+        chunk_index: int,
+        chunk_plans: list[tuple[Path, str, str, bool]],
+        needs_relationship_refresh: bool,
+        thread_local: threading.local,
+    ) -> asyncio.Future[tuple[int, ChunkPreparation, int, list[str]]]:
+        """Submit parse-only chunk work to the thread pool and wrap it for asyncio."""
+        future = executor.submit(
+            self._run_chunk_worker,
+            repo_name,
+            chunk_index,
+            chunk_plans,
+            needs_relationship_refresh,
+            thread_local,
+        )
+        return asyncio.wrap_future(future, loop=loop)
+
     @staticmethod
     def _relative_file_path(root: Path, file_path: Path) -> str:
         """Return a repository-relative path for stable file identity."""
@@ -916,26 +985,32 @@ class IndexingPipeline:
             for entity, vector in zip(batch, vectors):
                 entity.embedding = vector
 
+    async def _embed_prepared_chunk(
+        self,
+        *,
+        chunk: ChunkPreparation,
+        embed_semaphore: asyncio.Semaphore,
+    ) -> ChunkPreparation:
+        """Embed a prepared chunk while respecting the shared embedding limit."""
+        if not chunk.entities and not chunk.relationships:
+            return chunk
+
+        async with embed_semaphore:
+            await self._embed_entities(chunk.entities)
+        return chunk
+
     async def _finalize_prepared_chunk(
         self,
         *,
         spool_dir: Path,
         chunk: ChunkPreparation,
-        errors: list[str] | None = None,
     ) -> None:
-        """Embed entities and write a prepared chunk to the spool directory.
+        """Write a prepared chunk to the spool directory.
 
-        Called from the main thread after a worker completes parse-only
-        preparation. Embedding and spool writes are serial (not threaded).
+        Called from the main thread after embedding completes so spool writes
+        remain ordered by ``chunk_index``.
         """
         if not chunk.entities and not chunk.relationships:
             return
-        try:
-            await self._embed_entities(chunk.entities)
-        except Exception as exc:
-            err_msg = f"Embedding failed for chunk {chunk.chunk_index}: {exc}"
-            logger.error(err_msg)
-            if errors is not None:
-                errors.append(err_msg)
         chunk_paths = SpoolChunkPaths.for_chunk(spool_dir, chunk.chunk_index)
         write_chunk_preparation(chunk_paths, chunk)

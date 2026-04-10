@@ -1,5 +1,6 @@
 """Tests for the indexing pipeline orchestrator."""
 
+import asyncio
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1938,7 +1939,7 @@ def test_parser_registry_clone_preserves_custom_extensions():
 
 class TestFinalizePreparedChunk:
     @pytest.mark.asyncio
-    async def test_finalize_chunk_embeds_then_writes_spool(
+    async def test_embed_prepared_chunk_then_finalize_writes_spool(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
         from constellation.indexer.spool import (
@@ -1982,7 +1983,14 @@ class TestFinalizePreparedChunk:
         )
 
         spool_dir = create_spool_dir(tmp_path, "run-1")
-        await pipeline._finalize_prepared_chunk(spool_dir=spool_dir, chunk=chunk)
+        embedded_chunk = await pipeline._embed_prepared_chunk(
+            chunk=chunk,
+            embed_semaphore=asyncio.Semaphore(1),
+        )
+        await pipeline._finalize_prepared_chunk(
+            spool_dir=spool_dir,
+            chunk=embedded_chunk,
+        )
 
         loaded = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1))
         assert loaded.chunk_index == 1
@@ -2029,12 +2037,11 @@ class TestFinalizePreparedChunk:
         mock_embedding_provider.embed_batch.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_finalize_chunk_swallows_embedding_errors(
+    async def test_embed_prepared_chunk_propagates_embedding_errors(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
-        """Must catch embedding failures and record in errors list, not abort."""
         from constellation.indexer.spool import (
-            ChunkPreparation, SpoolChunkPaths, create_spool_dir, load_chunk_preparation,
+            ChunkPreparation,
         )
         from constellation.parsers.registry import create_fresh_registry
 
@@ -2067,14 +2074,8 @@ class TestFinalizePreparedChunk:
             relationships=[],
         )
 
-        spool_dir = create_spool_dir(tmp_path, "run-embed-fail")
-        errors: list[str] = []
-
-        await pipeline._finalize_prepared_chunk(
-            spool_dir=spool_dir, chunk=chunk, errors=errors,
-        )
-
-        assert len(errors) == 1
-        assert "embed boom" in errors[0]
-        loaded = load_chunk_preparation(SpoolChunkPaths.for_chunk(spool_dir, 1))
-        assert loaded.chunk_index == 1
+        with pytest.raises(RuntimeError, match="embed boom"):
+            await pipeline._embed_prepared_chunk(
+                chunk=chunk,
+                embed_semaphore=asyncio.Semaphore(1),
+            )
