@@ -1366,6 +1366,101 @@ class TestPostgresSpoolPath:
                 f"No-op run should produce no chunk files; got indices: {manifest.chunk_indices}"
             )
 
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_parse_result_errors_abort_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_parser.parse_file = MagicMock(
+            return_value=ParseResult(
+                file_path=str(tmp_path / "bad.py"),
+                language="python",
+                errors=["Syntax error at line 1"],
+            )
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_parse_exception_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_parser.parse_file = MagicMock(side_effect=RuntimeError("parser boom"))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_pipeline_postgres_serial_embedding_failure_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
+    ):
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=1,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=mock_registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "embed_fail.py", "class EmbedMe: pass")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(
+            return_value=(0, 0, 0)
+        )
+        mock_embedding_provider.embed_batch = AsyncMock(
+            side_effect=RuntimeError("embed boom")
+        )
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Embedding failed: embed boom"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
     def test_prepare_chunk_parse_only_returns_entities_relationships_without_embedding(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
@@ -1694,6 +1789,86 @@ class TestPostgresSpoolPath:
         with patch.object(pipeline, "_run_chunk_worker", side_effect=flaky_worker), \
              patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
             with pytest.raises(RuntimeError, match="boom from worker"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_parse_result_errors_abort_before_replay(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.base import BaseParser
+        from constellation.parsers.registry import ParserRegistry
+
+        class BrokenParser(BaseParser):
+            language = "python"
+            file_extensions = [".py"]
+
+            def parse_file(self, file_path, repo_name):
+                return ParseResult(
+                    file_path=str(file_path),
+                    language="python",
+                    errors=["Syntax error at line 1"],
+                )
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        registry = ParserRegistry()
+        registry.register(BrokenParser())
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
+                await pipeline.run(source=str(tmp_path))
+
+        assert not mock_graph_client.apply_spooled_indexing_changes.called
+
+    @pytest.mark.asyncio
+    async def test_postgres_threaded_parse_exception_aborts_before_replay(
+        self, mock_graph_client, mock_embedding_provider, tmp_path
+    ):
+        from constellation.parsers.base import BaseParser
+        from constellation.parsers.registry import ParserRegistry
+
+        class CrashingParser(BaseParser):
+            language = "python"
+            file_extensions = [".py"]
+
+            def parse_file(self, file_path, repo_name):
+                raise RuntimeError("parser boom")
+
+        settings = _make_settings(
+            storage_backend="postgres",
+            files_per_chunk=1,
+            indexing_worker_threads=2,
+            postgres_dsn="postgresql://test:test@localhost:5432/test",
+        )
+        registry = ParserRegistry()
+        registry.register(CrashingParser())
+        pipeline = IndexingPipeline(
+            graph_client=mock_graph_client,
+            embedding_provider=mock_embedding_provider,
+            parser_registry=registry,
+            settings=settings,
+        )
+        _create_py_file(tmp_path, "bad.py", "broken")
+        mock_graph_client.get_file_hashes = AsyncMock(return_value={})
+        mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
+            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
                 await pipeline.run(source=str(tmp_path))
 
         assert not mock_graph_client.apply_spooled_indexing_changes.called

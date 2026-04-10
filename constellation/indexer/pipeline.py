@@ -289,6 +289,9 @@ class IndexingPipeline:
                                         if future in parse_futures.values():
                                             ci, chunk, files_delta, chunk_errors = future.result()
                                             parse_futures.pop(ci, None)
+                                            if chunk_errors:
+                                                errors.extend(chunk_errors)
+                                                raise RuntimeError(chunk_errors[0])
                                             chunk_metadata[ci] = (files_delta, chunk_errors)
                                             embed_tasks[ci] = asyncio.create_task(
                                                 self._embed_prepared_chunk(
@@ -334,6 +337,7 @@ class IndexingPipeline:
                             self._chunk_file_plans(file_plans, chunk_size),
                             start=1,
                         ):
+                            error_count_before_chunk = len(errors)
                             chunk, files_processed = await self._prepare_chunk(
                                 repo_name=repo_name,
                                 source_path=source_path,
@@ -346,6 +350,8 @@ class IndexingPipeline:
                                 errors=errors,
                                 entities_found_offset=entities_found_so_far,
                             )
+                            if len(errors) > error_count_before_chunk:
+                                raise RuntimeError(errors[error_count_before_chunk])
                             entities_found_so_far += len(chunk.entities)
 
                             # Skip empty chunks — no entities and no relationships
