@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS
     embedding_batch_size: int = 8
+    embedding_concurrency: int = 1
     files_per_chunk: int = Field(
         100,
         validation_alias=AliasChoices("files_per_chunk", "entity_batch_size"),

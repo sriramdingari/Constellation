@@ -55,6 +55,14 @@ class TestSettings:
         s = _settings_without_env_file()
         assert s.embedding_batch_size == 8
 
+    def test_default_embedding_concurrency(self):
+        s = _settings_without_env_file()
+        assert s.embedding_concurrency == 1
+
+    def test_embedding_concurrency_can_be_overridden(self):
+        s = _settings_without_env_file(embedding_concurrency=3)
+        assert s.embedding_concurrency == 3
+
     def test_default_entity_batch_size(self):
         s = _settings_without_env_file()
         assert s.files_per_chunk == 100
