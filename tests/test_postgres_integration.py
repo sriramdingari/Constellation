@@ -790,3 +790,71 @@ async def test_threaded_chunk_preparation_matches_serial_replay(
     assert "b.py" in hashes
 
     await write_backend.delete_repository("threaded-test")
+
+
+async def test_concurrent_embedding_matches_serial_replay(
+    write_backend, postgres_dsn, tmp_path: Path,
+):
+    """Concurrent chunk embedding should overlap without changing replay results."""
+    import asyncio
+
+    from constellation.embeddings.base import BaseEmbeddingProvider
+    from constellation.indexer.pipeline import IndexingPipeline
+    from constellation.parsers.registry import get_default_registry
+
+    class SlowEmbeddingProvider(BaseEmbeddingProvider):
+        def __init__(self) -> None:
+            self.started = 0
+            self._inflight = 0
+            self.max_inflight = 0
+
+        @property
+        def model_name(self) -> str:
+            return "slow-test"
+
+        @property
+        def dimensions(self) -> int:
+            return 1536
+
+        async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+            self.started += 1
+            self._inflight += 1
+            self.max_inflight = max(self.max_inflight, self._inflight)
+            try:
+                await asyncio.sleep(0.05)
+                return [[0.2] * 1536 for _ in texts]
+            finally:
+                self._inflight -= 1
+
+    provider = SlowEmbeddingProvider()
+    await write_backend.delete_repository("concurrent-embedding-test")
+
+    settings = Settings(
+        storage_backend="postgres",
+        postgres_dsn=postgres_dsn,
+        files_per_chunk=1,
+        indexing_worker_threads=2,
+        embedding_concurrency=2,
+    )
+    pipeline = IndexingPipeline(
+        graph_client=write_backend,
+        embedding_provider=provider,
+        parser_registry=get_default_registry(),
+        settings=settings,
+    )
+
+    (tmp_path / "a.py").write_text("class A: pass", encoding="utf-8")
+    (tmp_path / "b.py").write_text("class B: pass", encoding="utf-8")
+
+    result = await pipeline.run(
+        source=str(tmp_path),
+        name="concurrent-embedding-test",
+    )
+
+    assert result.files_processed == 2
+    assert provider.started >= 2
+    assert provider.max_inflight >= 2
+    hashes = await write_backend.get_file_hashes("concurrent-embedding-test")
+    assert hashes.keys() == {"a.py", "b.py"}
+
+    await write_backend.delete_repository("concurrent-embedding-test")
