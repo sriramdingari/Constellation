@@ -65,6 +65,8 @@ class _ParsingContext:
     default_export: str | None = None
     emitted_hooks: set[str] = field(default_factory=set)
     module_callable_ids: dict[str, str] = field(default_factory=dict)
+    imported_callable_ids: dict[str, str] = field(default_factory=dict)
+    imported_namespace_modules: dict[str, str] = field(default_factory=dict)
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     current_class_method_ids: dict[str, str] = field(default_factory=dict)
 
@@ -133,6 +135,7 @@ class JavaScriptParser(BaseParser):
 
         # Two-pass approach: gather exports first, then definitions.
         self._collect_exports(tree.root_node, ctx)
+        self._collect_imports(tree.root_node, ctx)
         self._collect_local_callables(tree.root_node, ctx)
         self._walk_root(tree.root_node, ctx, result, file_id)
 
@@ -200,6 +203,69 @@ class JavaScriptParser(BaseParser):
                             name_node = decl.child_by_field_name("name")
                             if name_node and name_node.type == "identifier":
                                 ctx.exported_names.add(self._get_text(name_node, ctx.code))
+
+    def _collect_imports(self, root: Node, ctx: _ParsingContext) -> None:
+        for child in root.children:
+            if child.type != "import_statement":
+                continue
+
+            source_node = child.child_by_field_name("source")
+            if not source_node:
+                for sub in child.children:
+                    if sub.type == "string":
+                        source_node = sub
+                        break
+            if not source_node:
+                continue
+
+            module_name = self._import_module_name(self._get_text(source_node, ctx.code).strip("'\""))
+
+            clause_node = child.child_by_field_name("clause")
+            if not clause_node:
+                for sub in child.children:
+                    if sub.type == "import_clause":
+                        clause_node = sub
+                        break
+            if not clause_node:
+                continue
+
+            for sub in clause_node.children:
+                if sub.type == "identifier":
+                    # Default imports are intentionally not resolved in v1.
+                    continue
+                if sub.type == "namespace_import":
+                    alias_node = sub.child_by_field_name("name")
+                    if not alias_node:
+                        for grandchild in sub.children:
+                            if grandchild.type == "identifier":
+                                alias_node = grandchild
+                                break
+                    if alias_node:
+                        ctx.imported_namespace_modules[self._get_text(alias_node, ctx.code)] = module_name
+                    continue
+                if sub.type != "named_imports":
+                    continue
+                for spec in sub.children:
+                    if spec.type != "import_specifier":
+                        continue
+                    imported_node = spec.child_by_field_name("name")
+                    if not imported_node:
+                        for grandchild in spec.children:
+                            if grandchild.type == "identifier":
+                                imported_node = grandchild
+                                break
+                    if not imported_node:
+                        continue
+                    imported_name = self._get_text(imported_node, ctx.code)
+                    alias_node = spec.child_by_field_name("alias")
+                    if not alias_node:
+                        identifiers = [grandchild for grandchild in spec.children if grandchild.type == "identifier"]
+                        if len(identifiers) > 1:
+                            alias_node = identifiers[-1]
+                    local_name = imported_name
+                    if alias_node:
+                        local_name = self._get_text(alias_node, ctx.code)
+                    ctx.imported_callable_ids[local_name] = ctx.entity_id(module_name, imported_name)
 
     def _collect_local_callables(self, root: Node, ctx: _ParsingContext) -> None:
         for child in root.children:
@@ -620,10 +686,16 @@ class JavaScriptParser(BaseParser):
 
             called_symbol: str | None = None
             target_id: str | None = None
+            receiver_text: str | None = None
             if func_node.type == "identifier":
                 called_symbol = self._get_text(func_node, ctx.code)
                 target_id = ctx.module_callable_ids.get(called_symbol)
+                if target_id is None:
+                    target_id = ctx.imported_callable_ids.get(called_symbol)
             elif func_node.type == "member_expression":
+                object_node = func_node.child_by_field_name("object")
+                if object_node:
+                    receiver_text = self._get_text(object_node, ctx.code)
                 called_symbol, target_id = self._resolve_member_call(func_node, ctx)
 
             if not called_symbol:
@@ -632,6 +704,9 @@ class JavaScriptParser(BaseParser):
             if target_id is None:
                 target_id = self._reference_target_id(source_id, called_symbol, call_node)
                 if target_id not in seen_targets:
+                    properties = {"symbol": called_symbol}
+                    if receiver_text:
+                        properties["receiver"] = receiver_text
                     result.add_entity(CodeEntity(
                         id=target_id,
                         name=called_symbol,
@@ -641,7 +716,7 @@ class JavaScriptParser(BaseParser):
                         line_number=call_node.start_point[0] + 1,
                         line_end=call_node.end_point[0] + 1,
                         language=self.language,
-                        properties={"symbol": called_symbol},
+                        properties=properties,
                     ))
 
             if target_id in seen_targets:
@@ -665,12 +740,24 @@ class JavaScriptParser(BaseParser):
 
         if object_text in {"this", ctx.current_class}:
             return called_symbol, ctx.current_class_method_ids.get(property_name)
+        imported_module = ctx.imported_namespace_modules.get(object_text)
+        if imported_module:
+            return called_symbol, ctx.entity_id(imported_module, property_name)
         return called_symbol, None
 
     def _reference_target_id(self, source_id: str, called_symbol: str, call_node: Node) -> str:
         line_number = call_node.start_point[0] + 1
         column_number = call_node.start_point[1] + 1
         return f"{source_id}::ref:{line_number}:{column_number}:{called_symbol}"
+
+    @staticmethod
+    def _import_module_name(specifier: str) -> str:
+        module_name = Path(specifier).stem
+        if module_name == "index":
+            parent_name = Path(specifier).parent.name
+            if parent_name:
+                return parent_name
+        return module_name
 
     # -- Hook call extraction (USES_HOOK) -----------------------------------
 

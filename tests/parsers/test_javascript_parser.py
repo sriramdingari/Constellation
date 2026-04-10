@@ -485,6 +485,52 @@ class TestCallsAndReferences:
         }
         assert not (call_targets & reference_ids)
 
+    def test_imported_function_call_resolves_to_declaration_target(self, parser, tmp_path):
+        source = tmp_path / "imported_function.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::imported_function.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_namespace_imported_member_call_resolves_to_declaration_target(self, parser, tmp_path):
+        source = tmp_path / "namespace_import.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::namespace_import.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
     def test_unresolved_calls_emit_reference_entities(self, parser, tmp_path):
         source = tmp_path / "unresolved_calls.ts"
         source.write_text(
@@ -519,6 +565,34 @@ class TestCallsAndReferences:
             ("missing", "missing"),
             ("client.ping", "client.ping"),
         }
+
+    def test_unresolved_member_call_captures_receiver_metadata(self, parser, tmp_path):
+        source = tmp_path / "receiver_metadata.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  client.ping();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::receiver_metadata.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert call_targets <= reference_entities.keys()
+
+        target_id = next(iter(call_targets))
+        reference = reference_entities[target_id]
+        assert reference.name == "client.ping"
+        assert reference.properties["symbol"] == "client.ping"
+        assert reference.properties["receiver"] == "client"
 
     def test_unresolved_calls_in_different_places_get_distinct_reference_ids(self, parser, tmp_path):
         source = tmp_path / "distinct_references.ts"
