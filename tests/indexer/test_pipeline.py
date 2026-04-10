@@ -1473,13 +1473,20 @@ class TestPostgresSpoolPath:
         )
 
         original_embed_entities = pipeline._embed_entities
-        call_count = {"value": 0}
+        chunk1_started = asyncio.Event()
+        embedding_completion_order: list[int] = []
 
         async def delayed_embed_entities(entities):
-            call_count["value"] += 1
-            if call_count["value"] == 1:
+            chunk_index = (
+                1 if any(entity.file_path.endswith("a.py") for entity in entities) else 2
+            )
+            if chunk_index == 1:
+                chunk1_started.set()
                 await asyncio.sleep(0.05)
-            return await original_embed_entities(entities)
+            else:
+                await chunk1_started.wait()
+            await original_embed_entities(entities)
+            embedding_completion_order.append(chunk_index)
 
         with patch.object(
             pipeline,
@@ -1495,6 +1502,7 @@ class TestPostgresSpoolPath:
             "spool_dir"
         ]
         manifest = load_run_manifest(spool_dir / "run_manifest.json")
+        assert embedding_completion_order == [2, 1]
         assert manifest.chunk_indices == [1, 2]
 
     @pytest.mark.asyncio
@@ -1503,6 +1511,7 @@ class TestPostgresSpoolPath:
     ):
         from concurrent.futures import Future
         from constellation.parsers.registry import create_fresh_registry
+        import threading
 
         settings = _make_settings(
             storage_backend="postgres",
@@ -1526,18 +1535,32 @@ class TestPostgresSpoolPath:
         )
 
         submit_calls: list[int] = []
+        in_flight: list[Future] = []
+        lock = threading.Lock()
 
         class RecordingExecutor:
             def __init__(self, max_workers):
                 self.max_workers = max_workers
 
             def submit(self, fn, *args, **kwargs):
-                submit_calls.append(args[1])
-                future = Future()
-                try:
-                    future.set_result(fn(*args, **kwargs))
-                except Exception as exc:
-                    future.set_exception(exc)
+                chunk_index = args[1]
+                with lock:
+                    active_workers = sum(1 for future in in_flight if not future.done())
+                    if active_workers >= self.max_workers:
+                        raise AssertionError(
+                            f"submitted chunk {chunk_index} before worker capacity freed"
+                        )
+                    submit_calls.append(chunk_index)
+                    future = Future()
+                    in_flight.append(future)
+
+                def complete_work():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except Exception as exc:
+                        future.set_exception(exc)
+
+                threading.Timer(0.01, complete_work).start()
                 return future
 
             def shutdown(self, wait=True, cancel_futures=False):
@@ -1553,7 +1576,6 @@ class TestPostgresSpoolPath:
             await pipeline.run(source=str(tmp_path))
 
         assert submit_calls[:2] == [1, 2]
-        assert len(submit_calls) < 4
 
     @pytest.mark.asyncio
     async def test_postgres_concurrent_embedding_failure_aborts(
