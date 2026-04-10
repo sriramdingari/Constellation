@@ -1474,6 +1474,7 @@ class TestPostgresSpoolPath:
 
         original_embed_entities = pipeline._embed_entities
         chunk1_started = asyncio.Event()
+        chunk2_finished = asyncio.Event()
         embedding_completion_order: list[int] = []
 
         async def delayed_embed_entities(entities):
@@ -1482,11 +1483,13 @@ class TestPostgresSpoolPath:
             )
             if chunk_index == 1:
                 chunk1_started.set()
-                await asyncio.sleep(0.05)
+                await chunk2_finished.wait()
             else:
                 await chunk1_started.wait()
             await original_embed_entities(entities)
             embedding_completion_order.append(chunk_index)
+            if chunk_index == 2:
+                chunk2_finished.set()
 
         with patch.object(
             pipeline,
@@ -1496,7 +1499,7 @@ class TestPostgresSpoolPath:
             "constellation.indexer.pipeline.get_commit_sha",
             return_value="abc123",
         ), patch("constellation.indexer.pipeline.cleanup_spool_dir"):
-            await pipeline.run(source=str(tmp_path))
+            await asyncio.wait_for(pipeline.run(source=str(tmp_path)), timeout=0.2)
 
         spool_dir = mock_graph_client.apply_spooled_indexing_changes.call_args.kwargs[
             "spool_dir"
@@ -1535,24 +1538,30 @@ class TestPostgresSpoolPath:
         )
 
         submit_calls: list[int] = []
-        in_flight: list[Future] = []
+        active_futures: list[Future] = []
         lock = threading.Lock()
+        max_active = 0
 
         class RecordingExecutor:
             def __init__(self, max_workers):
                 self.max_workers = max_workers
 
             def submit(self, fn, *args, **kwargs):
+                nonlocal max_active
                 chunk_index = args[1]
                 with lock:
-                    active_workers = sum(1 for future in in_flight if not future.done())
+                    active_workers = sum(
+                        1 for future in active_futures if not future.done()
+                    )
                     if active_workers >= self.max_workers:
                         raise AssertionError(
-                            f"submitted chunk {chunk_index} before worker capacity freed"
+                            f"submitted chunk {chunk_index} while {active_workers} "
+                            f"workers were active"
                         )
                     submit_calls.append(chunk_index)
                     future = Future()
-                    in_flight.append(future)
+                    active_futures.append(future)
+                    max_active = max(max_active, active_workers + 1)
 
                 def complete_work():
                     try:
@@ -1575,7 +1584,8 @@ class TestPostgresSpoolPath:
         ), patch("constellation.indexer.pipeline.cleanup_spool_dir"):
             await pipeline.run(source=str(tmp_path))
 
-        assert submit_calls[:2] == [1, 2]
+        assert submit_calls == [1, 2, 3, 4]
+        assert max_active <= settings.indexing_worker_threads
 
     @pytest.mark.asyncio
     async def test_postgres_concurrent_embedding_failure_aborts(
