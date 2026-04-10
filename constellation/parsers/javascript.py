@@ -64,6 +64,9 @@ class _ParsingContext:
     exported_names: set[str] = field(default_factory=set)
     default_export: str | None = None
     emitted_hooks: set[str] = field(default_factory=set)
+    module_callable_ids: dict[str, str] = field(default_factory=dict)
+    class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
+    current_class_method_ids: dict[str, str] = field(default_factory=dict)
 
     def entity_id(self, *parts: str) -> str:
         """Build an entity ID in the format ``{repository}::{qualified.name}``."""
@@ -130,6 +133,7 @@ class JavaScriptParser(BaseParser):
 
         # Two-pass approach: gather exports first, then definitions.
         self._collect_exports(tree.root_node, ctx)
+        self._collect_local_callables(tree.root_node, ctx)
         self._walk_root(tree.root_node, ctx, result, file_id)
 
         return result
@@ -196,6 +200,56 @@ class JavaScriptParser(BaseParser):
                             name_node = decl.child_by_field_name("name")
                             if name_node and name_node.type == "identifier":
                                 ctx.exported_names.add(self._get_text(name_node, ctx.code))
+
+    def _collect_local_callables(self, root: Node, ctx: _ParsingContext) -> None:
+        for child in root.children:
+            if child.type == "export_statement":
+                for sub in child.children:
+                    self._collect_top_level_callables(sub, ctx)
+            else:
+                self._collect_top_level_callables(child, ctx)
+
+    def _collect_top_level_callables(self, node: Node, ctx: _ParsingContext) -> None:
+        if node.type == "function_declaration":
+            name_node = node.child_by_field_name("name")
+            if not name_node:
+                return
+            func_name = self._get_text(name_node, ctx.code)
+            ctx.module_callable_ids[func_name] = ctx.entity_id(ctx.module_name, func_name)
+            return
+
+        if node.type in ("lexical_declaration", "variable_declaration"):
+            for declarator in self._find_nodes(node, "variable_declarator"):
+                name_node = declarator.child_by_field_name("name")
+                value_node = declarator.child_by_field_name("value")
+                if not name_node or name_node.type != "identifier" or not value_node:
+                    continue
+                if self._resolve_function_value(value_node) is None:
+                    continue
+                func_name = self._get_text(name_node, ctx.code)
+                ctx.module_callable_ids[func_name] = ctx.entity_id(ctx.module_name, func_name)
+            return
+
+        if node.type != "class_declaration":
+            return
+
+        name_node = node.child_by_field_name("name")
+        body = node.child_by_field_name("body")
+        if not name_node or not body:
+            return
+
+        class_name = self._get_text(name_node, ctx.code)
+        method_ids: dict[str, str] = {}
+        for child in body.children:
+            if child.type != "method_definition":
+                continue
+            method_name_node = child.child_by_field_name("name")
+            if not method_name_node:
+                continue
+            method_name = self._get_text(method_name_node, ctx.code)
+            method_ids[method_name] = ctx.entity_id(ctx.module_name, class_name, method_name)
+        if method_ids:
+            ctx.class_method_ids[class_name] = method_ids
 
     # -- Main walk (second pass) --------------------------------------------
 
@@ -311,11 +365,14 @@ class JavaScriptParser(BaseParser):
         if body:
             saved_class = ctx.current_class
             saved_class_id = ctx.current_class_full_id
+            saved_class_method_ids = ctx.current_class_method_ids
             ctx.current_class = class_name
             ctx.current_class_full_id = class_id
+            ctx.current_class_method_ids = ctx.class_method_ids.get(class_name, {})
             self._process_class_body(body, ctx, result, class_id)
             ctx.current_class = saved_class
             ctx.current_class_full_id = saved_class_id
+            ctx.current_class_method_ids = saved_class_method_ids
 
     def _process_class_body(self, body: Node, ctx: _ParsingContext, result: ParseResult, class_id: str) -> None:
         for child in body.children:
@@ -375,6 +432,7 @@ class JavaScriptParser(BaseParser):
         # Scan body for hook calls
         body = node.child_by_field_name("body")
         if body:
+            self._extract_calls(body, ctx, result, method_id)
             self._extract_hook_calls(body, ctx, result, method_id)
 
     # -- Top-level function -> METHOD entity ---------------------------------
@@ -423,6 +481,7 @@ class JavaScriptParser(BaseParser):
 
         body = node.child_by_field_name("body")
         if body:
+            self._extract_calls(body, ctx, result, func_id)
             self._extract_hook_calls(body, ctx, result, func_id)
 
     # -- Variable declaration (arrow functions) -> METHOD entity -------------
@@ -435,18 +494,8 @@ class JavaScriptParser(BaseParser):
                 continue
 
             # We only care about arrow functions / plain functions assigned to a const.
-            actual_func = value_node
-            if value_node.type == "call_expression":
-                # Could be an HOC wrapper -- skip for now unless wrapping an arrow/function.
-                args_node = value_node.child_by_field_name("arguments")
-                if args_node:
-                    for arg in args_node.children:
-                        if arg.type in ("arrow_function", "function"):
-                            actual_func = arg
-                            break
-                if actual_func.type not in ("arrow_function", "function"):
-                    continue
-            elif value_node.type not in ("arrow_function", "function"):
+            actual_func = self._resolve_function_value(value_node)
+            if actual_func is None:
                 continue
 
             var_name = self._get_text(name_node, ctx.code)
@@ -495,6 +544,7 @@ class JavaScriptParser(BaseParser):
 
             body = actual_func.child_by_field_name("body")
             if body:
+                self._extract_calls(body, ctx, result, func_id)
                 self._extract_hook_calls(body, ctx, result, func_id)
 
     # -- Test stereotype detection ------------------------------------------
@@ -558,6 +608,70 @@ class JavaScriptParser(BaseParser):
                     properties={"export_type": export_type},
                 ))
 
+    # -- General call extraction (CALLS / REFERENCE) ------------------------
+
+    def _extract_calls(self, node: Node, ctx: _ParsingContext, result: ParseResult, source_id: str) -> None:
+        seen_targets: set[str] = set()
+
+        for call_node in self._find_nodes(node, "call_expression"):
+            func_node = call_node.child_by_field_name("function")
+            if not func_node:
+                continue
+
+            called_symbol: str | None = None
+            target_id: str | None = None
+            if func_node.type == "identifier":
+                called_symbol = self._get_text(func_node, ctx.code)
+                target_id = ctx.module_callable_ids.get(called_symbol)
+            elif func_node.type == "member_expression":
+                called_symbol, target_id = self._resolve_member_call(func_node, ctx)
+
+            if not called_symbol:
+                continue
+
+            if target_id is None:
+                target_id = self._reference_target_id(source_id, called_symbol, call_node)
+                if target_id not in seen_targets:
+                    result.add_entity(CodeEntity(
+                        id=target_id,
+                        name=called_symbol,
+                        entity_type=EntityType.REFERENCE,
+                        repository=ctx.repository,
+                        file_path=ctx.file_path,
+                        line_number=call_node.start_point[0] + 1,
+                        line_end=call_node.end_point[0] + 1,
+                        language=self.language,
+                        properties={"symbol": called_symbol},
+                    ))
+
+            if target_id in seen_targets:
+                continue
+            seen_targets.add(target_id)
+            result.add_relationship(CodeRelationship(
+                source_id=source_id,
+                target_id=target_id,
+                relationship_type=RelationshipType.CALLS,
+            ))
+
+    def _resolve_member_call(self, node: Node, ctx: _ParsingContext) -> tuple[str | None, str | None]:
+        object_node = node.child_by_field_name("object")
+        property_node = node.child_by_field_name("property")
+        if not object_node or not property_node:
+            return None, None
+
+        object_text = self._get_text(object_node, ctx.code)
+        property_name = self._get_text(property_node, ctx.code)
+        called_symbol = f"{object_text}.{property_name}"
+
+        if object_text in {"this", ctx.current_class}:
+            return called_symbol, ctx.current_class_method_ids.get(property_name)
+        return called_symbol, None
+
+    def _reference_target_id(self, source_id: str, called_symbol: str, call_node: Node) -> str:
+        line_number = call_node.start_point[0] + 1
+        column_number = call_node.start_point[1] + 1
+        return f"{source_id}::ref:{line_number}:{column_number}:{called_symbol}"
+
     # -- Hook call extraction (USES_HOOK) -----------------------------------
 
     def _extract_hook_calls(self, node: Node, ctx: _ParsingContext, result: ParseResult, source_id: str) -> None:
@@ -588,6 +702,19 @@ class JavaScriptParser(BaseParser):
                         target_id=hook_id,
                         relationship_type=RelationshipType.USES_HOOK,
                     ))
+
+    def _resolve_function_value(self, value_node: Node) -> Node | None:
+        actual_func = value_node
+        if value_node.type == "call_expression":
+            args_node = value_node.child_by_field_name("arguments")
+            if args_node:
+                for arg in args_node.children:
+                    if arg.type in ("arrow_function", "function"):
+                        return arg
+            return None
+        if actual_func.type in ("arrow_function", "function"):
+            return actual_func
+        return None
 
     # -- Parameter / return-type extraction ----------------------------------
 
