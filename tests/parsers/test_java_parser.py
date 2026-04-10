@@ -510,6 +510,76 @@ class TestCallsRelationships:
         assert len(reference_targets) == 1
         assert reference_targets[0].name == "logger.info"
 
+    def test_unresolved_java_calls_produce_reference_entity_and_calls_edge(self, parser, tmp_path):
+        sample = tmp_path / "UnresolvedCall.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void run() {\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        run_id = f"{REPO}::com.example.Worker.run()"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == run_id
+        }
+
+        assert call_targets, "Expected run() to emit a CALLS edge for missing()"
+
+        reference_targets = [
+            entity for entity in _entities(result, EntityType.REFERENCE)
+            if entity.id in call_targets
+        ]
+        assert len(reference_targets) == 1
+
+    def test_unresolved_java_calls_in_different_methods_get_distinct_reference_ids(self, parser, tmp_path):
+        sample = tmp_path / "DistinctUnresolvedCalls.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void first() {\n"
+            "        missing();\n"
+            "    }\n"
+            "    void second() {\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        first_id = f"{REPO}::com.example.Worker.first()"
+        second_id = f"{REPO}::com.example.Worker.second()"
+
+        first_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == first_id
+        }
+        second_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == second_id
+        }
+
+        assert len(first_targets) == 1
+        assert len(second_targets) == 1
+
+        first_target = next(iter(first_targets))
+        second_target = next(iter(second_targets))
+        assert first_target != second_target
+
+        reference_ids = {
+            entity.id
+            for entity in _entities(result, EntityType.REFERENCE)
+        }
+        assert first_target in reference_ids
+        assert second_target in reference_ids
+
 
 # ===========================================================================
 # Docstring / Javadoc Capture

@@ -452,6 +452,100 @@ class TestHasConstructorRelationships:
 
 
 # ===========================================================================
+# CALLS / REFERENCE contract
+# ===========================================================================
+
+
+class TestCallsAndReferences:
+    def test_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "local_calls.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::local_calls.run"
+        helper_id = f"{REPOSITORY}::local_calls.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert call_targets, "Expected run() to emit a CALLS edge"
+        assert helper_id in call_targets
+
+        reference_ids = {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert not (call_targets & reference_ids)
+
+    def test_unresolved_calls_emit_reference_entities(self, parser, tmp_path):
+        source = tmp_path / "unresolved_calls.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "  client.ping();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::unresolved_calls.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 2
+
+        reference_ids = {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert call_targets <= reference_ids
+
+    def test_unresolved_calls_in_different_places_get_distinct_reference_ids(self, parser, tmp_path):
+        source = tmp_path / "distinct_references.ts"
+        source.write_text(
+            "function first(): void {\n"
+            "  missing();\n"
+            "}\n"
+            "function second(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        first_id = f"{REPOSITORY}::distinct_references.first"
+        second_id = f"{REPOSITORY}::distinct_references.second"
+
+        first_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, first_id, RelationshipType.CALLS)
+        }
+        second_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, second_id, RelationshipType.CALLS)
+        }
+
+        assert len(first_targets) == 1
+        assert len(second_targets) == 1
+        assert first_targets != second_targets
+
+        reference_ids = {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert first_targets <= reference_ids
+        assert second_targets <= reference_ids
+
+
+# ===========================================================================
 # Entity ID format
 # ===========================================================================
 
