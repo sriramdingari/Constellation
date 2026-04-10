@@ -476,7 +476,7 @@ class TestCallsAndReferences:
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         }
-        assert call_targets, "Expected run() to emit a CALLS edge"
+        assert len(call_targets) == 1
         assert helper_id in call_targets
 
         reference_ids = {
@@ -503,11 +503,18 @@ class TestCallsAndReferences:
 
         assert len(call_targets) == 2
 
-        reference_ids = {
-            entity.id
+        reference_entities = {
+            entity.id: entity
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
-        assert call_targets <= reference_ids
+        assert call_targets <= reference_entities.keys()
+        reference_names = {reference_entities[target_id].name for target_id in call_targets}
+        reference_symbols = {
+            reference_entities[target_id].properties["symbol"]
+            for target_id in call_targets
+        }
+        assert reference_names == {"missing", "client.ping"}
+        assert reference_symbols == {"missing", "client.ping"}
 
     def test_unresolved_calls_in_different_places_get_distinct_reference_ids(self, parser, tmp_path):
         source = tmp_path / "distinct_references.ts"
@@ -537,12 +544,49 @@ class TestCallsAndReferences:
         assert len(second_targets) == 1
         assert first_targets != second_targets
 
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert first_targets <= reference_entities.keys()
+        assert second_targets <= reference_entities.keys()
+
+        first_target = next(iter(first_targets))
+        second_target = next(iter(second_targets))
+        assert reference_entities[first_target].name == "missing"
+        assert reference_entities[first_target].properties["symbol"] == "missing"
+        assert reference_entities[second_target].name == "missing"
+        assert reference_entities[second_target].properties["symbol"] == "missing"
+
+    def test_class_method_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "class_local_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  run(): number {\n"
+            "    return this.helper();\n"
+            "  }\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::class_local_calls.Worker.run"
+        helper_id = f"{REPOSITORY}::class_local_calls.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+
         reference_ids = {
             entity.id
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
-        assert first_targets <= reference_ids
-        assert second_targets <= reference_ids
+        assert not (call_targets & reference_ids)
 
 
 # ===========================================================================

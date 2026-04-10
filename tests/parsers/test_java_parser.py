@@ -529,13 +529,15 @@ class TestCallsRelationships:
             if relationship.source_id == run_id
         }
 
-        assert call_targets, "Expected run() to emit a CALLS edge for missing()"
+        assert len(call_targets) == 1
 
         reference_targets = [
             entity for entity in _entities(result, EntityType.REFERENCE)
             if entity.id in call_targets
         ]
         assert len(reference_targets) == 1
+        assert reference_targets[0].name == "com.example.Worker.missing"
+        assert reference_targets[0].properties["symbol"] == "com.example.Worker.missing"
 
     def test_unresolved_java_calls_in_different_methods_get_distinct_reference_ids(self, parser, tmp_path):
         sample = tmp_path / "DistinctUnresolvedCalls.java"
@@ -573,12 +575,16 @@ class TestCallsRelationships:
         second_target = next(iter(second_targets))
         assert first_target != second_target
 
-        reference_ids = {
-            entity.id
+        reference_entities = {
+            entity.id: entity
             for entity in _entities(result, EntityType.REFERENCE)
         }
-        assert first_target in reference_ids
-        assert second_target in reference_ids
+        assert first_target in reference_entities
+        assert second_target in reference_entities
+        assert reference_entities[first_target].name == "com.example.Worker.missing"
+        assert reference_entities[first_target].properties["symbol"] == "com.example.Worker.missing"
+        assert reference_entities[second_target].name == "com.example.Worker.missing"
+        assert reference_entities[second_target].properties["symbol"] == "com.example.Worker.missing"
 
 
 # ===========================================================================
