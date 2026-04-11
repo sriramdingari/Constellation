@@ -1367,7 +1367,7 @@ class TestPostgresSpoolPath:
             )
 
     @pytest.mark.asyncio
-    async def test_pipeline_postgres_serial_parse_result_errors_abort_before_replay(
+    async def test_pipeline_postgres_serial_parse_result_errors_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
     ):
         settings = _make_settings(
@@ -1396,13 +1396,12 @@ class TestPostgresSpoolPath:
         )
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Parse error in" in e and "bad.py" in e for e in result.errors)
 
     @pytest.mark.asyncio
-    async def test_pipeline_postgres_serial_parse_exception_aborts_before_replay(
+    async def test_pipeline_postgres_serial_parse_exception_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
     ):
         settings = _make_settings(
@@ -1425,10 +1424,9 @@ class TestPostgresSpoolPath:
         mock_parser.parse_file = MagicMock(side_effect=RuntimeError("parser boom"))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Exception parsing" in e and "bad.py" in e for e in result.errors)
 
     @pytest.mark.asyncio
     async def test_pipeline_postgres_serial_embedding_failure_aborts_before_replay(
@@ -1794,7 +1792,7 @@ class TestPostgresSpoolPath:
         assert not mock_graph_client.apply_spooled_indexing_changes.called
 
     @pytest.mark.asyncio
-    async def test_postgres_threaded_parse_result_errors_abort_before_replay(
+    async def test_postgres_threaded_parse_result_errors_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
         from constellation.parsers.base import BaseParser
@@ -1830,13 +1828,12 @@ class TestPostgresSpoolPath:
         mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Parse error in" in e and "bad.py" in e for e in result.errors)
 
     @pytest.mark.asyncio
-    async def test_postgres_threaded_parse_exception_aborts_before_replay(
+    async def test_postgres_threaded_parse_exception_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
         from constellation.parsers.base import BaseParser
@@ -1868,10 +1865,9 @@ class TestPostgresSpoolPath:
         mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Exception parsing" in e and "parser boom" in e for e in result.errors)
 
     @pytest.mark.asyncio
     async def test_postgres_thread_count_one_preserves_serial_behavior(

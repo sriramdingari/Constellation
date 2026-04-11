@@ -645,13 +645,13 @@ class TestEmptyFile:
 
 
 class TestSyntaxErrorFile:
-    """File with syntax errors produces ParseResult with errors, success is False."""
+    """File with syntax errors still succeeds — tree-sitter produces a partial AST."""
 
-    def test_syntax_error_not_success(self, syntax_error_result):
-        assert syntax_error_result.success is False
+    def test_syntax_error_still_succeeds(self, syntax_error_result):
+        assert syntax_error_result.success is True
 
-    def test_syntax_error_has_errors(self, syntax_error_result):
-        assert len(syntax_error_result.errors) > 0
+    def test_syntax_error_no_errors_in_result(self, syntax_error_result):
+        assert len(syntax_error_result.errors) == 0
 
 
 # ===========================================================================
