@@ -89,6 +89,7 @@ class _ParsingContext:
     module_callable_ids: dict[str, str] = field(default_factory=dict)
     imported_callable_ids: dict[str, str] = field(default_factory=dict)
     imported_namespace_modules: dict[str, str] = field(default_factory=dict)
+    module_class_ids: dict[str, str] = field(default_factory=dict)
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     class_instance_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
@@ -96,7 +97,10 @@ class _ParsingContext:
     current_class_instance_method_ids: dict[str, str] = field(default_factory=dict)
     current_class_static_method_ids: dict[str, str] = field(default_factory=dict)
     current_method_is_static: bool = False
+    allocated_entity_ids: set[str] = field(default_factory=set)
+    local_name_counts: list[dict[str, int]] = field(default_factory=list)
     local_callable_scopes: list[dict[str, str | None]] = field(default_factory=list)
+    local_class_scopes: list[dict[str, str]] = field(default_factory=list)
     local_instance_scopes: list[dict[str, str]] = field(default_factory=list)
 
     def entity_id(self, *parts: str) -> str:
@@ -323,7 +327,9 @@ class JavaScriptParser(BaseParser):
             if not name_node:
                 return
             func_name = self._get_text(name_node, ctx.code)
-            ctx.module_callable_ids[func_name] = ctx.entity_id(ctx.module_name, func_name)
+            func_id = ctx.entity_id(ctx.module_name, func_name)
+            ctx.module_callable_ids[func_name] = func_id
+            ctx.allocated_entity_ids.add(func_id)
             return
 
         if node.type in ("lexical_declaration", "variable_declaration"):
@@ -335,7 +341,9 @@ class JavaScriptParser(BaseParser):
                 if self._resolve_function_value(value_node) is None:
                     continue
                 func_name = self._get_text(name_node, ctx.code)
-                ctx.module_callable_ids[func_name] = ctx.entity_id(ctx.module_name, func_name)
+                func_id = ctx.entity_id(ctx.module_name, func_name)
+                ctx.module_callable_ids[func_name] = func_id
+                ctx.allocated_entity_ids.add(func_id)
             return
 
         if node.type != "class_declaration":
@@ -347,28 +355,10 @@ class JavaScriptParser(BaseParser):
             return
 
         class_name = self._get_text(name_node, ctx.code)
-        method_ids: dict[str, str] = {}
-        instance_method_ids: dict[str, str] = {}
-        static_method_ids: dict[str, str] = {}
-        for child in body.children:
-            if child.type != "method_definition":
-                continue
-            method_name_node = child.child_by_field_name("name")
-            if not method_name_node:
-                continue
-            method_name = self._get_text(method_name_node, ctx.code)
-            method_id = ctx.entity_id(ctx.module_name, class_name, method_name)
-            method_ids[method_name] = method_id
-            if any(grandchild.type == "static" for grandchild in child.children):
-                static_method_ids[method_name] = method_id
-            else:
-                instance_method_ids[method_name] = method_id
-        if method_ids:
-            ctx.class_method_ids[class_name] = method_ids
-        if instance_method_ids:
-            ctx.class_instance_method_ids[class_name] = instance_method_ids
-        if static_method_ids:
-            ctx.class_static_method_ids[class_name] = static_method_ids
+        class_id = ctx.entity_id(ctx.module_name, class_name)
+        ctx.module_class_ids[class_name] = class_id
+        ctx.allocated_entity_ids.add(class_id)
+        self._register_class_members(body, ctx, class_id)
 
     # -- Main walk (second pass) --------------------------------------------
 
@@ -460,44 +450,12 @@ class JavaScriptParser(BaseParser):
         if not name_node:
             return
         class_name = self._get_text(name_node, ctx.code)
-        class_id = ctx.entity_id(ctx.module_name, class_name)
-        entity = CodeEntity(
-            id=class_id,
-            name=class_name,
-            entity_type=EntityType.CLASS,
-            repository=ctx.repository,
-            file_path=ctx.file_path,
-            line_number=node.start_point[0] + 1,
-            line_end=node.end_point[0] + 1,
-            language=self.language,
-            code=self._get_text(node, ctx.code),
-        )
-        result.add_entity(entity)
-        result.add_relationship(CodeRelationship(
-            source_id=file_id,
-            target_id=class_id,
-            relationship_type=RelationshipType.CONTAINS,
-        ))
-
-        # Walk class body
-        body = node.child_by_field_name("body")
-        if body:
-            saved_class = ctx.current_class
-            saved_class_id = ctx.current_class_full_id
-            saved_class_method_ids = ctx.current_class_method_ids
-            saved_class_instance_method_ids = ctx.current_class_instance_method_ids
-            saved_class_static_method_ids = ctx.current_class_static_method_ids
-            ctx.current_class = class_name
-            ctx.current_class_full_id = class_id
-            ctx.current_class_method_ids = ctx.class_method_ids.get(class_name, {})
-            ctx.current_class_instance_method_ids = ctx.class_instance_method_ids.get(class_name, {})
-            ctx.current_class_static_method_ids = ctx.class_static_method_ids.get(class_name, {})
-            self._process_class_body(body, ctx, result, class_id)
-            ctx.current_class = saved_class
-            ctx.current_class_full_id = saved_class_id
-            ctx.current_class_method_ids = saved_class_method_ids
-            ctx.current_class_instance_method_ids = saved_class_instance_method_ids
-            ctx.current_class_static_method_ids = saved_class_static_method_ids
+        class_id = ctx.module_class_ids.get(class_name)
+        if class_id is None:
+            class_id = ctx.entity_id(ctx.module_name, class_name)
+            ctx.module_class_ids[class_name] = class_id
+        ctx.allocated_entity_ids.add(class_id)
+        self._emit_class(node, ctx, result, file_id, class_name, class_id)
 
     def _process_class_body(self, body: Node, ctx: _ParsingContext, result: ParseResult, class_id: str) -> None:
         for child in body.children:
@@ -529,7 +487,8 @@ class JavaScriptParser(BaseParser):
         if return_type:
             signature += f": {return_type}"
 
-        method_id = ctx.entity_id(ctx.module_name, ctx.current_class, method_name)
+        method_id = f"{ctx.current_class_full_id}.{method_name}"
+        ctx.allocated_entity_ids.add(method_id)
         entity_type = EntityType.CONSTRUCTOR if is_constructor else EntityType.METHOD
         entity = CodeEntity(
             id=method_id,
@@ -567,6 +526,83 @@ class JavaScriptParser(BaseParser):
                 [ctx.current_class, method_name],
             )
             ctx.current_method_is_static = saved_method_is_static
+
+    def _register_class_members(self, body: Node | None, ctx: _ParsingContext, class_id: str) -> None:
+        if body is None:
+            return
+
+        method_ids: dict[str, str] = {}
+        instance_method_ids: dict[str, str] = {}
+        static_method_ids: dict[str, str] = {}
+        for child in body.children:
+            if child.type != "method_definition":
+                continue
+            method_name_node = child.child_by_field_name("name")
+            if not method_name_node:
+                continue
+            method_name = self._get_text(method_name_node, ctx.code)
+            method_id = f"{class_id}.{method_name}"
+            method_ids[method_name] = method_id
+            ctx.allocated_entity_ids.add(method_id)
+            if any(grandchild.type == "static" for grandchild in child.children):
+                static_method_ids[method_name] = method_id
+            else:
+                instance_method_ids[method_name] = method_id
+
+        if method_ids:
+            ctx.class_method_ids[class_id] = method_ids
+        if instance_method_ids:
+            ctx.class_instance_method_ids[class_id] = instance_method_ids
+        if static_method_ids:
+            ctx.class_static_method_ids[class_id] = static_method_ids
+
+    def _emit_class(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        container_id: str,
+        class_name: str,
+        class_id: str,
+    ) -> None:
+        entity = CodeEntity(
+            id=class_id,
+            name=class_name,
+            entity_type=EntityType.CLASS,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
+            line_number=node.start_point[0] + 1,
+            line_end=node.end_point[0] + 1,
+            language=self.language,
+            code=self._get_text(node, ctx.code),
+        )
+        result.add_entity(entity)
+        result.add_relationship(CodeRelationship(
+            source_id=container_id,
+            target_id=class_id,
+            relationship_type=RelationshipType.CONTAINS,
+        ))
+
+        body = node.child_by_field_name("body")
+        if not body:
+            return
+
+        saved_class = ctx.current_class
+        saved_class_id = ctx.current_class_full_id
+        saved_class_method_ids = ctx.current_class_method_ids
+        saved_class_instance_method_ids = ctx.current_class_instance_method_ids
+        saved_class_static_method_ids = ctx.current_class_static_method_ids
+        ctx.current_class = class_name
+        ctx.current_class_full_id = class_id
+        ctx.current_class_method_ids = ctx.class_method_ids.get(class_id, {})
+        ctx.current_class_instance_method_ids = ctx.class_instance_method_ids.get(class_id, {})
+        ctx.current_class_static_method_ids = ctx.class_static_method_ids.get(class_id, {})
+        self._process_class_body(body, ctx, result, class_id)
+        ctx.current_class = saved_class
+        ctx.current_class_full_id = saved_class_id
+        ctx.current_class_method_ids = saved_class_method_ids
+        ctx.current_class_instance_method_ids = saved_class_instance_method_ids
+        ctx.current_class_static_method_ids = saved_class_static_method_ids
 
     # -- Top-level function -> METHOD entity ---------------------------------
 
@@ -749,9 +785,13 @@ class JavaScriptParser(BaseParser):
         source_id: str,
         scope_parts: list[str],
     ) -> None:
+        local_name_counts = self._collect_scoped_name_counts(body, ctx)
+        ctx.local_name_counts.append(local_name_counts)
         local_callable_ids = self._collect_scope_callable_ids(body, ctx, scope_parts)
-        local_instance_ids = self._collect_scope_instance_ids(body, ctx)
+        local_class_ids = self._collect_scope_class_ids(body, ctx, scope_parts)
         ctx.local_callable_scopes.append(local_callable_ids)
+        ctx.local_class_scopes.append(local_class_ids)
+        local_instance_ids = self._collect_scope_instance_ids(body, ctx)
         ctx.local_instance_scopes.append(local_instance_ids)
         try:
             self._process_nested_callables(body, ctx, result, source_id, scope_parts)
@@ -759,7 +799,9 @@ class JavaScriptParser(BaseParser):
             self._extract_hook_calls(body, ctx, result, source_id)
         finally:
             ctx.local_instance_scopes.pop()
+            ctx.local_class_scopes.pop()
             ctx.local_callable_scopes.pop()
+            ctx.local_name_counts.pop()
 
     def _collect_scope_callable_ids(
         self,
@@ -774,7 +816,8 @@ class JavaScriptParser(BaseParser):
                 if not name_node:
                     continue
                 func_name = self._get_text(name_node, ctx.code)
-                callable_ids[func_name] = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
+                func_id = self._allocate_scoped_entity_id(ctx, scope_parts, func_name, current)
+                callable_ids[func_name] = func_id
                 continue
 
             if current.type == "class_declaration":
@@ -800,8 +843,69 @@ class JavaScriptParser(BaseParser):
                 if self._resolve_function_value(value_node) is None:
                     callable_ids[func_name] = None
                     continue
-                callable_ids[func_name] = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
+                callable_ids[func_name] = self._allocate_scoped_entity_id(ctx, scope_parts, func_name, declarator)
         return callable_ids
+
+    def _collect_scope_class_ids(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        scope_parts: list[str],
+    ) -> dict[str, str]:
+        class_ids: dict[str, str] = {}
+        for current in node.children:
+            if current.type != "class_declaration":
+                continue
+            name_node = current.child_by_field_name("name")
+            body = current.child_by_field_name("body")
+            if not name_node:
+                continue
+            class_name = self._get_text(name_node, ctx.code)
+            class_id = self._allocate_scoped_entity_id(ctx, scope_parts, class_name, current)
+            class_ids[class_name] = class_id
+            self._register_class_members(body, ctx, class_id)
+        return class_ids
+
+    def _collect_scoped_name_counts(self, node: Node, ctx: _ParsingContext) -> dict[str, int]:
+        counts: dict[str, int] = {}
+
+        def visit(current: Node, *, is_root: bool = False) -> None:
+            if current.type == "function_declaration":
+                name_node = current.child_by_field_name("name")
+                if name_node:
+                    name = self._get_text(name_node, ctx.code)
+                    counts[name] = counts.get(name, 0) + 1
+                return
+
+            if current.type == "class_declaration":
+                name_node = current.child_by_field_name("name")
+                if name_node:
+                    name = self._get_text(name_node, ctx.code)
+                    counts[name] = counts.get(name, 0) + 1
+                return
+
+            if not is_root and current.type in CALLABLE_SCOPE_BARRIERS:
+                return
+
+            if current.type in ("lexical_declaration", "variable_declaration"):
+                for declarator in current.children:
+                    if declarator.type != "variable_declarator":
+                        continue
+                    name_node = declarator.child_by_field_name("name")
+                    value_node = declarator.child_by_field_name("value")
+                    if not name_node or name_node.type != "identifier" or not value_node:
+                        continue
+                    if self._resolve_function_value(value_node) is None:
+                        continue
+                    name = self._get_text(name_node, ctx.code)
+                    counts[name] = counts.get(name, 0) + 1
+                return
+
+            for child in current.children:
+                visit(child)
+
+        visit(node, is_root=True)
+        return counts
 
     def _collect_scope_instance_ids(self, node: Node, ctx: _ParsingContext) -> dict[str, str]:
         instance_ids: dict[str, str] = {}
@@ -827,9 +931,10 @@ class JavaScriptParser(BaseParser):
                     continue
 
                 class_name = self._get_text(constructor_node, ctx.code)
-                if class_name not in ctx.class_method_ids:
+                class_id = self._resolve_class_id(class_name, ctx)
+                if class_id is None:
                     continue
-                instance_ids[self._get_text(name_node, ctx.code)] = class_name
+                instance_ids[self._get_text(name_node, ctx.code)] = class_id
         return instance_ids
 
     def _collect_parameter_bindings(self, body: Node, code: bytes) -> dict[str, str | None]:
@@ -861,12 +966,65 @@ class JavaScriptParser(BaseParser):
         container_id: str,
         scope_parts: list[str],
     ) -> None:
-        for current in self._iter_scope_nodes(node):
-            if current.type == "function_declaration":
-                self._process_nested_function(current, ctx, result, container_id, scope_parts)
-                continue
-            if current.type == "variable_declarator":
-                self._process_nested_variable_callable(current, ctx, result, container_id, scope_parts)
+        self._process_nested_callables_in_scope(node, ctx, result, container_id, scope_parts, is_scope_root=True)
+
+    def _process_nested_callables_in_scope(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        container_id: str,
+        scope_parts: list[str],
+        *,
+        is_scope_root: bool = False,
+    ) -> None:
+        entered_scope = False
+        if not is_scope_root and node.type == "statement_block":
+            ctx.local_callable_scopes.append(self._collect_scope_callable_ids(node, ctx, scope_parts))
+            ctx.local_class_scopes.append(self._collect_scope_class_ids(node, ctx, scope_parts))
+            ctx.local_instance_scopes.append(self._collect_scope_instance_ids(node, ctx))
+            entered_scope = True
+
+        try:
+            if node.type == "class_declaration":
+                self._process_nested_class(node, ctx, result, container_id, scope_parts)
+                return
+            if node.type == "function_declaration":
+                self._process_nested_function(node, ctx, result, container_id, scope_parts)
+                return
+            if node.type == "variable_declarator":
+                self._process_nested_variable_callable(node, ctx, result, container_id, scope_parts)
+                return
+
+            if not is_scope_root and node.type in CALLABLE_SCOPE_BARRIERS:
+                return
+
+            for child in node.children:
+                self._process_nested_callables_in_scope(child, ctx, result, container_id, scope_parts)
+        finally:
+            if entered_scope:
+                ctx.local_instance_scopes.pop()
+                ctx.local_class_scopes.pop()
+                ctx.local_callable_scopes.pop()
+
+    def _process_nested_class(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        container_id: str,
+        scope_parts: list[str],
+    ) -> None:
+        name_node = node.child_by_field_name("name")
+        if not name_node:
+            return
+
+        class_name = self._get_text(name_node, ctx.code)
+        class_id = self._resolve_class_id(class_name, ctx)
+        if class_id is None:
+            class_id = self._allocate_scoped_entity_id(ctx, scope_parts, class_name, node)
+
+        self._emit_class(node, ctx, result, container_id, class_name, class_id)
 
     def _process_nested_function(
         self,
@@ -881,7 +1039,9 @@ class JavaScriptParser(BaseParser):
             return
 
         func_name = self._get_text(name_node, ctx.code)
-        func_id = ctx.entity_id(ctx.module_name, *scope_parts, func_name)
+        func_id = self._current_local_callable_id(func_name, ctx)
+        if func_id is None:
+            func_id = self._allocate_scoped_entity_id(ctx, scope_parts, func_name, node)
 
         modifiers: list[str] = []
         for child in node.children:
@@ -945,7 +1105,9 @@ class JavaScriptParser(BaseParser):
             return
 
         var_name = self._get_text(name_node, ctx.code)
-        func_id = ctx.entity_id(ctx.module_name, *scope_parts, var_name)
+        func_id = self._current_local_callable_id(var_name, ctx)
+        if func_id is None:
+            func_id = self._allocate_scoped_entity_id(ctx, scope_parts, var_name, declarator)
 
         modifiers: list[str] = []
         for child in actual_func.children:
@@ -1136,20 +1298,60 @@ class JavaScriptParser(BaseParser):
                 return called_symbol, None
             return called_symbol, ctx.current_class_method_ids.get(property_name)
         for scope in reversed(ctx.local_instance_scopes):
-            class_name = scope.get(object_text)
-            if class_name is not None:
-                return called_symbol, ctx.class_instance_method_ids.get(class_name, {}).get(property_name)
-        for scope in reversed(ctx.local_callable_scopes):
-            if object_text in scope:
-                return called_symbol, None
+            class_id = scope.get(object_text)
+            if class_id is not None:
+                return called_symbol, ctx.class_instance_method_ids.get(class_id, {}).get(property_name)
+        for scope in reversed(ctx.local_class_scopes):
+            class_id = scope.get(object_text)
+            if class_id is not None:
+                return called_symbol, ctx.class_static_method_ids.get(class_id, {}).get(property_name)
         if object_text == ctx.current_class:
             return called_symbol, ctx.current_class_static_method_ids.get(property_name)
-        if object_text in ctx.class_static_method_ids:
-            return called_symbol, ctx.class_static_method_ids.get(object_text, {}).get(property_name)
+        class_id = ctx.module_class_ids.get(object_text)
+        if class_id is not None:
+            return called_symbol, ctx.class_static_method_ids.get(class_id, {}).get(property_name)
         imported_module = ctx.imported_namespace_modules.get(object_text)
         if imported_module:
             return called_symbol, ctx.entity_id(imported_module, property_name)
         return called_symbol, None
+
+    def _resolve_class_id(self, class_name: str, ctx: _ParsingContext) -> str | None:
+        for scope in reversed(ctx.local_class_scopes):
+            class_id = scope.get(class_name)
+            if class_id is not None:
+                return class_id
+        return ctx.module_class_ids.get(class_name)
+
+    def _allocate_scoped_entity_id(
+        self,
+        ctx: _ParsingContext,
+        scope_parts: list[str],
+        name: str,
+        node: Node,
+    ) -> str:
+        duplicate_count = 1
+        if ctx.local_name_counts:
+            duplicate_count = ctx.local_name_counts[-1].get(name, 1)
+
+        if duplicate_count <= 1:
+            candidate = ctx.entity_id(ctx.module_name, *scope_parts, name)
+            ctx.allocated_entity_ids.add(candidate)
+            return candidate
+
+        line = node.start_point[0] + 1
+        column = node.start_point[1] + 1
+        candidate_name = f"{name}@{line}:{column}"
+        candidate = ctx.entity_id(ctx.module_name, *scope_parts, candidate_name)
+        ctx.allocated_entity_ids.add(candidate)
+        return candidate
+
+    @staticmethod
+    def _current_local_callable_id(name: str, ctx: _ParsingContext) -> str | None:
+        for scope in reversed(ctx.local_callable_scopes):
+            target_id = scope.get(name)
+            if target_id is not None:
+                return target_id
+        return None
 
     def _reference_target_id(self, source_id: str, called_symbol: str, call_node: Node) -> str:
         line_number = call_node.start_point[0] + 1
