@@ -1193,6 +1193,101 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         } & set(call_targets)
 
+    def test_inner_block_local_class_bindings_resolve_same_file_static_and_instance_calls(self, parser, tmp_path):
+        source = tmp_path / "inner_block_local_class_bindings.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    class Foo {\n"
+            "      static bar(): number {\n"
+            "        return 1;\n"
+            "      }\n"
+            "\n"
+            "      baz(): number {\n"
+            "        return 2;\n"
+            "      }\n"
+            "    }\n"
+            "\n"
+            "    const foo = new Foo();\n"
+            "    Foo.bar();\n"
+            "    return foo.baz();\n"
+            "  }\n"
+            "\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::inner_block_local_class_bindings.run"
+
+        class_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.CLASS)
+            if entity.name == "Foo"
+        ]
+        assert len(class_entities) == 1
+
+        bar_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "bar"
+        ]
+        baz_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "baz"
+        ]
+        assert len(bar_entities) == 1
+        assert len(baz_entities) == 1
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert len(call_targets) == 2
+        assert bar_entities[0].id in call_targets
+        assert baz_entities[0].id in call_targets
+        assert not {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        } & set(call_targets)
+
+    def test_unresolved_reference_ids_include_file_context_across_same_stem_files(self, parser, tmp_path):
+        first_source = tmp_path / "alpha" / "shared_stem.ts"
+        second_source = tmp_path / "beta" / "shared_stem.ts"
+        first_source.parent.mkdir()
+        second_source.parent.mkdir()
+        first_source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+        second_source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        first_result = parser.parse_file(first_source, repository=REPOSITORY)
+        second_result = parser.parse_file(second_source, repository=REPOSITORY)
+
+        first_target_id = next(
+            relationship.target_id
+            for relationship in _rels_from(first_result, f"{REPOSITORY}::shared_stem.run", RelationshipType.CALLS)
+        )
+        second_target_id = next(
+            relationship.target_id
+            for relationship in _rels_from(second_result, f"{REPOSITORY}::shared_stem.run", RelationshipType.CALLS)
+        )
+
+        assert first_target_id != second_target_id
+        assert first_target_id in {
+            entity.id for entity in _entities_by_type(first_result, EntityType.REFERENCE)
+        }
+        assert second_target_id in {
+            entity.id for entity in _entities_by_type(second_result, EntityType.REFERENCE)
+        }
+
     def test_out_of_scope_local_shadow_does_not_hide_namespace_import_resolution(self, parser, tmp_path):
         source = tmp_path / "block_shadowed_namespace.ts"
         source.write_text(

@@ -1192,6 +1192,7 @@ class JavaScriptParser(BaseParser):
         entered_scope = False
         if not is_scope_root and node.type == "statement_block":
             ctx.local_callable_scopes.append(self._collect_scope_callable_ids(node, ctx, scope_parts))
+            ctx.local_class_scopes.append(self._collect_scope_class_ids(node, ctx, scope_parts))
             ctx.local_instance_scopes.append(self._collect_scope_instance_ids(node, ctx))
             entered_scope = True
 
@@ -1207,6 +1208,7 @@ class JavaScriptParser(BaseParser):
         finally:
             if entered_scope:
                 ctx.local_instance_scopes.pop()
+                ctx.local_class_scopes.pop()
                 ctx.local_callable_scopes.pop()
 
     def _record_call(
@@ -1241,7 +1243,7 @@ class JavaScriptParser(BaseParser):
             return
 
         if target_id is None:
-            target_id = self._reference_target_id(source_id, called_symbol, call_node)
+            target_id = self._reference_target_id(ctx, source_id, called_symbol, call_node)
             if target_id not in seen_reference_targets:
                 seen_reference_targets.add(target_id)
                 properties = {"symbol": called_symbol}
@@ -1353,10 +1355,10 @@ class JavaScriptParser(BaseParser):
                 return target_id
         return None
 
-    def _reference_target_id(self, source_id: str, called_symbol: str, call_node: Node) -> str:
+    def _reference_target_id(self, ctx: _ParsingContext, source_id: str, called_symbol: str, call_node: Node) -> str:
         line_number = call_node.start_point[0] + 1
         column_number = call_node.start_point[1] + 1
-        return f"{source_id}::ref:{line_number}:{column_number}:{called_symbol}"
+        return f"{source_id}::ref:{ctx.file_path}:{line_number}:{column_number}:{called_symbol}"
 
     @staticmethod
     def _enclosing_declaration_name(source_id: str) -> str:
