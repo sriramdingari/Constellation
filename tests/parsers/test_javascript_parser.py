@@ -508,6 +508,36 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
 
+    def test_type_only_import_call_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "type_only_import.ts"
+        source.write_text(
+            "import type { Helper } from \"./utils\";\n"
+            "function run(): void {\n"
+            "  Helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::type_only_import.run"
+        helper_id = f"{REPOSITORY}::utils.Helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "Helper"
+        assert reference_entities[target_id].properties["symbol"] == "Helper"
+
     def test_default_import_call_stays_unresolved_without_local_static_evidence(self, parser, tmp_path):
         source = tmp_path / "default_import.ts"
         source.write_text(
@@ -531,6 +561,47 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
         target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_wrapper_call_assigned_local_callable_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "wrapped_local_callable.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  const helper = wrap(() => 1);\n"
+            "  helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::wrapped_local_callable.run"
+        helper_id = f"{REPOSITORY}::wrapped_local_callable.run.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id not in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.METHOD)
+        }
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        helper_reference_ids = {
+            entity.id
+            for entity in reference_entities.values()
+            if entity.name == "helper" and entity.properties["symbol"] == "helper"
+        }
+        assert len(helper_reference_ids) == 1
+
+        target_id = next(iter(helper_reference_ids))
+        assert target_id in call_targets
         assert target_id in reference_entities
         assert reference_entities[target_id].name == "helper"
         assert reference_entities[target_id].properties["symbol"] == "helper"

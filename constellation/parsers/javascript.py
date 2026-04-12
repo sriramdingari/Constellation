@@ -234,6 +234,8 @@ class JavaScriptParser(BaseParser):
         for child in root.children:
             if child.type != "import_statement":
                 continue
+            if self._is_type_only_import_statement(child):
+                continue
 
             source_node = child.child_by_field_name("source")
             if not source_node:
@@ -273,6 +275,8 @@ class JavaScriptParser(BaseParser):
                 for spec in sub.children:
                     if spec.type != "import_specifier":
                         continue
+                    if self._is_type_only_import_specifier(spec):
+                        continue
                     imported_node = spec.child_by_field_name("name")
                     if not imported_node:
                         for grandchild in spec.children:
@@ -291,6 +295,14 @@ class JavaScriptParser(BaseParser):
                     if alias_node:
                         local_name = self._get_text(alias_node, ctx.code)
                     ctx.imported_callable_ids[local_name] = ctx.entity_id(module_name, imported_name)
+
+    @staticmethod
+    def _is_type_only_import_statement(node: Node) -> bool:
+        return any(child.type == "type" for child in node.children)
+
+    @staticmethod
+    def _is_type_only_import_specifier(node: Node) -> bool:
+        return any(child.type == "type" for child in node.children)
 
     def _collect_local_callables(self, root: Node, ctx: _ParsingContext) -> None:
         for child in root.children:
@@ -1186,16 +1198,8 @@ class JavaScriptParser(BaseParser):
                     ))
 
     def _resolve_function_value(self, value_node: Node) -> Node | None:
-        actual_func = value_node
-        if value_node.type == "call_expression":
-            args_node = value_node.child_by_field_name("arguments")
-            if args_node:
-                for arg in args_node.children:
-                    if arg.type in ("arrow_function", "function"):
-                        return arg
-            return None
-        if actual_func.type in ("arrow_function", "function"):
-            return actual_func
+        if value_node.type in ("arrow_function", "function"):
+            return value_node
         return None
 
     # -- Parameter / return-type extraction ----------------------------------
