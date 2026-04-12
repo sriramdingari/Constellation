@@ -90,8 +90,10 @@ class _ParsingContext:
     imported_callable_ids: dict[str, str] = field(default_factory=dict)
     imported_namespace_modules: dict[str, str] = field(default_factory=dict)
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
+    class_instance_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     current_class_method_ids: dict[str, str] = field(default_factory=dict)
+    current_class_instance_method_ids: dict[str, str] = field(default_factory=dict)
     current_class_static_method_ids: dict[str, str] = field(default_factory=dict)
     current_method_is_static: bool = False
     local_callable_scopes: list[dict[str, str | None]] = field(default_factory=list)
@@ -346,6 +348,7 @@ class JavaScriptParser(BaseParser):
 
         class_name = self._get_text(name_node, ctx.code)
         method_ids: dict[str, str] = {}
+        instance_method_ids: dict[str, str] = {}
         static_method_ids: dict[str, str] = {}
         for child in body.children:
             if child.type != "method_definition":
@@ -358,8 +361,12 @@ class JavaScriptParser(BaseParser):
             method_ids[method_name] = method_id
             if any(grandchild.type == "static" for grandchild in child.children):
                 static_method_ids[method_name] = method_id
+            else:
+                instance_method_ids[method_name] = method_id
         if method_ids:
             ctx.class_method_ids[class_name] = method_ids
+        if instance_method_ids:
+            ctx.class_instance_method_ids[class_name] = instance_method_ids
         if static_method_ids:
             ctx.class_static_method_ids[class_name] = static_method_ids
 
@@ -478,15 +485,18 @@ class JavaScriptParser(BaseParser):
             saved_class = ctx.current_class
             saved_class_id = ctx.current_class_full_id
             saved_class_method_ids = ctx.current_class_method_ids
+            saved_class_instance_method_ids = ctx.current_class_instance_method_ids
             saved_class_static_method_ids = ctx.current_class_static_method_ids
             ctx.current_class = class_name
             ctx.current_class_full_id = class_id
             ctx.current_class_method_ids = ctx.class_method_ids.get(class_name, {})
+            ctx.current_class_instance_method_ids = ctx.class_instance_method_ids.get(class_name, {})
             ctx.current_class_static_method_ids = ctx.class_static_method_ids.get(class_name, {})
             self._process_class_body(body, ctx, result, class_id)
             ctx.current_class = saved_class
             ctx.current_class_full_id = saved_class_id
             ctx.current_class_method_ids = saved_class_method_ids
+            ctx.current_class_instance_method_ids = saved_class_instance_method_ids
             ctx.current_class_static_method_ids = saved_class_static_method_ids
 
     def _process_class_body(self, body: Node, ctx: _ParsingContext, result: ParseResult, class_id: str) -> None:
@@ -1013,7 +1023,7 @@ class JavaScriptParser(BaseParser):
         result: ParseResult,
         source_id: str,
         scope_parts: list[str],
-        seen_targets: set[str],
+        seen_reference_targets: set[str],
         *,
         is_scope_root: bool = False,
     ) -> None:
@@ -1025,13 +1035,13 @@ class JavaScriptParser(BaseParser):
 
         try:
             if node.type == "call_expression":
-                self._record_call(node, ctx, result, source_id, seen_targets)
+                self._record_call(node, ctx, result, source_id, seen_reference_targets)
 
             if not is_scope_root and node.type in CALLABLE_SCOPE_BARRIERS:
                 return
 
             for child in node.children:
-                self._extract_calls_in_scope(child, ctx, result, source_id, scope_parts, seen_targets)
+                self._extract_calls_in_scope(child, ctx, result, source_id, scope_parts, seen_reference_targets)
         finally:
             if entered_scope:
                 ctx.local_instance_scopes.pop()
@@ -1043,7 +1053,7 @@ class JavaScriptParser(BaseParser):
         ctx: _ParsingContext,
         result: ParseResult,
         source_id: str,
-        seen_targets: set[str],
+        seen_reference_targets: set[str],
     ) -> None:
         func_node = call_node.child_by_field_name("function")
         if not func_node:
@@ -1070,7 +1080,8 @@ class JavaScriptParser(BaseParser):
 
         if target_id is None:
             target_id = self._reference_target_id(source_id, called_symbol, call_node)
-            if target_id not in seen_targets:
+            if target_id not in seen_reference_targets:
+                seen_reference_targets.add(target_id)
                 properties = {"symbol": called_symbol}
                 if receiver_text:
                     properties["receiver"] = receiver_text
@@ -1087,10 +1098,6 @@ class JavaScriptParser(BaseParser):
                     language=self.language,
                     properties=properties,
                 ))
-
-        if target_id in seen_targets:
-            return
-        seen_targets.add(target_id)
         result.add_relationship(CodeRelationship(
             source_id=source_id,
             target_id=target_id,
@@ -1122,13 +1129,16 @@ class JavaScriptParser(BaseParser):
         if object_text == "this":
             if ctx.current_method_is_static:
                 return called_symbol, ctx.current_class_static_method_ids.get(property_name)
+            instance_target_id = ctx.current_class_instance_method_ids.get(property_name)
+            if instance_target_id is not None:
+                return called_symbol, instance_target_id
             if property_name in ctx.current_class_static_method_ids:
                 return called_symbol, None
             return called_symbol, ctx.current_class_method_ids.get(property_name)
         for scope in reversed(ctx.local_instance_scopes):
             class_name = scope.get(object_text)
             if class_name is not None:
-                return called_symbol, ctx.class_method_ids.get(class_name, {}).get(property_name)
+                return called_symbol, ctx.class_instance_method_ids.get(class_name, {}).get(property_name)
         for scope in reversed(ctx.local_callable_scopes):
             if object_text in scope:
                 return called_symbol, None

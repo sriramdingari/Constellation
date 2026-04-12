@@ -508,6 +508,30 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
 
+    def test_duplicate_resolved_calls_emit_one_edge_per_call_site(self, parser, tmp_path):
+        source = tmp_path / "duplicate_resolved_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "function run(): number {\n"
+            "  helper();\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::duplicate_resolved_calls.run"
+        helper_id = f"{REPOSITORY}::duplicate_resolved_calls.helper"
+
+        call_relationships = _rels_from(result, run_id, RelationshipType.CALLS)
+        assert len(call_relationships) == 2
+        assert [relationship.target_id for relationship in call_relationships] == [helper_id, helper_id]
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
     def test_type_only_import_call_stays_unresolved(self, parser, tmp_path):
         source = tmp_path / "type_only_import.ts"
         source.write_text(
@@ -863,6 +887,36 @@ class TestCallsAndReferences:
         assert reference_entities[target_id].name == "this.helper"
         assert reference_entities[target_id].properties["symbol"] == "this.helper"
         assert reference_entities[target_id].properties["receiver"] == "this"
+
+    def test_instance_this_call_prefers_instance_method_when_static_exists_too(self, parser, tmp_path):
+        source = tmp_path / "instance_this_prefers_instance.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  run(): number {\n"
+            "    return this.helper();\n"
+            "  }\n"
+            "  helper(): number {\n"
+            "    return 1;\n"
+            "  }\n"
+            "  static helper(): number {\n"
+            "    return 2;\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::instance_this_prefers_instance.Worker.run"
+        helper_id = f"{REPOSITORY}::instance_this_prefers_instance.Worker.helper"
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert call_targets == [helper_id]
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
 
     def test_nested_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
         source = tmp_path / "nested_local_calls.ts"
