@@ -794,6 +794,108 @@ class TestCallsAndReferences:
         assert reference_entities[target_id].name == "helper"
         assert reference_entities[target_id].properties["symbol"] == "helper"
 
+    def test_block_scoped_local_callable_is_not_visible_after_block(self, parser, tmp_path):
+        source = tmp_path / "block_scoped_local.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const helper = () => 1;\n"
+            "  }\n"
+            "\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_scoped_local.run"
+        helper_id = f"{REPOSITORY}::block_scoped_local.run.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_block_scoped_instance_receiver_is_not_visible_after_block(self, parser, tmp_path):
+        source = tmp_path / "block_scoped_instance.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const worker = new Worker();\n"
+            "  }\n"
+            "\n"
+            "  return worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_scoped_instance.run"
+        helper_id = f"{REPOSITORY}::block_scoped_instance.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "worker.helper"
+        assert reference_entities[target_id].properties["symbol"] == "worker.helper"
+        assert reference_entities[target_id].properties["receiver"] == "worker"
+
+    def test_out_of_scope_local_shadow_does_not_hide_namespace_import_resolution(self, parser, tmp_path):
+        source = tmp_path / "block_shadowed_namespace.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "\n"
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const utils = { helper(): number { return 1; } };\n"
+            "  }\n"
+            "\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_shadowed_namespace.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
     def test_same_file_instance_receiver_call_resolves_to_class_method(self, parser, tmp_path):
         source = tmp_path / "instance_calls.ts"
         source.write_text(
