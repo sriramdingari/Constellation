@@ -93,6 +93,7 @@ class _ParsingContext:
     class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     current_class_method_ids: dict[str, str] = field(default_factory=dict)
     current_class_static_method_ids: dict[str, str] = field(default_factory=dict)
+    current_method_is_static: bool = False
     local_callable_scopes: list[dict[str, str | None]] = field(default_factory=list)
     local_instance_scopes: list[dict[str, str]] = field(default_factory=list)
 
@@ -286,6 +287,8 @@ class JavaScriptParser(BaseParser):
                     if not imported_node:
                         continue
                     imported_name = self._get_text(imported_node, ctx.code)
+                    if imported_name == "default":
+                        continue
                     alias_node = spec.child_by_field_name("alias")
                     if not alias_node:
                         identifiers = [grandchild for grandchild in spec.children if grandchild.type == "identifier"]
@@ -544,6 +547,8 @@ class JavaScriptParser(BaseParser):
         # Scan body for hook calls
         body = node.child_by_field_name("body")
         if body:
+            saved_method_is_static = ctx.current_method_is_static
+            ctx.current_method_is_static = "static" in modifiers
             self._process_callable_body(
                 body,
                 ctx,
@@ -551,6 +556,7 @@ class JavaScriptParser(BaseParser):
                 method_id,
                 [ctx.current_class, method_name],
             )
+            ctx.current_method_is_static = saved_method_is_static
 
     # -- Top-level function -> METHOD entity ---------------------------------
 
@@ -1114,6 +1120,10 @@ class JavaScriptParser(BaseParser):
         called_symbol = f"{object_text}.{property_name}"
 
         if object_text == "this":
+            if ctx.current_method_is_static:
+                return called_symbol, ctx.current_class_static_method_ids.get(property_name)
+            if property_name in ctx.current_class_static_method_ids:
+                return called_symbol, None
             return called_symbol, ctx.current_class_method_ids.get(property_name)
         for scope in reversed(ctx.local_instance_scopes):
             class_name = scope.get(object_text)
