@@ -508,7 +508,7 @@ class TestCallsAndReferences:
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
 
-    def test_default_import_call_resolves_to_declaration_target(self, parser, tmp_path):
+    def test_default_import_call_stays_unresolved_without_local_static_evidence(self, parser, tmp_path):
         source = tmp_path / "default_import.ts"
         source.write_text(
             "import helper from \"./utils\";\n"
@@ -519,17 +519,21 @@ class TestCallsAndReferences:
 
         result = parser.parse_file(source, repository=REPOSITORY)
         run_id = f"{REPOSITORY}::default_import.run"
-        helper_id = f"{REPOSITORY}::utils.helper"
 
         call_targets = {
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         }
-        assert helper_id in call_targets
-        assert helper_id not in {
-            entity.id
+        assert len(call_targets) == 1
+
+        reference_entities = {
+            entity.id: entity
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
 
     def test_namespace_imported_member_call_resolves_to_declaration_target(self, parser, tmp_path):
         source = tmp_path / "namespace_import.ts"
@@ -808,6 +812,36 @@ class TestCallsAndReferences:
         result = parser.parse_file(source, repository=REPOSITORY)
         run_id = f"{REPOSITORY}::instance_calls.run"
         helper_id = f"{REPOSITORY}::instance_calls.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_same_file_static_class_member_call_resolves_to_class_method(self, parser, tmp_path):
+        source = tmp_path / "static_class_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  static helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  return Worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::static_class_calls.run"
+        helper_id = f"{REPOSITORY}::static_class_calls.Worker.helper"
 
         call_targets = {
             relationship.target_id

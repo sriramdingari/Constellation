@@ -90,7 +90,9 @@ class _ParsingContext:
     imported_callable_ids: dict[str, str] = field(default_factory=dict)
     imported_namespace_modules: dict[str, str] = field(default_factory=dict)
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
+    class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     current_class_method_ids: dict[str, str] = field(default_factory=dict)
+    current_class_static_method_ids: dict[str, str] = field(default_factory=dict)
     local_callable_scopes: list[dict[str, str | None]] = field(default_factory=list)
     local_instance_scopes: list[dict[str, str]] = field(default_factory=list)
 
@@ -255,8 +257,6 @@ class JavaScriptParser(BaseParser):
 
             for sub in clause_node.children:
                 if sub.type == "identifier":
-                    local_name = self._get_text(sub, ctx.code)
-                    ctx.imported_callable_ids[local_name] = ctx.entity_id(module_name, local_name)
                     continue
                 if sub.type == "namespace_import":
                     alias_node = sub.child_by_field_name("name")
@@ -331,6 +331,7 @@ class JavaScriptParser(BaseParser):
 
         class_name = self._get_text(name_node, ctx.code)
         method_ids: dict[str, str] = {}
+        static_method_ids: dict[str, str] = {}
         for child in body.children:
             if child.type != "method_definition":
                 continue
@@ -338,9 +339,14 @@ class JavaScriptParser(BaseParser):
             if not method_name_node:
                 continue
             method_name = self._get_text(method_name_node, ctx.code)
-            method_ids[method_name] = ctx.entity_id(ctx.module_name, class_name, method_name)
+            method_id = ctx.entity_id(ctx.module_name, class_name, method_name)
+            method_ids[method_name] = method_id
+            if any(grandchild.type == "static" for grandchild in child.children):
+                static_method_ids[method_name] = method_id
         if method_ids:
             ctx.class_method_ids[class_name] = method_ids
+        if static_method_ids:
+            ctx.class_static_method_ids[class_name] = static_method_ids
 
     # -- Main walk (second pass) --------------------------------------------
 
@@ -457,13 +463,16 @@ class JavaScriptParser(BaseParser):
             saved_class = ctx.current_class
             saved_class_id = ctx.current_class_full_id
             saved_class_method_ids = ctx.current_class_method_ids
+            saved_class_static_method_ids = ctx.current_class_static_method_ids
             ctx.current_class = class_name
             ctx.current_class_full_id = class_id
             ctx.current_class_method_ids = ctx.class_method_ids.get(class_name, {})
+            ctx.current_class_static_method_ids = ctx.class_static_method_ids.get(class_name, {})
             self._process_class_body(body, ctx, result, class_id)
             ctx.current_class = saved_class
             ctx.current_class_full_id = saved_class_id
             ctx.current_class_method_ids = saved_class_method_ids
+            ctx.current_class_static_method_ids = saved_class_static_method_ids
 
     def _process_class_body(self, body: Node, ctx: _ParsingContext, result: ParseResult, class_id: str) -> None:
         for child in body.children:
@@ -1043,7 +1052,7 @@ class JavaScriptParser(BaseParser):
         property_name = self._get_text(property_node, ctx.code)
         called_symbol = f"{object_text}.{property_name}"
 
-        if object_text in {"this", ctx.current_class}:
+        if object_text == "this":
             return called_symbol, ctx.current_class_method_ids.get(property_name)
         for scope in reversed(ctx.local_instance_scopes):
             class_name = scope.get(object_text)
@@ -1052,6 +1061,10 @@ class JavaScriptParser(BaseParser):
         for scope in reversed(ctx.local_callable_scopes):
             if object_text in scope:
                 return called_symbol, None
+        if object_text == ctx.current_class:
+            return called_symbol, ctx.current_class_static_method_ids.get(property_name)
+        if object_text in ctx.class_static_method_ids:
+            return called_symbol, ctx.class_static_method_ids.get(object_text, {}).get(property_name)
         imported_module = ctx.imported_namespace_modules.get(object_text)
         if imported_module:
             return called_symbol, ctx.entity_id(imported_module, property_name)
