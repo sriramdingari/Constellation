@@ -1225,6 +1225,8 @@ class JavaScriptParser(BaseParser):
         try:
             if node.type == "call_expression":
                 self._record_call(node, ctx, result, source_id, seen_reference_targets)
+            elif node.type == "new_expression":
+                self._record_new_call(node, ctx, result, source_id, seen_reference_targets)
 
             if not is_scope_root and node.type in CALLABLE_SCOPE_BARRIERS:
                 return
@@ -1288,6 +1290,57 @@ class JavaScriptParser(BaseParser):
                     language=self.language,
                     properties=properties,
                 ))
+        result.add_relationship(CodeRelationship(
+            source_id=source_id,
+            target_id=target_id,
+            relationship_type=RelationshipType.CALLS,
+        ))
+
+    def _record_new_call(
+        self,
+        new_node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        source_id: str,
+        seen_reference_targets: set[str],
+    ) -> None:
+        constructor_node = new_node.child_by_field_name("constructor")
+        if not constructor_node:
+            return
+
+        constructor_node = self._unwrap_call_target(constructor_node)
+        if constructor_node.type == "identifier":
+            class_name = self._get_text(constructor_node, ctx.code)
+            class_id = self._resolve_class_id(class_name, ctx)
+            if class_id is not None:
+                ctor_id = ctx.class_method_ids.get(class_id, {}).get("constructor")
+                target_id = ctor_id if ctor_id else class_id
+                result.add_relationship(CodeRelationship(
+                    source_id=source_id,
+                    target_id=target_id,
+                    relationship_type=RelationshipType.CALLS,
+                ))
+                return
+
+        called_symbol = f"new {self._get_text(constructor_node, ctx.code)}"
+        target_id = self._reference_target_id(ctx, source_id, called_symbol, new_node)
+        if target_id not in seen_reference_targets:
+            seen_reference_targets.add(target_id)
+            result.add_entity(CodeEntity(
+                id=target_id,
+                name=called_symbol,
+                entity_type=EntityType.REFERENCE,
+                repository=ctx.repository,
+                file_path=ctx.file_path,
+                line_number=new_node.start_point[0] + 1,
+                line_end=new_node.end_point[0] + 1,
+                language=self.language,
+                properties={
+                    "symbol": called_symbol,
+                    "enclosing_declaration_id": source_id,
+                    "enclosing_declaration_name": self._enclosing_declaration_name(source_id),
+                },
+            ))
         result.add_relationship(CodeRelationship(
             source_id=source_id,
             target_id=target_id,

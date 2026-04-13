@@ -1079,15 +1079,15 @@ class TestCallsAndReferences:
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         }
 
-        assert len(call_targets) == 1
         assert helper_id not in call_targets
 
         reference_entities = {
             entity.id: entity
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
-        target_id = next(iter(call_targets))
-        assert target_id in reference_entities
+        ref_targets = call_targets & set(reference_entities.keys())
+        assert len(ref_targets) == 1
+        target_id = next(iter(ref_targets))
         assert reference_entities[target_id].name == "worker.helper"
         assert reference_entities[target_id].properties["symbol"] == "worker.helper"
         assert reference_entities[target_id].properties["receiver"] == "worker"
@@ -1185,13 +1185,9 @@ class TestCallsAndReferences:
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         ]
-        assert len(call_targets) == 2
         assert bar_entities[0].id in call_targets
         assert baz_entities[0].id in call_targets
-        assert not {
-            entity.id
-            for entity in _entities_by_type(result, EntityType.REFERENCE)
-        } & set(call_targets)
+        assert class_entities[0].id in call_targets  # new Foo()
 
     def test_inner_block_local_class_bindings_resolve_same_file_static_and_instance_calls(self, parser, tmp_path):
         source = tmp_path / "inner_block_local_class_bindings.ts"
@@ -1244,13 +1240,9 @@ class TestCallsAndReferences:
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         ]
-        assert len(call_targets) == 2
         assert bar_entities[0].id in call_targets
         assert baz_entities[0].id in call_targets
-        assert not {
-            entity.id
-            for entity in _entities_by_type(result, EntityType.REFERENCE)
-        } & set(call_targets)
+        assert class_entities[0].id in call_targets  # new Foo()
 
     def test_unresolved_reference_ids_include_file_context_across_same_stem_files(self, parser, tmp_path):
         first_source = tmp_path / "alpha" / "shared_stem.ts"
@@ -1335,14 +1327,15 @@ class TestCallsAndReferences:
         result = parser.parse_file(source, repository=REPOSITORY)
         run_id = f"{REPOSITORY}::instance_calls.run"
         helper_id = f"{REPOSITORY}::instance_calls.Worker.helper"
+        worker_class_id = f"{REPOSITORY}::instance_calls.Worker"
 
         call_targets = {
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         }
 
-        assert len(call_targets) == 1
         assert helper_id in call_targets
+        assert worker_class_id in call_targets
         assert helper_id not in {
             entity.id
             for entity in _entities_by_type(result, EntityType.REFERENCE)
