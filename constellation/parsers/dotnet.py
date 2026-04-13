@@ -27,6 +27,8 @@ TEST_METHOD_ATTRIBUTES = frozenset({
     "TestMethod", "DataTestMethod",
 })
 
+COMPILE_TIME_OPERATORS = frozenset({"nameof", "typeof", "sizeof", "default"})
+
 CS_LANGUAGE = Language(tscsharp.language())
 
 
@@ -497,10 +499,16 @@ class DotNetParser(BaseParser):
         # Process base types (EXTENDS / IMPLEMENTS)
         self._extract_base_types(node, ctx.code, class_entity, result, is_interface=False)
 
-        # Process class body
+        # Process class body — set current_class context for call resolution
         body_node = self._find_child_by_type(node, "declaration_list")
         if body_node:
+            saved_class = ctx.current_class
+            saved_class_full_id = ctx.current_class_full_id
+            ctx.current_class = class_name
+            ctx.current_class_full_id = class_entity.id
             self._process_class_body(body_node, ctx, file_entity, class_entity, result, namespace)
+            ctx.current_class = saved_class
+            ctx.current_class_full_id = saved_class_full_id
 
     # =========================================================================
     # Interface Processing
@@ -744,6 +752,11 @@ class DotNetParser(BaseParser):
             relationship_type=RelationshipType.HAS_METHOD,
         ))
 
+        # Extract calls from method body
+        body_node = node.child_by_field_name("body")
+        if body_node:
+            self._extract_calls(body_node, ctx, result, method_entity.id)
+
     # =========================================================================
     # Constructor Processing
     # =========================================================================
@@ -795,6 +808,11 @@ class DotNetParser(BaseParser):
             target_id=ctor_entity.id,
             relationship_type=RelationshipType.HAS_CONSTRUCTOR,
         ))
+
+        # Extract calls from constructor body
+        body_node = node.child_by_field_name("body")
+        if body_node:
+            self._extract_calls(body_node, ctx, result, ctor_entity.id)
 
     # =========================================================================
     # Field Processing
@@ -906,6 +924,179 @@ class DotNetParser(BaseParser):
             target_id=prop_entity.id,
             relationship_type=RelationshipType.HAS_FIELD,
         ))
+
+    # =========================================================================
+    # Call Extraction
+    # =========================================================================
+
+    def _extract_calls(
+        self,
+        body: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        source_id: str,
+    ) -> None:
+        """Recursively walk *body* to find invocation_expression nodes
+        and record each as a call from *source_id*.
+
+        Lambda bodies and anonymous delegate bodies are walked and calls
+        within them are attributed to the enclosing method/constructor.
+        """
+        seen_reference_targets: set[str] = set()
+        self._walk_for_calls(body, ctx, result, source_id, seen_reference_targets)
+
+    def _walk_for_calls(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        source_id: str,
+        seen_reference_targets: set[str],
+    ) -> None:
+        """Recursive walk helper for call extraction."""
+        if node.type == "invocation_expression":
+            self._record_call(node, ctx, result, source_id, seen_reference_targets)
+
+        # Recurse into all children (including lambdas and anonymous delegates)
+        for child in node.children:
+            self._walk_for_calls(child, ctx, result, source_id, seen_reference_targets)
+
+    def _record_call(
+        self,
+        call_node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        source_id: str,
+        seen_reference_targets: set[str],
+    ) -> None:
+        """Resolve and record a single invocation_expression."""
+        # The function part is the first child of invocation_expression
+        # (the second child is argument_list)
+        func_node = call_node.children[0] if call_node.children else None
+        if func_node is None:
+            return
+
+        called_symbol: str | None = None
+        target_id: str | None = None
+
+        if func_node.type == "identifier":
+            called_symbol = self._get_text(func_node, ctx.code)
+
+            # Skip compile-time operators
+            if called_symbol in COMPILE_TIME_OPERATORS:
+                return
+
+            # Tier 1: Same-class method resolution
+            class_methods = ctx.class_method_ids.get(ctx.current_class_full_id, {})
+            target_id = class_methods.get(called_symbol)
+
+        elif func_node.type == "generic_name":
+            # Generic method call like Method<T>() — extract base name
+            name_node = self._find_child_by_type(func_node, "identifier")
+            if name_node:
+                called_symbol = self._get_text(name_node, ctx.code)
+
+                # Skip compile-time operators
+                if called_symbol in COMPILE_TIME_OPERATORS:
+                    return
+
+                # Tier 1: Same-class method resolution
+                class_methods = ctx.class_method_ids.get(ctx.current_class_full_id, {})
+                target_id = class_methods.get(called_symbol)
+
+        elif func_node.type == "member_access_expression":
+            # object.Method() — check for this/base
+            object_node = func_node.children[0] if func_node.children else None
+            member_node = None
+            for child in func_node.children:
+                if child.type == "identifier" and child != object_node:
+                    member_node = child
+            # The member name is the rightmost identifier (after the '.')
+            if member_node is None:
+                # Last child that is an identifier
+                for child in reversed(func_node.children):
+                    if child.type == "identifier":
+                        member_node = child
+                        break
+
+            if member_node is None or object_node is None:
+                return
+
+            called_symbol = self._get_text(member_node, ctx.code)
+
+            if object_node.type == "this":
+                # Tier 2: this.Method() — resolve via same-class
+                class_methods = ctx.class_method_ids.get(ctx.current_class_full_id, {})
+                target_id = class_methods.get(called_symbol)
+            elif object_node.type == "base":
+                # Tier 2b: base.Method() — stays unresolved
+                target_id = None
+            else:
+                # Tier 7: Other member access — unresolved
+                # Use the full expression text as the called symbol
+                called_symbol = self._get_text(func_node, ctx.code)
+                target_id = None
+
+        else:
+            # Fallback: use the full text of the function node
+            called_symbol = self._get_text(func_node, ctx.code).strip()
+            if called_symbol in COMPILE_TIME_OPERATORS:
+                return
+
+        if not called_symbol:
+            return
+
+        # If we resolved to a target, emit a CALLS edge directly
+        if target_id is not None:
+            result.add_relationship(CodeRelationship(
+                source_id=source_id,
+                target_id=target_id,
+                relationship_type=RelationshipType.CALLS,
+            ))
+            return
+
+        # Otherwise: unresolved — create a Reference entity
+        target_id = self._reference_target_id(ctx, source_id, called_symbol, call_node)
+        if target_id not in seen_reference_targets:
+            seen_reference_targets.add(target_id)
+            result.add_entity(CodeEntity(
+                id=target_id,
+                name=called_symbol,
+                entity_type=EntityType.REFERENCE,
+                repository=ctx.repository,
+                file_path=ctx.file_path,
+                line_number=call_node.start_point[0] + 1,
+                line_end=call_node.end_point[0] + 1,
+                language=self.language,
+                properties={
+                    "symbol": called_symbol,
+                    "enclosing_declaration_id": source_id,
+                    "enclosing_declaration_name": self._enclosing_declaration_name(source_id),
+                },
+            ))
+        result.add_relationship(CodeRelationship(
+            source_id=source_id,
+            target_id=target_id,
+            relationship_type=RelationshipType.CALLS,
+        ))
+
+    def _reference_target_id(
+        self,
+        ctx: _ParsingContext,
+        source_id: str,
+        called_symbol: str,
+        call_node: Node,
+    ) -> str:
+        """Build a unique ID for an unresolved call-site reference."""
+        line = call_node.start_point[0] + 1
+        col = call_node.start_point[1] + 1
+        return f"{source_id}::ref:{ctx.file_path}:{line}:{col}:{called_symbol}"
+
+    @staticmethod
+    def _enclosing_declaration_name(source_id: str) -> str:
+        """Extract the short name from a fully-qualified entity ID."""
+        local_id = source_id.split("::", 1)[-1]
+        return local_id.rsplit(".", 1)[-1]
 
     # =========================================================================
     # Base Type Extraction (EXTENDS / IMPLEMENTS)

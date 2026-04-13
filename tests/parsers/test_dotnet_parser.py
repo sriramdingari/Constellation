@@ -1197,6 +1197,202 @@ class TestPreCollectClasses:
         assert len(result.entities) > 0
         assert len(result.errors) == 0
 
+
+# ===========================================================================
+# Calls and References (Task 3)
+# ===========================================================================
+
+
+class TestCallsAndReferences:
+    """Call extraction: same-class, this/base resolution, and references."""
+
+    def test_same_class_method_call_resolves(self, parser, tmp_path):
+        """A bare call to Validate() in a class that defines Validate
+        resolves to the Validate method entity via a CALLS edge."""
+        src = tmp_path / "SameClass.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            Validate();\n"
+            "        }\n"
+            "        public void Validate() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        validate_method = _find_entity(result, "Validate", EntityType.METHOD)
+        assert run_method is not None
+        assert validate_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == validate_method.id]
+        assert len(resolved) == 1
+
+    def test_this_method_call_resolves(self, parser, tmp_path):
+        """this.Validate() resolves to the same-class method."""
+        src = tmp_path / "ThisCall.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            this.Validate();\n"
+            "        }\n"
+            "        public void Validate() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        validate_method = _find_entity(result, "Validate", EntityType.METHOD)
+        assert run_method is not None
+        assert validate_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == validate_method.id]
+        assert len(resolved) == 1
+
+    def test_base_method_call_stays_unresolved(self, parser, tmp_path):
+        """base.Save() stays unresolved — produces a Reference entity."""
+        src = tmp_path / "BaseCall.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Child : BaseEntity {\n"
+            "        public void DoWork() {\n"
+            "            base.Save();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        refs = _find_entities(result, EntityType.REFERENCE)
+        base_refs = [r for r in refs if "Save" in r.name]
+        assert len(base_refs) == 1
+
+        # There should be a CALLS edge from DoWork to the reference
+        do_work = _find_entity(result, "DoWork", EntityType.METHOD)
+        assert do_work is not None
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        call = [r for r in calls if r.source_id == do_work.id and r.target_id == base_refs[0].id]
+        assert len(call) == 1
+
+    def test_unresolved_external_call_produces_reference(self, parser, tmp_path):
+        """A call to an external unknown method creates a REFERENCE entity."""
+        src = tmp_path / "External.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            ExternalLib.DoSomething();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        refs = _find_entities(result, EntityType.REFERENCE)
+        assert len(refs) >= 1
+        ext_refs = [r for r in refs if "DoSomething" in r.name]
+        assert len(ext_refs) == 1
+
+        # CALLS edge exists from Run to the reference
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        assert run_method is not None
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        call = [r for r in calls if r.source_id == run_method.id and r.target_id == ext_refs[0].id]
+        assert len(call) == 1
+
+    def test_same_name_unresolved_in_different_methods_get_distinct_ids(self, parser, tmp_path):
+        """Two methods calling the same unresolved name get distinct reference IDs."""
+        src = tmp_path / "DistinctRefs.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Alpha() {\n"
+            "            Logger.Log();\n"
+            "        }\n"
+            "        public void Beta() {\n"
+            "            Logger.Log();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        refs = _find_entities(result, EntityType.REFERENCE)
+        log_refs = [r for r in refs if "Log" in r.name]
+        assert len(log_refs) == 2
+        assert log_refs[0].id != log_refs[1].id
+
+    def test_nameof_does_not_produce_calls_edge(self, parser, tmp_path):
+        """nameof(Foo) is a compile-time operator and must NOT produce a CALLS edge."""
+        src = tmp_path / "NameOf.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            var n = nameof(Run);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        # No CALLS edges should come from Run method
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        assert run_method is not None
+        run_calls = [r for r in calls if r.source_id == run_method.id]
+        assert len(run_calls) == 0
+
+    def test_typeof_does_not_produce_calls_edge(self, parser, tmp_path):
+        """typeof(Foo) is a compile-time operator and must NOT produce a CALLS edge."""
+        src = tmp_path / "TypeOf.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            var t = typeof(Svc);\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        assert run_method is not None
+        run_calls = [r for r in calls if r.source_id == run_method.id]
+        assert len(run_calls) == 0
+
+    def test_calls_inside_await_are_found(self, parser, tmp_path):
+        """Calls inside await expressions are extracted via recursive walk."""
+        src = tmp_path / "AwaitCall.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public async Task Run() {\n"
+            "            await DoAsync();\n"
+            "        }\n"
+            "        public Task DoAsync() { return Task.CompletedTask; }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        do_async = _find_entity(result, "DoAsync", EntityType.METHOD)
+        assert run_method is not None
+        assert do_async is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == do_async.id]
+        assert len(resolved) == 1
+
         edge_result = parser.parse_file(EDGE_CASES_FILE, repository=REPOSITORY)
         assert len(edge_result.entities) > 0
         assert len(edge_result.errors) == 0
