@@ -955,6 +955,8 @@ class JavaScriptParser(BaseParser):
                     value_node = child.child_by_field_name("value")
                     if value_node:
                         yield from JavaScriptParser._extract_pattern_identifiers(value_node, code)
+                elif child.type == "rest_pattern":
+                    yield from JavaScriptParser._extract_pattern_identifiers(child, code)
         elif pattern.type == "array_pattern":
             for child in pattern.children:
                 yield from JavaScriptParser._extract_pattern_identifiers(child, code)
@@ -962,6 +964,9 @@ class JavaScriptParser(BaseParser):
             left = pattern.child_by_field_name("left")
             if left:
                 yield from JavaScriptParser._extract_pattern_identifiers(left, code)
+        elif pattern.type == "rest_pattern":
+            for child in pattern.children:
+                yield from JavaScriptParser._extract_pattern_identifiers(child, code)
 
     def _collect_parameter_bindings(self, body: Node, code: bytes) -> dict[str, str | None]:
         callable_ids: dict[str, str | None] = {}

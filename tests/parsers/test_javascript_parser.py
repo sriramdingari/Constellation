@@ -1558,6 +1558,29 @@ class TestCallsAndReferences:
         target_id = next(iter(call_targets))
         assert target_id in reference_entities
 
+    def test_rest_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_rest.ts"
+        source.write_text(
+            "import { rest } from \"./utils\";\n"
+            "\n"
+            "function run(obj: any) {\n"
+            "  const { a, ...rest } = obj;\n"
+            "  return rest();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_rest.run"
+        import_id = f"{REPOSITORY}::utils.rest"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
     def test_new_expression_emits_calls_edge(self, parser, tmp_path):
         source = tmp_path / "new_call.ts"
         source.write_text(
@@ -1572,13 +1595,14 @@ class TestCallsAndReferences:
 
         result = parser.parse_file(source, repository=REPOSITORY)
         run_id = f"{REPOSITORY}::new_call.run"
+        ctor_id = f"{REPOSITORY}::new_call.Foo.constructor"
 
         call_targets = {
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
         }
 
-        assert len(call_targets) >= 1
+        assert ctor_id in call_targets
 
     def test_new_expression_unresolved_emits_reference(self, parser, tmp_path):
         source = tmp_path / "new_unresolved.ts"
