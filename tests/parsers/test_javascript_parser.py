@@ -1473,6 +1473,142 @@ class TestCallsAndReferences:
         assert target_id in reference_entities
         assert reference_entities[target_id].name == "Foo.bar"
 
+    def test_object_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_obj.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run() {\n"
+            "  const { helper } = someObj;\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_obj.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_array_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_arr.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run() {\n"
+            "  const [helper] = items;\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_arr.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_destructured_parameter_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_param.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run({ helper }: any) {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_param.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_new_expression_emits_calls_edge(self, parser, tmp_path):
+        source = tmp_path / "new_call.ts"
+        source.write_text(
+            "class Foo {\n"
+            "  constructor() {}\n"
+            "}\n"
+            "\n"
+            "function run() {\n"
+            "  const f = new Foo();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::new_call.run"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) >= 1
+
+    def test_new_expression_unresolved_emits_reference(self, parser, tmp_path):
+        source = tmp_path / "new_unresolved.ts"
+        source.write_text(
+            "function run() {\n"
+            "  const f = new UnknownClass();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::new_unresolved.run"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "new UnknownClass"
+
 
 # ===========================================================================
 # Entity ID format

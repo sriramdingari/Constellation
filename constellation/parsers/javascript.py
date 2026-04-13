@@ -834,7 +834,13 @@ class JavaScriptParser(BaseParser):
                     continue
                 name_node = declarator.child_by_field_name("name")
                 value_node = declarator.child_by_field_name("value")
-                if not name_node or name_node.type != "identifier":
+                if not name_node:
+                    continue
+                if name_node.type in ("object_pattern", "array_pattern"):
+                    for ident in self._extract_pattern_identifiers(name_node, ctx.code):
+                        callable_ids[ident] = None
+                    continue
+                if name_node.type != "identifier":
                     continue
                 func_name = self._get_text(name_node, ctx.code)
                 if not value_node:
@@ -937,6 +943,26 @@ class JavaScriptParser(BaseParser):
                 instance_ids[self._get_text(name_node, ctx.code)] = class_id
         return instance_ids
 
+    @staticmethod
+    def _extract_pattern_identifiers(pattern: Node, code: bytes) -> Iterator[str]:
+        if pattern.type == "identifier":
+            yield code[pattern.start_byte : pattern.end_byte].decode("utf-8")
+        elif pattern.type == "object_pattern":
+            for child in pattern.children:
+                if child.type == "shorthand_property_identifier_pattern":
+                    yield code[child.start_byte : child.end_byte].decode("utf-8")
+                elif child.type == "pair_pattern":
+                    value_node = child.child_by_field_name("value")
+                    if value_node:
+                        yield from JavaScriptParser._extract_pattern_identifiers(value_node, code)
+        elif pattern.type == "array_pattern":
+            for child in pattern.children:
+                yield from JavaScriptParser._extract_pattern_identifiers(child, code)
+        elif pattern.type == "assignment_pattern":
+            left = pattern.child_by_field_name("left")
+            if left:
+                yield from JavaScriptParser._extract_pattern_identifiers(left, code)
+
     def _collect_parameter_bindings(self, body: Node, code: bytes) -> dict[str, str | None]:
         callable_ids: dict[str, str | None] = {}
         parent = body.parent
@@ -954,8 +980,8 @@ class JavaScriptParser(BaseParser):
                 if next_pattern is None:
                     continue
                 pattern = next_pattern
-            if pattern.type == "identifier":
-                callable_ids[self._get_text(pattern, code)] = None
+            for ident in self._extract_pattern_identifiers(pattern, code):
+                callable_ids[ident] = None
         return callable_ids
 
     def _process_nested_callables(
