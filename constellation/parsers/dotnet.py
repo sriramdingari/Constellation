@@ -978,6 +978,7 @@ class DotNetParser(BaseParser):
 
         called_symbol: str | None = None
         target_id: str | None = None
+        receiver_text: str | None = None
 
         if func_node.type == "identifier":
             called_symbol = self._get_text(func_node, ctx.code)
@@ -1023,6 +1024,7 @@ class DotNetParser(BaseParser):
                 return
 
             called_symbol = self._get_text(member_node, ctx.code)
+            receiver_text = self._get_text(object_node, ctx.code)
 
             if object_node.type == "this":
                 # Tier 2: this.Method() — resolve via same-class
@@ -1068,11 +1070,7 @@ class DotNetParser(BaseParser):
                 line_number=call_node.start_point[0] + 1,
                 line_end=call_node.end_point[0] + 1,
                 language=self.language,
-                properties={
-                    "symbol": called_symbol,
-                    "enclosing_declaration_id": source_id,
-                    "enclosing_declaration_name": self._enclosing_declaration_name(source_id),
-                },
+                properties=self._reference_properties(called_symbol, source_id, receiver_text),
             ))
         result.add_relationship(CodeRelationship(
             source_id=source_id,
@@ -1091,6 +1089,19 @@ class DotNetParser(BaseParser):
         line = call_node.start_point[0] + 1
         col = call_node.start_point[1] + 1
         return f"{source_id}::ref:{ctx.file_path}:{line}:{col}:{called_symbol}"
+
+    def _reference_properties(
+        self, called_symbol: str, source_id: str, receiver_text: str | None,
+    ) -> dict:
+        """Build the properties dict for an unresolved Reference entity."""
+        props: dict = {
+            "symbol": called_symbol,
+            "enclosing_declaration_id": source_id,
+            "enclosing_declaration_name": self._enclosing_declaration_name(source_id),
+        }
+        if receiver_text:
+            props["receiver"] = receiver_text
+        return props
 
     @staticmethod
     def _enclosing_declaration_name(source_id: str) -> str:
