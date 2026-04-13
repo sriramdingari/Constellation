@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import tree_sitter_c_sharp as tscsharp
@@ -27,6 +28,33 @@ TEST_METHOD_ATTRIBUTES = frozenset({
 })
 
 CS_LANGUAGE = Language(tscsharp.language())
+
+
+# =============================================================================
+# Parsing Context
+# =============================================================================
+
+
+@dataclass
+class _ParsingContext:
+    """Mutable state threaded through the recursive walk."""
+
+    file_path: str
+    repository: str
+    code: bytes
+    namespace: str = ""
+    current_class: str = ""
+    current_class_full_id: str = ""
+
+    # Using-directive tracking (populated by _collect_usings)
+    usings: list[str] = field(default_factory=list)
+    using_statics: list[str] = field(default_factory=list)
+    using_aliases: dict[str, str] = field(default_factory=dict)
+
+    # Entity ID maps (populated by later tasks)
+    module_class_ids: dict[str, str] = field(default_factory=dict)
+    class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
+    class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 # =============================================================================
@@ -68,6 +96,15 @@ class DotNetParser(BaseParser):
         if tree.root_node.has_error:
             logger.warning("Syntax errors detected in %s (continuing with partial AST)", file_path)
 
+        ctx = _ParsingContext(
+            file_path=str(file_path),
+            repository=repository,
+            code=code,
+        )
+
+        # Collect using directives before processing entities
+        self._collect_usings(tree.root_node, ctx)
+
         # Create File entity
         file_entity = CodeEntity(
             id=f"{repository}::{file_path}",
@@ -81,9 +118,74 @@ class DotNetParser(BaseParser):
         result.add_entity(file_entity)
 
         # Extract namespace and types
-        self._process_root(tree.root_node, code, repository, str(file_path), file_entity, result)
+        self._process_root(tree.root_node, ctx, file_entity, result)
 
         return result
+
+    # =========================================================================
+    # Using-Directive Collection
+    # =========================================================================
+
+    def _collect_usings(self, root: Node, ctx: _ParsingContext) -> None:
+        """Scan the AST for using_directive nodes and populate *ctx*.
+
+        Handles all C# using forms:
+        - ``using System;``                -> ctx.usings
+        - ``using static System.Math;``    -> ctx.using_statics
+        - ``using MyAlias = Some.Type;``   -> ctx.using_aliases
+        - ``global using System.Linq;``    -> ctx.usings  (same bucket)
+        - ``global using static System.Console;`` -> ctx.using_statics
+        """
+        self._collect_usings_from(root, ctx)
+
+    def _collect_usings_from(self, node: Node, ctx: _ParsingContext) -> None:
+        """Recursively find using_directive nodes (they can appear inside
+        namespace declaration_list blocks too)."""
+        for child in node.children:
+            if child.type == "using_directive":
+                self._process_using_directive(child, ctx)
+            elif child.type in ("namespace_declaration", "declaration_list"):
+                self._collect_usings_from(child, ctx)
+
+    def _process_using_directive(self, node: Node, ctx: _ParsingContext) -> None:
+        """Classify a single using_directive and record it in *ctx*."""
+        # Detect alias: tree-sitter C# exposes the alias name via the "name" field
+        alias_node = node.child_by_field_name("name")
+        if alias_node is not None:
+            alias_name = self._get_text(alias_node, ctx.code)
+            # The target is the qualified/generic name after the '=' token
+            target = self._using_target_text(node, ctx.code, skip_alias=True)
+            if target:
+                ctx.using_aliases[alias_name] = target
+            return
+
+        # Detect 'static' modifier
+        has_static = any(child.type == "static" for child in node.children)
+
+        target = self._using_target_text(node, ctx.code, skip_alias=False)
+        if not target:
+            return
+
+        if has_static:
+            ctx.using_statics.append(target)
+        else:
+            ctx.usings.append(target)
+
+    @staticmethod
+    def _using_target_text(node: Node, code: bytes, *, skip_alias: bool) -> str | None:
+        """Extract the namespace/type target from a using_directive node.
+
+        When *skip_alias* is True, skip past the alias identifier and ``=``
+        token to find the real target.
+        """
+        # The target is the first qualified_name, identifier, or generic_name
+        # child that is NOT the alias identifier (which has the "name" field).
+        for child in node.children:
+            if child.type in ("qualified_name", "identifier", "generic_name"):
+                if skip_alias and node.child_by_field_name("name") == child:
+                    continue
+                return code[child.start_byte:child.end_byte].decode("utf-8")
+        return None
 
     # =========================================================================
     # Root Processing
@@ -92,9 +194,7 @@ class DotNetParser(BaseParser):
     def _process_root(
         self,
         root: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
     ) -> None:
@@ -102,9 +202,9 @@ class DotNetParser(BaseParser):
         # Process block-scoped namespace declarations
         for child in root.children:
             if child.type == "namespace_declaration":
-                self._process_namespace(child, code, repository, file_path, file_entity, result, parent_namespace="")
+                self._process_namespace(child, ctx, file_entity, result, parent_namespace="")
             elif child.type == "file_scoped_namespace_declaration":
-                self._process_file_scoped_namespace(child, code, repository, file_path, file_entity, result)
+                self._process_file_scoped_namespace(child, ctx, file_entity, result)
 
         # Process top-level types (no namespace)
         has_ns = any(
@@ -113,7 +213,7 @@ class DotNetParser(BaseParser):
         )
         if not has_ns:
             for child in root.children:
-                self._process_type_node(child, code, repository, file_path, file_entity, result, namespace="")
+                self._process_type_node(child, ctx, file_entity, result, namespace="")
 
     # =========================================================================
     # Namespace Processing
@@ -122,15 +222,13 @@ class DotNetParser(BaseParser):
     def _process_namespace(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
         parent_namespace: str,
     ) -> None:
         """Process a block-scoped namespace declaration."""
-        ns_name = self._get_namespace_name(node, code)
+        ns_name = self._get_namespace_name(node, ctx.code)
         if not ns_name:
             return
 
@@ -138,11 +236,11 @@ class DotNetParser(BaseParser):
 
         # Create PACKAGE entity for the namespace
         ns_entity = CodeEntity(
-            id=f"{repository}::{full_ns}",
+            id=f"{ctx.repository}::{full_ns}",
             name=full_ns.split(".")[-1],
             entity_type=EntityType.PACKAGE,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             language=self.language,
         )
@@ -153,31 +251,29 @@ class DotNetParser(BaseParser):
         if decl_list:
             for child in decl_list.children:
                 if child.type == "namespace_declaration":
-                    self._process_namespace(child, code, repository, file_path, file_entity, result, parent_namespace=full_ns)
+                    self._process_namespace(child, ctx, file_entity, result, parent_namespace=full_ns)
                 else:
-                    self._process_type_node(child, code, repository, file_path, file_entity, result, namespace=full_ns)
+                    self._process_type_node(child, ctx, file_entity, result, namespace=full_ns)
 
     def _process_file_scoped_namespace(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
     ) -> None:
         """Process a file-scoped namespace declaration (C# 10+)."""
-        ns_name = self._get_namespace_name(node, code)
+        ns_name = self._get_namespace_name(node, ctx.code)
         if not ns_name:
             return
 
         # Create PACKAGE entity
         ns_entity = CodeEntity(
-            id=f"{repository}::{ns_name}",
+            id=f"{ctx.repository}::{ns_name}",
             name=ns_name.split(".")[-1],
             entity_type=EntityType.PACKAGE,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             language=self.language,
         )
@@ -186,7 +282,7 @@ class DotNetParser(BaseParser):
         # File-scoped: all types declared after the namespace directive are in this namespace
         # They appear as children of the file_scoped_namespace_declaration node
         for child in node.children:
-            self._process_type_node(child, code, repository, file_path, file_entity, result, namespace=ns_name)
+            self._process_type_node(child, ctx, file_entity, result, namespace=ns_name)
 
     def _get_namespace_name(self, node: Node, code: bytes) -> str | None:
         """Extract namespace name from a namespace declaration node."""
@@ -215,9 +311,7 @@ class DotNetParser(BaseParser):
     def _process_type_node(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -225,11 +319,11 @@ class DotNetParser(BaseParser):
     ) -> None:
         """Route a type declaration node to the appropriate handler."""
         if node.type == "class_declaration":
-            self._process_class(node, code, repository, file_path, file_entity, result, namespace, outer_class_entity)
+            self._process_class(node, ctx, file_entity, result, namespace, outer_class_entity)
         elif node.type == "interface_declaration":
-            self._process_interface(node, code, repository, file_path, file_entity, result, namespace, outer_class_entity)
+            self._process_interface(node, ctx, file_entity, result, namespace, outer_class_entity)
         elif node.type == "enum_declaration":
-            self._process_enum(node, code, repository, file_path, file_entity, result, namespace)
+            self._process_enum(node, ctx, file_entity, result, namespace)
 
     # =========================================================================
     # Class Processing
@@ -238,9 +332,7 @@ class DotNetParser(BaseParser):
     def _process_class(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -251,23 +343,23 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        class_name = self._get_text(name_node, code)
+        class_name = self._get_text(name_node, ctx.code)
         full_name = self._qualified_type_name(
             namespace,
             class_name,
             outer_class_entity=outer_class_entity,
         )
 
-        modifiers = self._extract_modifiers(node, code)
-        docstring = self._extract_docstring(node, code)
-        class_code = self._get_text(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
+        docstring = self._extract_docstring(node, ctx.code)
+        class_code = self._get_text(node, ctx.code)
 
         class_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=class_name,
             entity_type=EntityType.CLASS,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             line_end=node.end_point[0] + 1,
             language=self.language,
@@ -288,7 +380,7 @@ class DotNetParser(BaseParser):
         if namespace:
             result.add_relationship(CodeRelationship(
                 source_id=class_entity.id,
-                target_id=f"{repository}::{namespace}",
+                target_id=f"{ctx.repository}::{namespace}",
                 relationship_type=RelationshipType.IN_PACKAGE,
             ))
 
@@ -301,12 +393,12 @@ class DotNetParser(BaseParser):
             ))
 
         # Process base types (EXTENDS / IMPLEMENTS)
-        self._extract_base_types(node, code, class_entity, result, is_interface=False)
+        self._extract_base_types(node, ctx.code, class_entity, result, is_interface=False)
 
         # Process class body
         body_node = self._find_child_by_type(node, "declaration_list")
         if body_node:
-            self._process_class_body(body_node, code, repository, file_path, file_entity, class_entity, result, namespace)
+            self._process_class_body(body_node, ctx, file_entity, class_entity, result, namespace)
 
     # =========================================================================
     # Interface Processing
@@ -315,9 +407,7 @@ class DotNetParser(BaseParser):
     def _process_interface(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -328,22 +418,22 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        iface_name = self._get_text(name_node, code)
+        iface_name = self._get_text(name_node, ctx.code)
         full_name = self._qualified_type_name(
             namespace,
             iface_name,
             outer_class_entity=outer_class_entity,
         )
 
-        modifiers = self._extract_modifiers(node, code)
-        docstring = self._extract_docstring(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
+        docstring = self._extract_docstring(node, ctx.code)
 
         iface_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=iface_name,
             entity_type=EntityType.INTERFACE,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             line_end=node.end_point[0] + 1,
             language=self.language,
@@ -363,7 +453,7 @@ class DotNetParser(BaseParser):
         if namespace:
             result.add_relationship(CodeRelationship(
                 source_id=iface_entity.id,
-                target_id=f"{repository}::{namespace}",
+                target_id=f"{ctx.repository}::{namespace}",
                 relationship_type=RelationshipType.IN_PACKAGE,
             ))
 
@@ -380,7 +470,7 @@ class DotNetParser(BaseParser):
         if body_node:
             for child in body_node.children:
                 if child.type == "method_declaration":
-                    self._process_method(child, code, repository, file_path, iface_entity, result, namespace)
+                    self._process_method(child, ctx, iface_entity, result, namespace)
 
     # =========================================================================
     # Enum Processing
@@ -389,9 +479,7 @@ class DotNetParser(BaseParser):
     def _process_enum(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -402,22 +490,22 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        enum_name = self._get_text(name_node, code)
+        enum_name = self._get_text(name_node, ctx.code)
         full_name = self._qualified_type_name(
             namespace,
             enum_name,
             outer_class_entity=outer_class_entity,
         )
 
-        modifiers = self._extract_modifiers(node, code)
-        docstring = self._extract_docstring(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
+        docstring = self._extract_docstring(node, ctx.code)
 
         enum_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=enum_name,
             entity_type=EntityType.CLASS,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             line_end=node.end_point[0] + 1,
             language=self.language,
@@ -438,7 +526,7 @@ class DotNetParser(BaseParser):
         if namespace:
             result.add_relationship(CodeRelationship(
                 source_id=enum_entity.id,
-                target_id=f"{repository}::{namespace}",
+                target_id=f"{ctx.repository}::{namespace}",
                 relationship_type=RelationshipType.IN_PACKAGE,
             ))
 
@@ -456,9 +544,7 @@ class DotNetParser(BaseParser):
     def _process_class_body(
         self,
         body: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         file_entity: CodeEntity,
         class_entity: CodeEntity,
         result: ParseResult,
@@ -467,26 +553,24 @@ class DotNetParser(BaseParser):
         """Process members inside a class body."""
         for child in body.children:
             if child.type == "method_declaration":
-                self._process_method(child, code, repository, file_path, class_entity, result, namespace)
+                self._process_method(child, ctx, class_entity, result, namespace)
             elif child.type == "constructor_declaration":
-                self._process_constructor(child, code, repository, file_path, class_entity, result, namespace)
+                self._process_constructor(child, ctx, class_entity, result, namespace)
             elif child.type == "field_declaration":
-                self._process_field(child, code, repository, file_path, class_entity, result, namespace)
+                self._process_field(child, ctx, class_entity, result, namespace)
             elif child.type == "property_declaration":
-                self._process_property(child, code, repository, file_path, class_entity, result, namespace)
+                self._process_property(child, ctx, class_entity, result, namespace)
             elif child.type == "class_declaration":
                 # Nested class
-                self._process_class(child, code, repository, file_path, file_entity, result, namespace, outer_class_entity=class_entity)
+                self._process_class(child, ctx, file_entity, result, namespace, outer_class_entity=class_entity)
             elif child.type == "interface_declaration":
                 # Nested interface
-                self._process_interface(child, code, repository, file_path, file_entity, result, namespace, outer_class_entity=class_entity)
+                self._process_interface(child, ctx, file_entity, result, namespace, outer_class_entity=class_entity)
             elif child.type == "enum_declaration":
                 # Nested enum
                 self._process_enum(
                     child,
-                    code,
-                    repository,
-                    file_path,
+                    ctx,
                     file_entity,
                     result,
                     namespace,
@@ -500,9 +584,7 @@ class DotNetParser(BaseParser):
     def _process_method(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         class_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -512,35 +594,35 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        method_name = self._get_text(name_node, code)
+        method_name = self._get_text(name_node, ctx.code)
         class_full_name = class_entity.id.split("::", 1)[1] if "::" in class_entity.id else class_entity.name
         full_name = f"{class_full_name}.{method_name}"
 
         # Return type
-        return_type = self._extract_return_type(node, code)
+        return_type = self._extract_return_type(node, ctx.code)
 
         # Signature
-        params = self._extract_parameters(node, code)
+        params = self._extract_parameters(node, ctx.code)
         param_str = ", ".join(f"{p['type']} {p['name']}" for p in params)
         signature = f"{return_type or 'void'} {method_name}({param_str})"
 
-        modifiers = self._extract_modifiers(node, code)
-        docstring = self._extract_docstring(node, code)
-        method_code = self._get_text(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
+        docstring = self._extract_docstring(node, ctx.code)
+        method_code = self._get_text(node, ctx.code)
 
         # Detect test stereotype via attributes
-        attributes = self._extract_attributes(node, code)
+        attributes = self._extract_attributes(node, ctx.code)
         stereotypes: list[str] = []
         attr_names = {a["name"] for a in attributes}
         if attr_names & TEST_METHOD_ATTRIBUTES:
             stereotypes.append("test")
 
         method_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=method_name,
             entity_type=EntityType.METHOD,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             line_end=node.end_point[0] + 1,
             language=self.language,
@@ -567,9 +649,7 @@ class DotNetParser(BaseParser):
     def _process_constructor(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         class_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -579,24 +659,24 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        ctor_name = self._get_text(name_node, code)
+        ctor_name = self._get_text(name_node, ctx.code)
         class_full_name = class_entity.id.split("::", 1)[1] if "::" in class_entity.id else class_entity.name
         full_name = f"{class_full_name}.{ctor_name}"
 
-        params = self._extract_parameters(node, code)
+        params = self._extract_parameters(node, ctx.code)
         param_str = ", ".join(f"{p['type']} {p['name']}" for p in params)
         signature = f"{ctor_name}({param_str})"
 
-        modifiers = self._extract_modifiers(node, code)
-        docstring = self._extract_docstring(node, code)
-        ctor_code = self._get_text(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
+        docstring = self._extract_docstring(node, ctx.code)
+        ctor_code = self._get_text(node, ctx.code)
 
         ctor_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=ctor_name,
             entity_type=EntityType.CONSTRUCTOR,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             line_end=node.end_point[0] + 1,
             language=self.language,
@@ -621,15 +701,13 @@ class DotNetParser(BaseParser):
     def _process_field(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         class_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
     ) -> None:
         """Process a field declaration (may declare multiple variables)."""
-        modifiers = self._extract_modifiers(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
 
         # Find variable_declaration child
         var_decl = self._find_child_by_type(node, "variable_declaration")
@@ -642,7 +720,7 @@ class DotNetParser(BaseParser):
         if not type_node:
             type_node = node.child_by_field_name("type")
         if type_node:
-            field_type = self._extract_type_name(type_node, code)
+            field_type = self._extract_type_name(type_node, ctx.code)
 
         # Process each variable declarator
         for child in var_decl.children:
@@ -654,16 +732,16 @@ class DotNetParser(BaseParser):
                 if not name_node:
                     continue
 
-                field_name = self._get_text(name_node, code)
+                field_name = self._get_text(name_node, ctx.code)
                 class_full_name = class_entity.id.split("::", 1)[1] if "::" in class_entity.id else class_entity.name
                 full_name = f"{class_full_name}.{field_name}"
 
                 field_entity = CodeEntity(
-                    id=f"{repository}::{full_name}",
+                    id=f"{ctx.repository}::{full_name}",
                     name=field_name,
                     entity_type=EntityType.FIELD,
-                    repository=repository,
-                    file_path=file_path,
+                    repository=ctx.repository,
+                    file_path=ctx.file_path,
                     line_number=node.start_point[0] + 1,
                     language=self.language,
                     return_type=field_type,
@@ -685,9 +763,7 @@ class DotNetParser(BaseParser):
     def _process_property(
         self,
         node: Node,
-        code: bytes,
-        repository: str,
-        file_path: str,
+        ctx: _ParsingContext,
         class_entity: CodeEntity,
         result: ParseResult,
         namespace: str,
@@ -697,24 +773,24 @@ class DotNetParser(BaseParser):
         if not name_node:
             return
 
-        prop_name = self._get_text(name_node, code)
+        prop_name = self._get_text(name_node, ctx.code)
         class_full_name = class_entity.id.split("::", 1)[1] if "::" in class_entity.id else class_entity.name
         full_name = f"{class_full_name}.{prop_name}"
 
-        modifiers = self._extract_modifiers(node, code)
+        modifiers = self._extract_modifiers(node, ctx.code)
         modifiers.append("property")
 
         prop_type = None
         type_node = node.child_by_field_name("type")
         if type_node:
-            prop_type = self._extract_type_name(type_node, code)
+            prop_type = self._extract_type_name(type_node, ctx.code)
 
         prop_entity = CodeEntity(
-            id=f"{repository}::{full_name}",
+            id=f"{ctx.repository}::{full_name}",
             name=prop_name,
             entity_type=EntityType.FIELD,
-            repository=repository,
-            file_path=file_path,
+            repository=ctx.repository,
+            file_path=ctx.file_path,
             line_number=node.start_point[0] + 1,
             language=self.language,
             return_type=prop_type,

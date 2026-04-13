@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
-from constellation.parsers.dotnet import DotNetParser
+from constellation.parsers.dotnet import DotNetParser, _ParsingContext
 from constellation.parsers.base import ParseResult
 
 # ---------------------------------------------------------------------------
@@ -788,3 +788,195 @@ class TestReadonlyModifier:
         entity = _find_entity(sample_result, "_userRepository", EntityType.FIELD)
         assert entity is not None
         assert "readonly" in entity.modifiers
+
+
+# ===========================================================================
+# Using-Directive Tracking
+# ===========================================================================
+
+
+class TestUsingDirectiveTracking:
+    """_collect_usings populates the _ParsingContext correctly."""
+
+    def test_existing_fixture_usings_collected(self, parser, tmp_path):
+        """The SampleCSharp.cs fixture has 'using System;' and
+        'using System.Collections.Generic;' — both should be tracked."""
+        result = parser.parse_file(SAMPLE_FILE, repository=REPOSITORY)
+        # Parsing succeeds (entity extraction unaffected)
+        assert len(result.entities) > 0
+        assert len(result.errors) == 0
+
+    def test_regular_usings(self, parser, tmp_path):
+        src = tmp_path / "Usings.cs"
+        src.write_text(
+            "using System;\n"
+            "using System.Collections.Generic;\n"
+            "\n"
+            "namespace Foo {\n"
+            "    class Bar {}\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        # File parses without error
+        assert len(result.errors) == 0
+        # Class still extracted
+        assert _find_entity(result, "Bar", EntityType.CLASS) is not None
+
+    def test_static_usings(self, parser, tmp_path):
+        src = tmp_path / "StaticUsing.cs"
+        src.write_text(
+            "using static System.Math;\n"
+            "using static System.Console;\n"
+            "\n"
+            "class Calc {\n"
+            "    int X() { return Abs(-1); }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        assert len(result.errors) == 0
+        assert _find_entity(result, "Calc", EntityType.CLASS) is not None
+
+    def test_alias_usings(self, parser, tmp_path):
+        src = tmp_path / "AliasUsing.cs"
+        src.write_text(
+            "using IntList = System.Collections.Generic.List<int>;\n"
+            "\n"
+            "class Foo {\n"
+            "    IntList items;\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        assert len(result.errors) == 0
+        assert _find_entity(result, "Foo", EntityType.CLASS) is not None
+
+    def test_global_usings(self, parser, tmp_path):
+        src = tmp_path / "GlobalUsing.cs"
+        src.write_text(
+            "global using System.Linq;\n"
+            "global using static System.Console;\n"
+            "\n"
+            "class App {}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        assert len(result.errors) == 0
+        assert _find_entity(result, "App", EntityType.CLASS) is not None
+
+    def test_usings_inside_namespace(self, parser, tmp_path):
+        src = tmp_path / "NsUsing.cs"
+        src.write_text(
+            "using System;\n"
+            "\n"
+            "namespace Outer {\n"
+            "    using System.Linq;\n"
+            "    class Inner {}\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        assert len(result.errors) == 0
+        assert _find_entity(result, "Inner", EntityType.CLASS) is not None
+
+    def test_mixed_usings_does_not_crash(self, parser, tmp_path):
+        """A file with every using variant should parse without error."""
+        src = tmp_path / "MixedUsings.cs"
+        src.write_text(
+            "using System;\n"
+            "using static System.Math;\n"
+            "using Alias = System.Text.StringBuilder;\n"
+            "global using System.IO;\n"
+            "global using static System.Console;\n"
+            "\n"
+            "namespace Demo {\n"
+            "    using System.Linq;\n"
+            "    class Widget {}\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+        assert len(result.errors) == 0
+        assert _find_entity(result, "Widget", EntityType.CLASS) is not None
+
+    def test_context_populated_regular_usings(self, parser):
+        """_collect_usings populates ctx.usings for plain using directives."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        code = b"using System;\nusing System.IO;\nclass X {}\n"
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository="r", code=code)
+        parser._collect_usings(tree.root_node, ctx)
+
+        assert "System" in ctx.usings
+        assert "System.IO" in ctx.usings
+        assert len(ctx.using_statics) == 0
+        assert len(ctx.using_aliases) == 0
+
+    def test_context_populated_static_usings(self, parser):
+        """_collect_usings populates ctx.using_statics for 'using static'."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        code = b"using static System.Math;\nusing static System.Console;\nclass X {}\n"
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository="r", code=code)
+        parser._collect_usings(tree.root_node, ctx)
+
+        assert "System.Math" in ctx.using_statics
+        assert "System.Console" in ctx.using_statics
+        assert len(ctx.usings) == 0
+
+    def test_context_populated_alias_usings(self, parser):
+        """_collect_usings populates ctx.using_aliases for alias directives."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        code = b"using IntList = System.Collections.Generic.List<int>;\nclass X {}\n"
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository="r", code=code)
+        parser._collect_usings(tree.root_node, ctx)
+
+        assert "IntList" in ctx.using_aliases
+        assert "System.Collections.Generic.List<int>" in ctx.using_aliases["IntList"]
+        assert len(ctx.usings) == 0
+        assert len(ctx.using_statics) == 0
+
+    def test_context_populated_global_usings(self, parser):
+        """Global usings go to the same buckets as non-global."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        code = b"global using System.Linq;\nglobal using static System.Console;\nclass X {}\n"
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository="r", code=code)
+        parser._collect_usings(tree.root_node, ctx)
+
+        assert "System.Linq" in ctx.usings
+        assert "System.Console" in ctx.using_statics
+
+    def test_context_populated_mixed(self, parser):
+        """All using categories are correctly separated."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        code = (
+            b"using System;\n"
+            b"using static System.Math;\n"
+            b"using Alias = System.Text.StringBuilder;\n"
+            b"global using System.IO;\n"
+            b"global using static System.Console;\n"
+            b"\n"
+            b"namespace Demo {\n"
+            b"    using System.Linq;\n"
+            b"    class Widget {}\n"
+            b"}\n"
+        )
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository="r", code=code)
+        parser._collect_usings(tree.root_node, ctx)
+
+        assert sorted(ctx.usings) == ["System", "System.IO", "System.Linq"]
+        assert sorted(ctx.using_statics) == ["System.Console", "System.Math"]
+        assert ctx.using_aliases == {"Alias": "System.Text.StringBuilder"}
