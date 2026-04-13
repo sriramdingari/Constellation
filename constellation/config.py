@@ -23,13 +23,13 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_embedding_model: str = DEFAULT_OLLAMA_EMBEDDING_MODEL
     ollama_embedding_dimensions: int = DEFAULT_OLLAMA_EMBEDDING_DIMENSIONS
-    embedding_batch_size: int = 512
-    embedding_concurrency: int = 20
+    embedding_batch_size: int = 8
+    embedding_concurrency: int = 1
     files_per_chunk: int = Field(
         100,
         validation_alias=AliasChoices("files_per_chunk", "entity_batch_size"),
     )
-    indexing_worker_threads: int = 22
+    indexing_worker_threads: int = 1
     storage_backend: Literal["neo4j", "postgres"] = "neo4j"
     postgres_dsn: str = ""
 
