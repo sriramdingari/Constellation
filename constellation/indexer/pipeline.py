@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 import threading
 import time
@@ -28,11 +29,7 @@ from constellation.indexer.collector import (
     is_github_url,
     merge_exclusions,
 )
-import re
-
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
-
-_REF_SITE_RE = re.compile(r"::ref:.*?(\d+):(\d+)(?::[^:]+)?$")
 from constellation.indexer.spool import (
     ChunkPreparation,
     RunManifest,
@@ -46,6 +43,8 @@ from constellation.parsers.base import ParseResult
 from constellation.parsers.registry import ParserRegistry
 
 logger = logging.getLogger(__name__)
+
+_REF_SITE_RE = re.compile(r"::ref:.*:(\d+):(\d+)(?::[^:]+)?$")
 
 
 @dataclass
