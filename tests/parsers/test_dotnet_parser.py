@@ -980,3 +980,223 @@ class TestUsingDirectiveTracking:
         assert sorted(ctx.usings) == ["System", "System.IO", "System.Linq"]
         assert sorted(ctx.using_statics) == ["System.Console", "System.Math"]
         assert ctx.using_aliases == {"Alias": "System.Text.StringBuilder"}
+
+
+# ===========================================================================
+# Class/Method Pre-Collection
+# ===========================================================================
+
+
+class TestPreCollectClasses:
+    """_pre_collect_classes populates module_class_ids, class_method_ids,
+    and class_static_method_ids on _ParsingContext."""
+
+    @staticmethod
+    def _parse_and_collect(parser, code: bytes, repository: str = "r") -> _ParsingContext:
+        """Helper: parse code, run _pre_collect_classes, return ctx."""
+        from tree_sitter import Parser as TSParser, Language
+        import tree_sitter_c_sharp as tscsharp
+
+        ts_parser = TSParser(Language(tscsharp.language()))
+        tree = ts_parser.parse(code)
+        ctx = _ParsingContext(file_path="test.cs", repository=repository, code=code)
+        parser._pre_collect_classes(tree.root_node, ctx)
+        return ctx
+
+    def test_single_class_in_namespace(self, parser):
+        """A single class inside a namespace is registered in module_class_ids."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Foo {\n"
+            b"        public void Bar() {}\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Foo" in ctx.module_class_ids
+        assert ctx.module_class_ids["Foo"] == "r::NS.Foo"
+
+    def test_class_method_ids_populated(self, parser):
+        """Methods of a class are collected in class_method_ids."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Foo {\n"
+            b"        public void Bar() {}\n"
+            b"        public int Baz() { return 1; }\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        class_id = "r::NS.Foo"
+        assert class_id in ctx.class_method_ids
+        assert "Bar" in ctx.class_method_ids[class_id]
+        assert ctx.class_method_ids[class_id]["Bar"] == "r::NS.Foo.Bar"
+        assert "Baz" in ctx.class_method_ids[class_id]
+        assert ctx.class_method_ids[class_id]["Baz"] == "r::NS.Foo.Baz"
+
+    def test_static_methods_registered(self, parser):
+        """Static methods appear in both class_method_ids and class_static_method_ids."""
+        code = (
+            b"namespace NS {\n"
+            b"    public static class Helper {\n"
+            b"        public static int Add(int a, int b) { return a + b; }\n"
+            b"        public static int Sub(int a, int b) { return a - b; }\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        class_id = "r::NS.Helper"
+        assert class_id in ctx.class_static_method_ids
+        assert "Add" in ctx.class_static_method_ids[class_id]
+        assert ctx.class_static_method_ids[class_id]["Add"] == "r::NS.Helper.Add"
+        assert "Sub" in ctx.class_static_method_ids[class_id]
+
+    def test_instance_method_not_in_static_map(self, parser):
+        """Non-static methods should NOT appear in class_static_method_ids."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Svc {\n"
+            b"        public void Run() {}\n"
+            b"        public static void Create() {}\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        class_id = "r::NS.Svc"
+        # Both are in the all-methods map
+        assert "Run" in ctx.class_method_ids[class_id]
+        assert "Create" in ctx.class_method_ids[class_id]
+        # Only Create is static
+        assert "Create" in ctx.class_static_method_ids[class_id]
+        assert "Run" not in ctx.class_static_method_ids[class_id]
+
+    def test_multiple_classes(self, parser):
+        """Multiple classes in the same namespace are all registered."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Alpha { public void A() {} }\n"
+            b"    public class Beta { public void B() {} }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Alpha" in ctx.module_class_ids
+        assert "Beta" in ctx.module_class_ids
+        assert ctx.module_class_ids["Alpha"] == "r::NS.Alpha"
+        assert ctx.module_class_ids["Beta"] == "r::NS.Beta"
+
+    def test_nested_namespace(self, parser):
+        """Classes in nested namespaces get fully qualified IDs."""
+        code = (
+            b"namespace Outer {\n"
+            b"    namespace Inner {\n"
+            b"        public class Deep { public void Go() {} }\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Deep" in ctx.module_class_ids
+        assert ctx.module_class_ids["Deep"] == "r::Outer.Inner.Deep"
+
+    def test_nested_class(self, parser):
+        """Nested classes use the outer class as part of their qualified name."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Outer {\n"
+            b"        public class Inner {\n"
+            b"            public void DoStuff() {}\n"
+            b"        }\n"
+            b"    }\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Outer" in ctx.module_class_ids
+        assert ctx.module_class_ids["Outer"] == "r::NS.Outer"
+        assert "Inner" in ctx.module_class_ids
+        assert ctx.module_class_ids["Inner"] == "r::NS.Outer.Inner"
+
+        inner_id = "r::NS.Outer.Inner"
+        assert inner_id in ctx.class_method_ids
+        assert "DoStuff" in ctx.class_method_ids[inner_id]
+
+    def test_class_without_namespace(self, parser):
+        """A class at top level (no namespace) is still registered."""
+        code = b"public class Standalone { public void Ping() {} }\n"
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Standalone" in ctx.module_class_ids
+        assert ctx.module_class_ids["Standalone"] == "r::Standalone"
+
+    def test_class_without_methods(self, parser):
+        """A class with no methods should be in module_class_ids but
+        not in class_method_ids."""
+        code = (
+            b"namespace NS {\n"
+            b"    public class Empty {}\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        assert "Empty" in ctx.module_class_ids
+        class_id = "r::NS.Empty"
+        assert class_id not in ctx.class_method_ids
+        assert class_id not in ctx.class_static_method_ids
+
+    def test_file_scoped_namespace(self, parser):
+        """File-scoped namespace (C# 10+): classes appear as root-level
+        siblings in the AST, so they are pre-collected without the namespace
+        prefix (matching the main entity walk behaviour)."""
+        code = (
+            b"namespace NS;\n"
+            b"\n"
+            b"public class Svc {\n"
+            b"    public void Run() {}\n"
+            b"}\n"
+        )
+        ctx = self._parse_and_collect(parser, code)
+
+        # The class is a root-level sibling; pre-collection mirrors the main walk.
+        assert "Svc" in ctx.module_class_ids
+
+    def test_ids_match_main_walk(self, parser, tmp_path):
+        """Pre-collected IDs match those produced by the main entity walk."""
+        src = tmp_path / "Match.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class TaxService {\n"
+            "        public decimal Calculate() { return 0m; }\n"
+            "        public static TaxService Create() { return new TaxService(); }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository="repo")
+
+        # Verify entity IDs from the main walk
+        tax_cls = _find_entity(result, "TaxService", EntityType.CLASS)
+        assert tax_cls is not None
+        assert tax_cls.id == "repo::NS.TaxService"
+
+        calc_method = _find_entity(result, "Calculate", EntityType.METHOD)
+        assert calc_method is not None
+        assert calc_method.id == "repo::NS.TaxService.Calculate"
+
+        create_method = _find_entity(result, "Create", EntityType.METHOD)
+        assert create_method is not None
+        assert create_method.id == "repo::NS.TaxService.Create"
+
+    def test_existing_fixtures_precollected(self, parser):
+        """The pre-collection pass runs on the real fixture files without
+        breaking any existing entity extraction."""
+        result = parser.parse_file(SAMPLE_FILE, repository=REPOSITORY)
+        assert len(result.entities) > 0
+        assert len(result.errors) == 0
+
+        edge_result = parser.parse_file(EDGE_CASES_FILE, repository=REPOSITORY)
+        assert len(edge_result.entities) > 0
+        assert len(edge_result.errors) == 0

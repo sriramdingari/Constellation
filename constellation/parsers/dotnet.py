@@ -105,6 +105,9 @@ class DotNetParser(BaseParser):
         # Collect using directives before processing entities
         self._collect_usings(tree.root_node, ctx)
 
+        # Pre-collect class/method IDs for call resolution
+        self._pre_collect_classes(tree.root_node, ctx)
+
         # Create File entity
         file_entity = CodeEntity(
             id=f"{repository}::{file_path}",
@@ -186,6 +189,105 @@ class DotNetParser(BaseParser):
                     continue
                 return code[child.start_byte:child.end_byte].decode("utf-8")
         return None
+
+    # =========================================================================
+    # Class/Method Pre-Collection (for call resolution)
+    # =========================================================================
+
+    def _pre_collect_classes(self, root: Node, ctx: _ParsingContext) -> None:
+        """Pre-collect all class and method entity IDs before the main walk.
+
+        Populates ``ctx.module_class_ids``, ``ctx.class_method_ids``, and
+        ``ctx.class_static_method_ids`` so that the call-resolution pass
+        (Tasks 3-4) can resolve targets without a second full traversal.
+        """
+        self._pre_collect_from(root, ctx, namespace="", outer_class_qname="")
+
+    def _pre_collect_from(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        namespace: str,
+        outer_class_qname: str,
+    ) -> None:
+        """Recursively scan *node* for class declarations and register their
+        entity IDs together with the IDs of their method members."""
+        for child in node.children:
+            if child.type in ("namespace_declaration", "file_scoped_namespace_declaration"):
+                ns_name = self._get_namespace_name(child, ctx.code)
+                if not ns_name:
+                    continue
+                # Block-scoped namespaces can be nested
+                full_ns = f"{namespace}.{ns_name}" if namespace else ns_name
+                # Recurse into the namespace body (declaration_list or direct children)
+                decl_list = self._find_child_by_type(child, "declaration_list")
+                if decl_list:
+                    self._pre_collect_from(decl_list, ctx, namespace=full_ns, outer_class_qname="")
+                else:
+                    # file_scoped_namespace_declaration: types are direct children
+                    self._pre_collect_from(child, ctx, namespace=full_ns, outer_class_qname="")
+
+            elif child.type == "class_declaration":
+                self._pre_collect_class(child, ctx, namespace, outer_class_qname)
+
+    def _pre_collect_class(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        namespace: str,
+        outer_class_qname: str,
+    ) -> None:
+        """Register a single class and its methods in the pre-collection maps."""
+        name_node = node.child_by_field_name("name")
+        if not name_node:
+            return
+
+        class_name = self._get_text(name_node, ctx.code)
+
+        # Build the qualified name the same way _process_class / _qualified_type_name does:
+        # nested: "{outer_qname}.{class_name}", top-level: "{namespace}.{class_name}"
+        if outer_class_qname:
+            full_qname = f"{outer_class_qname}.{class_name}"
+        elif namespace:
+            full_qname = f"{namespace}.{class_name}"
+        else:
+            full_qname = class_name
+
+        class_id = f"{ctx.repository}::{full_qname}"
+
+        # Store class name -> class entity ID
+        ctx.module_class_ids[class_name] = class_id
+
+        # Walk the class body for method_declaration children
+        body = self._find_child_by_type(node, "declaration_list")
+        if body:
+            method_ids: dict[str, str] = {}
+            static_method_ids: dict[str, str] = {}
+
+            for child in body.children:
+                if child.type == "method_declaration":
+                    mname_node = child.child_by_field_name("name")
+                    if not mname_node:
+                        continue
+                    method_name = self._get_text(mname_node, ctx.code)
+                    method_id = f"{ctx.repository}::{full_qname}.{method_name}"
+
+                    method_ids[method_name] = method_id
+
+                    # Check for static modifier
+                    modifiers = self._extract_modifiers(child, ctx.code)
+                    if "static" in modifiers:
+                        static_method_ids[method_name] = method_id
+
+            if method_ids:
+                ctx.class_method_ids[class_id] = method_ids
+            if static_method_ids:
+                ctx.class_static_method_ids[class_id] = static_method_ids
+
+            # Recurse into nested classes
+            for child in body.children:
+                if child.type == "class_declaration":
+                    self._pre_collect_class(child, ctx, namespace, outer_class_qname=full_qname)
 
     # =========================================================================
     # Root Processing
