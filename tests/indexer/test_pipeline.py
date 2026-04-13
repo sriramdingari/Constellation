@@ -1373,6 +1373,108 @@ class TestScopedEntityNormalization:
             "test-repo::handler.ts#ref:1:50:send",
         }
 
+    @pytest.mark.asyncio
+    async def test_csharp_unresolved_reference_ids_stable_after_normalize(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """C# Reference entities should get stable, site-based normalized IDs."""
+        mock_parser.language = "csharp"
+        mock_parser.file_extensions = [".cs"]
+        mock_registry.supported_extensions = {".cs"}
+
+        source_file = tmp_path / "Service.cs"
+        source_file.write_text("class Service { void Run() { Save(); } }")
+
+        def _parse_csharp(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::{file_path}"
+            class_id = f"{repository}::Service"
+            method_id = f"{repository}::Service.Run"
+            ref_id = f"{repository}::Service.Run::ref:{file_path}:1:30:Save"
+            return ParseResult(
+                file_path=str(file_path),
+                language="csharp",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="csharp",
+                    ),
+                    CodeEntity(
+                        id=class_id,
+                        name="Service",
+                        entity_type=EntityType.CLASS,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="csharp",
+                    ),
+                    CodeEntity(
+                        id=method_id,
+                        name="Run",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="csharp",
+                    ),
+                    CodeEntity(
+                        id=ref_id,
+                        name="Save",
+                        entity_type=EntityType.REFERENCE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="csharp",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=class_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=class_id,
+                        target_id=method_id,
+                        relationship_type=RelationshipType.HAS_METHOD,
+                    ),
+                    CodeRelationship(
+                        source_id=method_id,
+                        target_id=ref_id,
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_csharp)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        ref_ids = {
+            entity.id
+            for entity in all_entities
+            if entity.entity_type == EntityType.REFERENCE
+        }
+        # The normalized ID must use file-scoped format {file_entity_id}#ref:...
+        # NOT the raw parser format {repo}::Service.Run::ref:...
+        assert len(ref_ids) == 1
+        ref_id = next(iter(ref_ids))
+        assert ref_id.startswith("test-repo::Service.cs#ref:")
+        assert "Save" in ref_id
+
+        call_edges = {
+            (rel.source_id, rel.target_id)
+            for rel in _collect_created_relationships(mock_graph_client)
+            if rel.relationship_type == RelationshipType.CALLS
+        }
+        assert any(edge[1] == ref_id for edge in call_edges)
+
 
 # ---------------------------------------------------------------------------
 # Clone cleanup on error
