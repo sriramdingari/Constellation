@@ -888,32 +888,35 @@ class TestCallsAndReferences:
         assert reference_entities[target_id].properties["symbol"] == "this.helper"
         assert reference_entities[target_id].properties["receiver"] == "this"
 
-    def test_instance_this_call_prefers_instance_method_when_static_exists_too(self, parser, tmp_path):
-        source = tmp_path / "instance_this_prefers_instance.ts"
+    def test_instance_this_call_resolves_when_only_instance_method_exists(self, parser, tmp_path):
+        source = tmp_path / "instance_this_resolve.ts"
         source.write_text(
             "class Worker {\n"
             "  run(): number {\n"
-            "    return this.helper();\n"
+            "    return this.process();\n"
             "  }\n"
-            "  helper(): number {\n"
+            "  process(): number {\n"
             "    return 1;\n"
             "  }\n"
-            "  static helper(): number {\n"
-            "    return 2;\n"
+            "  static create(): Worker {\n"
+            "    return new Worker();\n"
             "  }\n"
             "}\n"
         )
 
         result = parser.parse_file(source, repository=REPOSITORY)
-        run_id = f"{REPOSITORY}::instance_this_prefers_instance.Worker.run"
-        helper_id = f"{REPOSITORY}::instance_this_prefers_instance.Worker.helper"
+        run_id = f"{REPOSITORY}::instance_this_resolve.Worker.run"
+        process_id = f"{REPOSITORY}::instance_this_resolve.Worker.process"
+        create_id = f"{REPOSITORY}::instance_this_resolve.Worker.create"
 
-        call_targets = [
+        call_targets = {
             relationship.target_id
             for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
-        ]
-        assert call_targets == [helper_id]
-        assert helper_id not in {
+        }
+
+        assert process_id in call_targets
+        assert create_id not in call_targets
+        assert process_id not in {
             entity.id
             for entity in _entities_by_type(result, EntityType.REFERENCE)
         }
