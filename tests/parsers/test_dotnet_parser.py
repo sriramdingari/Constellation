@@ -1562,3 +1562,332 @@ class TestCallsAndReferences:
         run_calls = [r for r in calls if r.source_id == run_method.id]
         # Should have at least one CALLS edge (likely unresolved reference)
         assert len(run_calls) >= 1, "Expected at least one CALLS edge from handler?.Invoke()"
+
+
+# ===========================================================================
+# Task 5: Extended Test Stereotype Detection (filename/path-based)
+# ===========================================================================
+
+
+class TestExtendedTestStereotypeDetection:
+    """Methods get stereotype=['test'] based on filename/path patterns."""
+
+    def test_file_named_FooTest_cs_gives_all_methods_test_stereotype(self, parser, tmp_path):
+        """A method in a file named FooTest.cs gets stereotypes=['test'] even
+        without any test-related attributes."""
+        src = tmp_path / "FooTest.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class FooTest {\n"
+            "        public void PlainHelper() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "PlainHelper", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes, (
+            f"Expected 'test' stereotype for method in FooTest.cs; got {method.stereotypes}"
+        )
+
+    def test_file_named_FooTests_cs_gives_test_stereotype(self, parser, tmp_path):
+        """A file ending with Tests.cs also triggers test stereotype."""
+        src = tmp_path / "FooTests.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class FooTests {\n"
+            "        public void AnotherHelper() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "AnotherHelper", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+
+    def test_file_named_FooSpec_cs_gives_test_stereotype(self, parser, tmp_path):
+        """A file ending with Spec.cs triggers test stereotype."""
+        src = tmp_path / "FooSpec.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class FooSpec {\n"
+            "        public void CheckBehavior() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "CheckBehavior", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+
+    def test_path_containing_dot_Tests_gives_test_stereotype(self, parser, tmp_path):
+        """A method in a path containing '.Tests/' gets stereotypes=['test']."""
+        test_dir = tmp_path / "MyProject.Tests" / "Unit"
+        test_dir.mkdir(parents=True)
+        src = test_dir / "OrderService.cs"
+        src.write_text(
+            "namespace MyProject.Tests.Unit {\n"
+            "    public class OrderService {\n"
+            "        public void PlainMethod() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "PlainMethod", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes, (
+            f"Expected 'test' stereotype for method in .Tests/ path; got {method.stereotypes}"
+        )
+
+    def test_path_containing_tests_dir_gives_test_stereotype(self, parser, tmp_path):
+        """A method in a path containing '/tests/' gets stereotypes=['test']."""
+        test_dir = tmp_path / "tests" / "unit"
+        test_dir.mkdir(parents=True)
+        src = test_dir / "Calc.cs"
+        src.write_text(
+            "namespace Tests.Unit {\n"
+            "    public class Calc {\n"
+            "        public void Add() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "Add", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+
+    def test_expanded_nunit_setup_attribute_gives_test_stereotype(self, parser, tmp_path):
+        """NUnit [SetUp] attribute triggers test stereotype."""
+        src = tmp_path / "Runner.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class Runner {\n"
+            "        [SetUp]\n"
+            "        public void Init() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "Init", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+
+    def test_expanded_mstest_testclass_attribute_gives_test_stereotype(self, parser, tmp_path):
+        """MSTest [TestInitialize] attribute triggers test stereotype."""
+        src = tmp_path / "Runner.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class Runner {\n"
+            "        [TestInitialize]\n"
+            "        public void Setup() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "Setup", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+
+    def test_no_duplicate_test_stereotype(self, parser, tmp_path):
+        """A [Fact] method in a *Test.cs file should only get 'test' once."""
+        src = tmp_path / "FooTest.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class FooTest {\n"
+            "        [Fact]\n"
+            "        public void MyTest() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "MyTest", EntityType.METHOD)
+        assert method is not None
+        assert method.stereotypes.count("test") == 1, (
+            f"Expected exactly one 'test' stereotype; got {method.stereotypes}"
+        )
+
+
+# ===========================================================================
+# Task 5: Endpoint Stereotype Detection
+# ===========================================================================
+
+
+class TestEndpointStereotypeDetection:
+    """Methods in controller classes with HTTP attributes get stereotype=['endpoint']."""
+
+    def test_httpget_in_class_inheriting_controllerbase(self, parser, tmp_path):
+        """A method with [HttpGet] in a class inheriting ControllerBase
+        gets stereotypes=['endpoint']."""
+        src = tmp_path / "OrdersController.cs"
+        src.write_text(
+            "namespace App.Controllers {\n"
+            "    public class OrdersController : ControllerBase {\n"
+            "        [HttpGet]\n"
+            "        public void GetOrders() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "GetOrders", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes, (
+            f"Expected 'endpoint' stereotype; got {method.stereotypes}"
+        )
+
+    def test_httppost_in_class_with_apicontroller_attribute(self, parser, tmp_path):
+        """A method with [HttpPost] in a class with [ApiController] attribute
+        gets stereotypes=['endpoint']."""
+        src = tmp_path / "UsersController.cs"
+        src.write_text(
+            "namespace App.Controllers {\n"
+            "    [ApiController]\n"
+            "    public class UsersController {\n"
+            "        [HttpPost]\n"
+            "        public void CreateUser() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "CreateUser", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes, (
+            f"Expected 'endpoint' stereotype; got {method.stereotypes}"
+        )
+
+    def test_httpput_in_controller_inheriting_controller(self, parser, tmp_path):
+        """A method with [HttpPut] in a class inheriting Controller
+        gets stereotypes=['endpoint']."""
+        src = tmp_path / "ItemsController.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class ItemsController : Controller {\n"
+            "        [HttpPut]\n"
+            "        public void UpdateItem() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "UpdateItem", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes
+
+    def test_httpdelete_endpoint(self, parser, tmp_path):
+        """[HttpDelete] also triggers endpoint stereotype."""
+        src = tmp_path / "ProductsController.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class ProductsController : ControllerBase {\n"
+            "        [HttpDelete]\n"
+            "        public void DeleteProduct() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "DeleteProduct", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes
+
+    def test_route_attribute_endpoint(self, parser, tmp_path):
+        """[Route] attribute also triggers endpoint stereotype."""
+        src = tmp_path / "HomeController.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class HomeController : Controller {\n"
+            "        [Route(\"home\")]\n"
+            "        public void Index() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "Index", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes
+
+    def test_regular_method_in_non_controller_no_endpoint(self, parser, tmp_path):
+        """A regular method in a non-controller class does NOT get 'endpoint'
+        stereotype, even if it has an [HttpGet]-like attribute."""
+        src = tmp_path / "Service.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class OrderService {\n"
+            "        [HttpGet]\n"
+            "        public void FetchOrders() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "FetchOrders", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" not in method.stereotypes, (
+            f"Expected NO 'endpoint' for non-controller class; got {method.stereotypes}"
+        )
+
+    def test_method_without_http_attr_in_controller_no_endpoint(self, parser, tmp_path):
+        """A method without an HTTP attribute in a controller class does NOT
+        get 'endpoint' stereotype."""
+        src = tmp_path / "FooController.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class FooController : ControllerBase {\n"
+            "        public void HelperMethod() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "HelperMethod", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" not in method.stereotypes
+
+    def test_combined_test_and_endpoint_stereotypes(self, parser, tmp_path):
+        """A method can have both 'test' and 'endpoint' if conditions are met,
+        although this is unusual in practice."""
+        test_dir = tmp_path / "tests"
+        test_dir.mkdir()
+        src = test_dir / "ControllerTest.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class TestController : ControllerBase {\n"
+            "        [HttpGet]\n"
+            "        [Fact]\n"
+            "        public void TestEndpoint() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "TestEndpoint", EntityType.METHOD)
+        assert method is not None
+        assert "test" in method.stereotypes
+        assert "endpoint" in method.stereotypes
+
+    def test_apicontroller_inheriting_apicontroller_base(self, parser, tmp_path):
+        """A class inheriting ApiController counts as a controller."""
+        src = tmp_path / "MyApi.cs"
+        src.write_text(
+            "namespace App {\n"
+            "    public class MyApi : ApiController {\n"
+            "        [HttpPatch]\n"
+            "        public void PatchItem() {}\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        method = _find_entity(result, "PatchItem", EntityType.METHOD)
+        assert method is not None
+        assert "endpoint" in method.stereotypes

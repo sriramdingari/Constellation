@@ -21,10 +21,27 @@ logger = logging.getLogger(__name__)
 TEST_METHOD_ATTRIBUTES = frozenset({
     # NUnit
     "Test", "TestCase", "TestCaseSource", "Theory",
+    "SetUp", "TearDown", "OneTimeSetUp", "OneTimeTearDown", "TestFixture",
     # xUnit
     "Fact", "InlineData", "MemberData", "ClassData",
     # MSTest
     "TestMethod", "DataTestMethod",
+    "DataRow", "TestInitialize", "TestCleanup",
+    "ClassInitialize", "ClassCleanup", "TestClass",
+})
+
+TEST_FILE_PATTERNS = frozenset({"Test.cs", "Tests.cs", "Spec.cs", "Specs.cs"})
+TEST_PATH_PATTERNS = frozenset({"/test/", "/tests/", ".Tests/", ".Test/", "/Test/", "/Tests/"})
+
+# =============================================================================
+# Endpoint Detection Constants
+# =============================================================================
+
+CONTROLLER_BASE_CLASSES = frozenset({"Controller", "ControllerBase", "ApiController"})
+CONTROLLER_ATTRIBUTES = frozenset({"ApiController", "Controller"})
+ENDPOINT_ATTRIBUTES = frozenset({
+    "HttpGet", "HttpPost", "HttpPut", "HttpDelete", "HttpPatch",
+    "HttpHead", "HttpOptions", "Route", "RoutePrefix",
 })
 
 COMPILE_TIME_OPERATORS = frozenset({"nameof", "typeof", "sizeof", "default"})
@@ -60,6 +77,9 @@ class _ParsingContext:
 
     # Local variable -> class name map for receiver typing (populated per method body)
     local_instance_types: dict[str, str] = field(default_factory=dict)
+
+    # Controller detection (populated per class by _process_class)
+    current_class_is_controller: bool = False
 
 
 # =============================================================================
@@ -513,16 +533,22 @@ class DotNetParser(BaseParser):
         # Process base types (EXTENDS / IMPLEMENTS)
         self._extract_base_types(node, ctx.code, class_entity, result, is_interface=False)
 
+        # Detect whether this class is a controller (for endpoint detection)
+        is_controller = self._is_controller_class(node, ctx.code)
+
         # Process class body — set current_class context for call resolution
         body_node = self._find_child_by_type(node, "declaration_list")
         if body_node:
             saved_class = ctx.current_class
             saved_class_full_id = ctx.current_class_full_id
+            saved_is_controller = ctx.current_class_is_controller
             ctx.current_class = class_name
             ctx.current_class_full_id = class_entity.id
+            ctx.current_class_is_controller = is_controller
             self._process_class_body(body_node, ctx, file_entity, class_entity, result, namespace)
             ctx.current_class = saved_class
             ctx.current_class_full_id = saved_class_full_id
+            ctx.current_class_is_controller = saved_is_controller
 
     # =========================================================================
     # Interface Processing
@@ -734,12 +760,12 @@ class DotNetParser(BaseParser):
         docstring = self._extract_docstring(node, ctx.code)
         method_code = self._get_text(node, ctx.code)
 
-        # Detect test stereotype via attributes
+        # Detect stereotypes via dedicated methods
         attributes = self._extract_attributes(node, ctx.code)
-        stereotypes: list[str] = []
-        attr_names = {a["name"] for a in attributes}
-        if attr_names & TEST_METHOD_ATTRIBUTES:
-            stereotypes.append("test")
+        stereotypes = self._detect_test_stereotypes(node, ctx, attributes)
+        stereotypes.extend(
+            self._detect_endpoint_stereotypes(node, ctx, attributes, ctx.current_class_is_controller)
+        )
 
         method_entity = CodeEntity(
             id=f"{ctx.repository}::{full_name}",
@@ -773,6 +799,88 @@ class DotNetParser(BaseParser):
             ctx.local_instance_types = self._collect_local_instance_types(body_node, ctx)
             self._extract_calls(body_node, ctx, result, method_entity.id)
             ctx.local_instance_types = saved_locals
+
+    # =========================================================================
+    # Stereotype Detection
+    # =========================================================================
+
+    def _detect_test_stereotypes(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        attributes: list[dict[str, str | None]],
+    ) -> list[str]:
+        """Detect 'test' stereotype from method attributes, file name, or file path."""
+        attr_names = {a["name"] for a in attributes}
+
+        # Check method-level test attributes
+        if attr_names & TEST_METHOD_ATTRIBUTES:
+            return ["test"]
+
+        # Check filename patterns (e.g. FooTest.cs, FooTests.cs, FooSpec.cs)
+        file_name = Path(ctx.file_path).name
+        for pattern in TEST_FILE_PATTERNS:
+            if file_name.endswith(pattern):
+                return ["test"]
+
+        # Check path patterns (e.g. /tests/, .Tests/)
+        # Normalise to forward slashes for cross-platform matching
+        normalised_path = ctx.file_path.replace("\\", "/")
+        for pattern in TEST_PATH_PATTERNS:
+            if pattern in normalised_path:
+                return ["test"]
+
+        return []
+
+    def _detect_endpoint_stereotypes(
+        self,
+        node: Node,
+        ctx: _ParsingContext,
+        attributes: list[dict[str, str | None]],
+        is_controller_class: bool,
+    ) -> list[str]:
+        """Detect 'endpoint' stereotype for methods in controller classes
+        that have HTTP/routing attributes."""
+        if not is_controller_class:
+            return []
+
+        attr_names = {a["name"] for a in attributes}
+        if attr_names & ENDPOINT_ATTRIBUTES:
+            return ["endpoint"]
+
+        return []
+
+    def _is_controller_class(self, node: Node, code: bytes) -> bool:
+        """Determine whether a class node represents an ASP.NET controller.
+
+        A class is a controller if it:
+        - Inherits from a CONTROLLER_BASE_CLASSES entry, OR
+        - Has a CONTROLLER_ATTRIBUTES attribute
+        """
+        # Check base types
+        base_names = self._get_base_type_names(node, code)
+        if base_names & CONTROLLER_BASE_CLASSES:
+            return True
+
+        # Check class-level attributes
+        class_attrs = self._extract_attributes(node, code)
+        class_attr_names = {a["name"] for a in class_attrs}
+        if class_attr_names & CONTROLLER_ATTRIBUTES:
+            return True
+
+        return False
+
+    def _get_base_type_names(self, node: Node, code: bytes) -> set[str]:
+        """Extract the set of base type names from a class declaration node."""
+        names: set[str] = set()
+        for child in node.children:
+            if child.type != "base_list":
+                continue
+            for base_child in child.children:
+                base_name = self._extract_base_type_name(base_child, code)
+                if base_name:
+                    names.add(base_name)
+        return names
 
     # =========================================================================
     # Constructor Processing
