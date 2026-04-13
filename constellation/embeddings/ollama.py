@@ -20,14 +20,15 @@ class OllamaEmbeddingProvider(BaseEmbeddingProvider):
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        embeddings = []
-        async with httpx.AsyncClient() as client:
-            for text in texts:
-                response = await client.post(
-                    f"{self._base_url}/api/embeddings",
-                    json={"model": self._model, "prompt": text},
-                )
-                response.raise_for_status()
-                data = response.json()
-                embeddings.append(data["embedding"])
-        return embeddings
+        # Use Ollama's newer /api/embed endpoint, which accepts ``input`` as a
+        # list and returns all vectors in one HTTP round-trip. The older
+        # /api/embeddings endpoint only accepts a single ``prompt``, which
+        # forced one request per entity — orders of magnitude slower.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0)) as client:
+            response = await client.post(
+                f"{self._base_url}/api/embed",
+                json={"model": self._model, "input": texts},
+            )
+            response.raise_for_status()
+            data = response.json()
+        return data["embeddings"]
