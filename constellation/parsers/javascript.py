@@ -1307,6 +1307,8 @@ class JavaScriptParser(BaseParser):
             class_id = scope.get(object_text)
             if class_id is not None:
                 return called_symbol, ctx.class_static_method_ids.get(class_id, {}).get(property_name)
+        if self._is_receiver_locally_shadowed(object_text, ctx):
+            return called_symbol, None
         if object_text == ctx.current_class:
             return called_symbol, ctx.current_class_static_method_ids.get(property_name)
         class_id = ctx.module_class_ids.get(object_text)
@@ -1316,6 +1318,13 @@ class JavaScriptParser(BaseParser):
         if imported_module:
             return called_symbol, ctx.entity_id(imported_module, property_name)
         return called_symbol, None
+
+    @staticmethod
+    def _is_receiver_locally_shadowed(name: str, ctx: _ParsingContext) -> bool:
+        for scope in reversed(ctx.local_callable_scopes):
+            if name in scope:
+                return True
+        return False
 
     def _resolve_class_id(self, class_name: str, ctx: _ParsingContext) -> str | None:
         for scope in reversed(ctx.local_class_scopes):

@@ -1407,6 +1407,72 @@ class TestCallsAndReferences:
         assert reference.properties["enclosing_declaration_id"] == run_id
         assert reference.properties["enclosing_declaration_name"] == "run"
 
+    def test_namespace_import_shadowed_by_local_object_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "ns_shadow.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "\n"
+            "function run(): number {\n"
+            "  const utils = { helper() { return 1; } };\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::ns_shadow.run"
+        resolved_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert resolved_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "utils.helper"
+
+    def test_class_name_shadowed_by_local_non_class_binding_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "class_shadow.ts"
+        source.write_text(
+            "class Foo {\n"
+            "  static bar(): number {\n"
+            "    return 1;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  const Foo = 1;\n"
+            "  return Foo.bar();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::class_shadow.run"
+        static_method_id = f"{REPOSITORY}::class_shadow.Foo.bar"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert static_method_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "Foo.bar"
+
 
 # ===========================================================================
 # Entity ID format
