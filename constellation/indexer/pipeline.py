@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -25,7 +27,7 @@ from constellation.indexer.collector import (
     compute_file_hash,
     derive_repo_name,
     is_github_url,
-    DEFAULT_EXCLUSIONS,
+    merge_exclusions,
 )
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
 from constellation.indexer.spool import (
@@ -41,6 +43,8 @@ from constellation.parsers.base import ParseResult
 from constellation.parsers.registry import ParserRegistry
 
 logger = logging.getLogger(__name__)
+
+_REF_SITE_RE = re.compile(r"::ref:.*:(\d+):(\d+)(?::[^:]+)?$")
 
 
 @dataclass
@@ -137,12 +141,7 @@ class IndexingPipeline:
             # ----------------------------------------------------------
             # 3. Build exclusion set
             # ----------------------------------------------------------
-            if exclude_patterns:
-                merged_exclusions = frozenset(
-                    set(DEFAULT_EXCLUSIONS) | set(exclude_patterns)
-                )
-            else:
-                merged_exclusions = DEFAULT_EXCLUSIONS
+            merged_exclusions = merge_exclusions(exclude_patterns)
 
             # ----------------------------------------------------------
             # 4. Collect files
@@ -230,6 +229,11 @@ class IndexingPipeline:
                             submit_idx = 0
                             tls = threading.local()
 
+                            logger.info(
+                                "threaded path: %d chunks, workers=%d embed_concurrency=%d max_in_flight=%d",
+                                len(all_chunk_plans), max_workers, embed_limit, max_in_flight_chunks,
+                            )
+
                             def unfinished_chunk_count() -> int:
                                 return len(parse_futures) + len(chunk_metadata)
 
@@ -247,6 +251,23 @@ class IndexingPipeline:
                                         *pending_cleanup,
                                         return_exceptions=True,
                                     )
+
+                            async def heartbeat_loop() -> None:
+                                """Periodic state dump — shows what the writer is blocked on."""
+                                while True:
+                                    await asyncio.sleep(10)
+                                    logger.info(
+                                        "heartbeat: parsing=%s embedding=%s waiting_write=%s "
+                                        "next_write=%d submit_idx=%d/%d",
+                                        sorted(parse_futures.keys()),
+                                        sorted(embed_tasks.keys()),
+                                        sorted(embedded_chunks.keys()),
+                                        next_chunk_to_write,
+                                        submit_idx,
+                                        len(all_chunk_plans),
+                                    )
+
+                            heartbeat_task = asyncio.create_task(heartbeat_loop())
 
                             while (
                                 submit_idx < len(all_chunk_plans)
@@ -289,9 +310,15 @@ class IndexingPipeline:
                                         if future in parse_futures.values():
                                             ci, chunk, files_delta, chunk_errors = future.result()
                                             parse_futures.pop(ci, None)
-                                            if chunk_errors:
-                                                errors.extend(chunk_errors)
-                                                raise RuntimeError(chunk_errors[0])
+                                            logger.info(
+                                                "chunk %d: parse done — entities=%d rels=%d errors=%d",
+                                                ci, len(chunk.entities), len(chunk.relationships),
+                                                len(chunk_errors),
+                                            )
+                                            # NOTE: chunk_errors are stored in chunk_metadata and
+                                            # appended to `errors` exactly once by the writer loop
+                                            # below when this chunk gets finalized. Do NOT extend
+                                            # `errors` here or you get each parse error twice.
                                             chunk_metadata[ci] = (files_delta, chunk_errors)
                                             embed_tasks[ci] = asyncio.create_task(
                                                 self._embed_prepared_chunk(
@@ -319,9 +346,20 @@ class IndexingPipeline:
                                                 files_processed,
                                                 entities_found_so_far,
                                             )
+                                        logger.info(
+                                            "chunk %d: write start", next_chunk_to_write,
+                                        )
+                                        t_write = time.monotonic()
                                         await self._finalize_prepared_chunk(
                                             spool_dir=spool_dir,
                                             chunk=chunk,
+                                        )
+                                        logger.info(
+                                            "chunk %d: write done in %.2fs (%d/%d written)",
+                                            next_chunk_to_write,
+                                            time.monotonic() - t_write,
+                                            next_chunk_to_write,
+                                            len(all_chunk_plans),
                                         )
                                         if chunk.entities or chunk.relationships:
                                             chunk_indices.append(chunk.chunk_index)
@@ -330,6 +368,11 @@ class IndexingPipeline:
                                     await cleanup_outstanding_work()
                                     raise
                         finally:
+                            heartbeat_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except (asyncio.CancelledError, BaseException):
+                                pass
                             executor.shutdown(wait=True, cancel_futures=True)
                     else:
                         # -- Serial path (threads <= 1) --
@@ -337,7 +380,6 @@ class IndexingPipeline:
                             self._chunk_file_plans(file_plans, chunk_size),
                             start=1,
                         ):
-                            error_count_before_chunk = len(errors)
                             chunk, files_processed = await self._prepare_chunk(
                                 repo_name=repo_name,
                                 source_path=source_path,
@@ -350,8 +392,6 @@ class IndexingPipeline:
                                 errors=errors,
                                 entities_found_offset=entities_found_so_far,
                             )
-                            if len(errors) > error_count_before_chunk:
-                                raise RuntimeError(errors[error_count_before_chunk])
                             entities_found_so_far += len(chunk.entities)
 
                             # Skip empty chunks — no entities and no relationships
@@ -670,13 +710,14 @@ class IndexingPipeline:
                     entities_found_offset + len(entities_to_upsert),
                 )
 
-        # Embed within the chunk
+        # Embed within the chunk — embedding failures are fatal (infrastructure
+        # error), unlike per-file parse errors which are accumulated and skipped.
         try:
             await self._embed_entities(entities_to_upsert)
         except Exception as exc:
             err_msg = f"Embedding failed: {exc}"
             logger.error(err_msg)
-            errors.append(err_msg)
+            raise RuntimeError(err_msg) from exc
 
         chunk = ChunkPreparation(
             chunk_index=chunk_index,
@@ -739,7 +780,14 @@ class IndexingPipeline:
                 continue
 
             try:
+                t_file = time.monotonic()
                 parse_result: ParseResult = parser.parse_file(fpath, repo_name)
+                dt_file = time.monotonic() - t_file
+                if dt_file > 1.0:
+                    logger.warning(
+                        "slow parse: %s took %.1fs (%d entities)",
+                        fpath, dt_file, len(parse_result.entities),
+                    )
             except Exception as exc:
                 err_msg = f"Exception parsing {fpath}: {exc}"
                 logger.error(err_msg)
@@ -942,8 +990,27 @@ class IndexingPipeline:
             elif relationship.source_id in entity_lookup:
                 parent_ids.setdefault(relationship.target_id, relationship.source_id)
 
+        # Pre-assign stable local paths for Reference entities using the
+        # call-site discriminator embedded in the parser-generated ID.
+        # Parser IDs contain ``::ref:`` followed by site-specific detail
+        # (line, col, symbol).  We extract line:col and combine with the
+        # entity name to form ``ref:{line}:{col}:{name}`` which is unique
+        # per call site even when the called symbol name repeats.
         local_paths: dict[str, str] = {}
         used_paths: set[str] = set()
+
+        for entity in local_entities:
+            if entity.entity_type == EntityType.REFERENCE:
+                m = _REF_SITE_RE.search(entity.id)
+                if m:
+                    line, col = m.group(1), m.group(2)
+                    ref_path = f"ref:{line}:{col}:{entity.name}"
+                else:
+                    # Fallback: use line_number and entity name
+                    ref_path = f"ref:{entity.line_number}:{entity.name}"
+                local_paths[entity.id] = ref_path
+                used_paths.add(ref_path)
+
         visiting: set[str] = set()
 
         def assign_local_path(entity_id: str) -> str:
@@ -984,22 +1051,45 @@ class IndexingPipeline:
         call_aliases = {
             f"{entity.repository}::{local_paths[entity.id]}": id_map[entity.id]
             for entity in local_entities
+            if entity.entity_type != EntityType.REFERENCE
         }
         return id_map, call_aliases
 
-    async def _embed_entities(self, entities: list[CodeEntity]) -> None:
+    async def _embed_entities(
+        self,
+        entities: list[CodeEntity],
+        *,
+        chunk_index: int | None = None,
+    ) -> None:
         """Generate embeddings for embeddable entities in batches."""
         embeddable = [e for e in entities if is_embeddable(e.entity_type)]
         if not embeddable:
             return
 
         batch_size = self._settings.embedding_batch_size
-        for i in range(0, len(embeddable), batch_size):
+        total_batches = (len(embeddable) + batch_size - 1) // batch_size
+        tag = f"chunk {chunk_index}" if chunk_index is not None else "batch"
+        logger.info(
+            "%s: embed start — %d entities, %d batches of up to %d",
+            tag, len(embeddable), total_batches, batch_size,
+        )
+        t_start = time.monotonic()
+        for batch_num, i in enumerate(range(0, len(embeddable), batch_size), start=1):
             batch = embeddable[i : i + batch_size]
             texts = [prepare_embedding_text(e) for e in batch]
+            t0 = time.monotonic()
             vectors = await self._embedder.embed_batch(texts)
+            dt = time.monotonic() - t0
+            logger.info(
+                "%s: embed batch %d/%d size=%d dt=%.2fs",
+                tag, batch_num, total_batches, len(batch), dt,
+            )
             for entity, vector in zip(batch, vectors):
                 entity.embedding = vector
+        logger.info(
+            "%s: embed done — %d entities in %.1fs",
+            tag, len(embeddable), time.monotonic() - t_start,
+        )
 
     async def _embed_prepared_chunk(
         self,
@@ -1009,10 +1099,14 @@ class IndexingPipeline:
     ) -> ChunkPreparation:
         """Embed a prepared chunk while respecting the shared embedding limit."""
         if not chunk.entities and not chunk.relationships:
+            logger.info(
+                "chunk %d: embed skipped — no entities or relationships",
+                chunk.chunk_index,
+            )
             return chunk
 
         async with embed_semaphore:
-            await self._embed_entities(chunk.entities)
+            await self._embed_entities(chunk.entities, chunk_index=chunk.chunk_index)
         return chunk
 
     async def _finalize_prepared_chunk(

@@ -659,32 +659,41 @@ class JavaParser(BaseParser):
                 called_full = f"{ctx.current_class_full_name}.{called_method}"
                 is_current_class_call = True
 
-            if called_full not in processed:
-                processed.add(called_full)
-                target_id = None
-                if is_current_class_call:
-                    target_id = self._resolve_current_class_call(
-                        called_method,
-                        call_node,
-                        ctx,
-                    )
-                if target_id is None:
-                    target_id = f"{source_method_id}::ref:{called_full}"
-                    result.add_entity(CodeEntity(
-                        id=target_id,
-                        name=called_full,
-                        entity_type=EntityType.REFERENCE,
-                        repository=ctx.repository,
-                        file_path=ctx.file_path,
-                        line_number=call_node.start_point[0] + 1,
-                        language=self.language,
-                        properties={"symbol": called_full},
-                    ))
-                result.add_relationship(CodeRelationship(
-                    source_id=source_method_id,
-                    target_id=target_id,
-                    relationship_type=RelationshipType.CALLS,
+            target_id = None
+            if is_current_class_call:
+                target_id = self._resolve_current_class_call(
+                    called_method,
+                    call_node,
+                    ctx,
+                )
+            is_reference_target = target_id is None
+            if target_id is None:
+                target_id = self._reference_target_id(
+                    source_method_id,
+                    called_full,
+                    call_node,
+                )
+
+            if target_id in processed:
+                continue
+            processed.add(target_id)
+
+            if is_reference_target:
+                result.add_entity(CodeEntity(
+                    id=target_id,
+                    name=called_full,
+                    entity_type=EntityType.REFERENCE,
+                    repository=ctx.repository,
+                    file_path=ctx.file_path,
+                    line_number=call_node.start_point[0] + 1,
+                    language=self.language,
+                    properties={"symbol": called_full},
                 ))
+            result.add_relationship(CodeRelationship(
+                source_id=source_method_id,
+                target_id=target_id,
+                relationship_type=RelationshipType.CALLS,
+            ))
 
     def _collect_class_call_targets(
         self,
@@ -738,6 +747,16 @@ class JavaParser(BaseParser):
             return name_matches[0]
 
         return None
+
+    def _reference_target_id(
+        self,
+        source_method_id: str,
+        called_full: str,
+        call_node: Node,
+    ) -> str:
+        line_number = call_node.start_point[0] + 1
+        column_number = call_node.start_point[1] + 1
+        return f"{source_method_id}::ref:{called_full}:{line_number}:{column_number}"
 
     def _argument_count(self, call_node: Node) -> int:
         arguments_node = call_node.child_by_field_name("arguments")

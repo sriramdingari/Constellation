@@ -510,6 +510,114 @@ class TestCallsRelationships:
         assert len(reference_targets) == 1
         assert reference_targets[0].name == "logger.info"
 
+    def test_unresolved_java_calls_produce_reference_entity_and_calls_edge(self, parser, tmp_path):
+        sample = tmp_path / "UnresolvedCall.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void run() {\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        run_id = f"{REPO}::com.example.Worker.run()"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == run_id
+        }
+
+        assert len(call_targets) == 1
+
+        reference_targets = [
+            entity for entity in _entities(result, EntityType.REFERENCE)
+            if entity.id in call_targets
+        ]
+        assert len(reference_targets) == 1
+        assert reference_targets[0].name == "com.example.Worker.missing"
+        assert reference_targets[0].properties["symbol"] == "com.example.Worker.missing"
+
+    def test_unresolved_java_calls_in_different_methods_get_distinct_reference_ids(self, parser, tmp_path):
+        sample = tmp_path / "DistinctUnresolvedCalls.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void first() {\n"
+            "        missing();\n"
+            "    }\n"
+            "    void second() {\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        first_id = f"{REPO}::com.example.Worker.first()"
+        second_id = f"{REPO}::com.example.Worker.second()"
+
+        first_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == first_id
+        }
+        second_targets = {
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == second_id
+        }
+
+        assert len(first_targets) == 1
+        assert len(second_targets) == 1
+
+        first_target = next(iter(first_targets))
+        second_target = next(iter(second_targets))
+        assert first_target != second_target
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities(result, EntityType.REFERENCE)
+        }
+        assert first_target in reference_entities
+        assert second_target in reference_entities
+        assert reference_entities[first_target].name == "com.example.Worker.missing"
+        assert reference_entities[first_target].properties["symbol"] == "com.example.Worker.missing"
+        assert reference_entities[second_target].name == "com.example.Worker.missing"
+        assert reference_entities[second_target].properties["symbol"] == "com.example.Worker.missing"
+
+    def test_unresolved_java_calls_at_different_sites_in_same_method_get_distinct_reference_ids(self, parser, tmp_path):
+        sample = tmp_path / "DistinctUnresolvedSites.java"
+        sample.write_text(
+            "package com.example;\n"
+            "public class Worker {\n"
+            "    void run() {\n"
+            "        missing();\n"
+            "        missing();\n"
+            "    }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(sample, repository=REPO)
+        run_id = f"{REPO}::com.example.Worker.run()"
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels(result, RelationshipType.CALLS)
+            if relationship.source_id == run_id
+        ]
+
+        assert len(call_targets) == 2
+        assert len(set(call_targets)) == 2
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities(result, EntityType.REFERENCE)
+        }
+        assert set(call_targets) <= reference_entities.keys()
+        for target_id in call_targets:
+            assert reference_entities[target_id].name == "com.example.Worker.missing"
+            assert reference_entities[target_id].properties["symbol"] == "com.example.Worker.missing"
+
 
 # ===========================================================================
 # Docstring / Javadoc Capture

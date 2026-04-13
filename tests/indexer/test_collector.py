@@ -71,6 +71,28 @@ class TestIsExcluded:
     def test_min_js_glob(self):
         assert is_excluded(Path("app.min.js"), DEFAULT_EXCLUSIONS) is True
 
+    # --- Regression: `**/` patterns must also match repo-root files. -----
+    # fnmatch doesn't implement real recursive-glob semantics, so a pattern
+    # like ``**/AssemblyInfo.cs`` only matches paths that contain at least
+    # one ``/``. Root-level ``AssemblyInfo.cs`` used to slip through.
+    # ``is_excluded`` now strips the ``**/`` prefix and retries.
+
+    def test_assembly_info_at_repo_root(self):
+        assert is_excluded(Path("AssemblyInfo.cs"), DEFAULT_EXCLUSIONS) is True
+
+    def test_assembly_info_nested(self):
+        assert is_excluded(Path("Props/AssemblyInfo.cs"), DEFAULT_EXCLUSIONS) is True
+
+    def test_designer_cs_at_repo_root(self):
+        assert is_excluded(Path("Foo.Designer.cs"), DEFAULT_EXCLUSIONS) is True
+
+    def test_designer_cs_nested(self):
+        assert is_excluded(Path("src/ns/Foo.Designer.cs"), DEFAULT_EXCLUSIONS) is True
+
+    def test_roslyn_generated_cs_at_root(self):
+        assert is_excluded(Path("Thing.g.cs"), DEFAULT_EXCLUSIONS) is True
+        assert is_excluded(Path("Thing.g.i.cs"), DEFAULT_EXCLUSIONS) is True
+
 
 class TestComputeFileHash:
     def test_returns_32_char_hex(self, tmp_path):

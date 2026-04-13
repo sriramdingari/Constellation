@@ -1,8 +1,15 @@
 """Celery application configuration for Constellation workers."""
 
+import logging
+
 from celery import Celery
 
 from constellation.config import get_settings
+
+# Silence chatty third-party loggers — httpx/httpcore emit one INFO line
+# per HTTP call, which is overwhelming for embedding workloads.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 settings = get_settings()
 

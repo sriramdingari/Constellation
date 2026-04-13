@@ -452,6 +452,1185 @@ class TestHasConstructorRelationships:
 
 
 # ===========================================================================
+# CALLS / REFERENCE contract
+# ===========================================================================
+
+
+class TestCallsAndReferences:
+    def test_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "local_calls.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::local_calls.run"
+        helper_id = f"{REPOSITORY}::local_calls.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+
+        reference_ids = {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert not (call_targets & reference_ids)
+
+    def test_imported_function_call_resolves_to_declaration_target(self, parser, tmp_path):
+        source = tmp_path / "imported_function.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::imported_function.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_duplicate_resolved_calls_emit_one_edge_per_call_site(self, parser, tmp_path):
+        source = tmp_path / "duplicate_resolved_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "function run(): number {\n"
+            "  helper();\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::duplicate_resolved_calls.run"
+        helper_id = f"{REPOSITORY}::duplicate_resolved_calls.helper"
+
+        call_relationships = _rels_from(result, run_id, RelationshipType.CALLS)
+        assert len(call_relationships) == 2
+        assert [relationship.target_id for relationship in call_relationships] == [helper_id, helper_id]
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_type_only_import_call_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "type_only_import.ts"
+        source.write_text(
+            "import type { Helper } from \"./utils\";\n"
+            "function run(): void {\n"
+            "  Helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::type_only_import.run"
+        helper_id = f"{REPOSITORY}::utils.Helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "Helper"
+        assert reference_entities[target_id].properties["symbol"] == "Helper"
+
+    def test_default_import_call_stays_unresolved_without_local_static_evidence(self, parser, tmp_path):
+        source = tmp_path / "default_import.ts"
+        source.write_text(
+            "import helper from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::default_import.run"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert len(call_targets) == 1
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_default_aliased_named_import_call_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "default_aliased_import.ts"
+        source.write_text(
+            "import { default as helper } from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::default_aliased_import.run"
+        helper_id = f"{REPOSITORY}::utils.default"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_wrapper_call_assigned_local_callable_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "wrapped_local_callable.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  const helper = wrap(() => 1);\n"
+            "  helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::wrapped_local_callable.run"
+        helper_id = f"{REPOSITORY}::wrapped_local_callable.run.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id not in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.METHOD)
+        }
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        helper_reference_ids = {
+            entity.id
+            for entity in reference_entities.values()
+            if entity.name == "helper" and entity.properties["symbol"] == "helper"
+        }
+        assert len(helper_reference_ids) == 1
+
+        target_id = next(iter(helper_reference_ids))
+        assert target_id in call_targets
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_namespace_imported_member_call_resolves_to_declaration_target(self, parser, tmp_path):
+        source = tmp_path / "namespace_import.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "function run(): number {\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::namespace_import.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_unresolved_calls_emit_reference_entities(self, parser, tmp_path):
+        source = tmp_path / "unresolved_calls.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "  client.ping();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::unresolved_calls.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 2
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert call_targets <= reference_entities.keys()
+        reference_pairs = {
+            (
+                reference_entities[target_id].name,
+                reference_entities[target_id].properties["symbol"],
+            )
+            for target_id in call_targets
+        }
+        assert reference_pairs == {
+            ("missing", "missing"),
+            ("client.ping", "client.ping"),
+        }
+
+    def test_unresolved_member_call_captures_receiver_metadata(self, parser, tmp_path):
+        source = tmp_path / "receiver_metadata.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  client.ping();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::receiver_metadata.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert call_targets <= reference_entities.keys()
+
+        target_id = next(iter(call_targets))
+        reference = reference_entities[target_id]
+        assert reference.name == "client.ping"
+        assert reference.properties["symbol"] == "client.ping"
+        assert reference.properties["receiver"] == "client"
+
+    def test_unresolved_calls_in_different_places_get_distinct_reference_ids(self, parser, tmp_path):
+        source = tmp_path / "distinct_references.ts"
+        source.write_text(
+            "function first(): void {\n"
+            "  missing();\n"
+            "}\n"
+            "function second(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        first_id = f"{REPOSITORY}::distinct_references.first"
+        second_id = f"{REPOSITORY}::distinct_references.second"
+
+        first_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, first_id, RelationshipType.CALLS)
+        }
+        second_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, second_id, RelationshipType.CALLS)
+        }
+
+        assert len(first_targets) == 1
+        assert len(second_targets) == 1
+        assert first_targets != second_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert first_targets <= reference_entities.keys()
+        assert second_targets <= reference_entities.keys()
+
+        first_target = next(iter(first_targets))
+        second_target = next(iter(second_targets))
+        assert reference_entities[first_target].name == "missing"
+        assert reference_entities[first_target].properties["symbol"] == "missing"
+        assert reference_entities[second_target].name == "missing"
+        assert reference_entities[second_target].properties["symbol"] == "missing"
+
+    def test_class_method_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "class_local_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  run(): number {\n"
+            "    return this.helper();\n"
+            "  }\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::class_local_calls.Worker.run"
+        helper_id = f"{REPOSITORY}::class_local_calls.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+
+        reference_ids = {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert not (call_targets & reference_ids)
+
+    def test_static_this_call_does_not_resolve_instance_method(self, parser, tmp_path):
+        source = tmp_path / "static_this_instance_mismatch.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  static run(): number {\n"
+            "    return this.helper();\n"
+            "  }\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::static_this_instance_mismatch.Worker.run"
+        helper_id = f"{REPOSITORY}::static_this_instance_mismatch.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "this.helper"
+        assert reference_entities[target_id].properties["symbol"] == "this.helper"
+        assert reference_entities[target_id].properties["receiver"] == "this"
+
+    def test_instance_this_call_does_not_resolve_static_method(self, parser, tmp_path):
+        source = tmp_path / "instance_this_static_mismatch.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  run(): number {\n"
+            "    return this.helper();\n"
+            "  }\n"
+            "  static helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::instance_this_static_mismatch.Worker.run"
+        helper_id = f"{REPOSITORY}::instance_this_static_mismatch.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "this.helper"
+        assert reference_entities[target_id].properties["symbol"] == "this.helper"
+        assert reference_entities[target_id].properties["receiver"] == "this"
+
+    def test_instance_this_call_resolves_when_only_instance_method_exists(self, parser, tmp_path):
+        source = tmp_path / "instance_this_resolve.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  run(): number {\n"
+            "    return this.process();\n"
+            "  }\n"
+            "  process(): number {\n"
+            "    return 1;\n"
+            "  }\n"
+            "  static create(): Worker {\n"
+            "    return new Worker();\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::instance_this_resolve.Worker.run"
+        process_id = f"{REPOSITORY}::instance_this_resolve.Worker.process"
+        create_id = f"{REPOSITORY}::instance_this_resolve.Worker.create"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert process_id in call_targets
+        assert create_id not in call_targets
+        assert process_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_nested_local_function_call_resolves_to_real_declaration(self, parser, tmp_path):
+        source = tmp_path / "nested_local_calls.ts"
+        source.write_text(
+            "function outer(): number {\n"
+            "  function helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        outer_id = f"{REPOSITORY}::nested_local_calls.outer"
+        helper_id = f"{REPOSITORY}::nested_local_calls.outer.helper"
+
+        helper_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.id == helper_id
+        ]
+        assert len(helper_entities) == 1
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, outer_id, RelationshipType.CALLS)
+        }
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_parenthesized_call_site_is_not_dropped(self, parser, tmp_path):
+        source = tmp_path / "parenthesized_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  return (helper)();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::parenthesized_calls.run"
+        helper_id = f"{REPOSITORY}::parenthesized_calls.helper"
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert len(call_targets) == 1
+
+        target_id = call_targets[0]
+        if target_id == helper_id:
+            return
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_non_callable_local_shadowing_keeps_call_unresolved(self, parser, tmp_path):
+        source = tmp_path / "shadowed_calls.ts"
+        source.write_text(
+            "function helper(): number {\n"
+            "  return 42;\n"
+            "}\n"
+            "\n"
+            "function run(): void {\n"
+            "  const helper = 1;\n"
+            "  helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::shadowed_calls.run"
+        helper_id = f"{REPOSITORY}::shadowed_calls.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_block_scoped_local_callable_is_not_visible_after_block(self, parser, tmp_path):
+        source = tmp_path / "block_scoped_local.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const helper = () => 1;\n"
+            "  }\n"
+            "\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_scoped_local.run"
+        helper_id = f"{REPOSITORY}::block_scoped_local.run.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "helper"
+        assert reference_entities[target_id].properties["symbol"] == "helper"
+
+    def test_block_scoped_instance_receiver_is_not_visible_after_block(self, parser, tmp_path):
+        source = tmp_path / "block_scoped_instance.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const worker = new Worker();\n"
+            "  }\n"
+            "\n"
+            "  return worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_scoped_instance.run"
+        helper_id = f"{REPOSITORY}::block_scoped_instance.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        ref_targets = call_targets & set(reference_entities.keys())
+        assert len(ref_targets) == 1
+        target_id = next(iter(ref_targets))
+        assert reference_entities[target_id].name == "worker.helper"
+        assert reference_entities[target_id].properties["symbol"] == "worker.helper"
+        assert reference_entities[target_id].properties["receiver"] == "worker"
+
+    def test_sibling_block_nested_helpers_do_not_collide(self, parser, tmp_path):
+        source = tmp_path / "sibling_block_helpers.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    function helper(): number {\n"
+            "      return 1;\n"
+            "    }\n"
+            "\n"
+            "    return helper();\n"
+            "  }\n"
+            "\n"
+            "  if (false) {\n"
+            "    function helper(): number {\n"
+            "      return 2;\n"
+            "    }\n"
+            "\n"
+            "    return helper();\n"
+            "  }\n"
+            "\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::sibling_block_helpers.run"
+
+        helper_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "helper"
+        ]
+        assert len(helper_entities) == 2
+        assert len({entity.id for entity in helper_entities}) == 2
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+        assert len(call_targets) == 2
+        assert call_targets == {entity.id for entity in helper_entities}
+        assert not call_targets & {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_local_class_bindings_resolve_same_file_static_and_instance_calls(self, parser, tmp_path):
+        source = tmp_path / "local_class_bindings.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  class Foo {\n"
+            "    static bar(): number {\n"
+            "      return 1;\n"
+            "    }\n"
+            "\n"
+            "    baz(): number {\n"
+            "      return 2;\n"
+            "    }\n"
+            "  }\n"
+            "\n"
+            "  const foo = new Foo();\n"
+            "  Foo.bar();\n"
+            "  return foo.baz();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::local_class_bindings.run"
+
+        class_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.CLASS)
+            if entity.name == "Foo"
+        ]
+        assert len(class_entities) == 1
+
+        bar_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "bar"
+        ]
+        baz_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "baz"
+        ]
+        assert len(bar_entities) == 1
+        assert len(baz_entities) == 1
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert bar_entities[0].id in call_targets
+        assert baz_entities[0].id in call_targets
+        assert class_entities[0].id in call_targets  # new Foo()
+
+    def test_inner_block_local_class_bindings_resolve_same_file_static_and_instance_calls(self, parser, tmp_path):
+        source = tmp_path / "inner_block_local_class_bindings.ts"
+        source.write_text(
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    class Foo {\n"
+            "      static bar(): number {\n"
+            "        return 1;\n"
+            "      }\n"
+            "\n"
+            "      baz(): number {\n"
+            "        return 2;\n"
+            "      }\n"
+            "    }\n"
+            "\n"
+            "    const foo = new Foo();\n"
+            "    Foo.bar();\n"
+            "    return foo.baz();\n"
+            "  }\n"
+            "\n"
+            "  return 0;\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::inner_block_local_class_bindings.run"
+
+        class_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.CLASS)
+            if entity.name == "Foo"
+        ]
+        assert len(class_entities) == 1
+
+        bar_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "bar"
+        ]
+        baz_entities = [
+            entity
+            for entity in _entities_by_type(result, EntityType.METHOD)
+            if entity.name == "baz"
+        ]
+        assert len(bar_entities) == 1
+        assert len(baz_entities) == 1
+
+        call_targets = [
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        ]
+        assert bar_entities[0].id in call_targets
+        assert baz_entities[0].id in call_targets
+        assert class_entities[0].id in call_targets  # new Foo()
+
+    def test_unresolved_reference_ids_include_file_context_across_same_stem_files(self, parser, tmp_path):
+        first_source = tmp_path / "alpha" / "shared_stem.ts"
+        second_source = tmp_path / "beta" / "shared_stem.ts"
+        first_source.parent.mkdir()
+        second_source.parent.mkdir()
+        first_source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+        second_source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        first_result = parser.parse_file(first_source, repository=REPOSITORY)
+        second_result = parser.parse_file(second_source, repository=REPOSITORY)
+
+        first_target_id = next(
+            relationship.target_id
+            for relationship in _rels_from(first_result, f"{REPOSITORY}::shared_stem.run", RelationshipType.CALLS)
+        )
+        second_target_id = next(
+            relationship.target_id
+            for relationship in _rels_from(second_result, f"{REPOSITORY}::shared_stem.run", RelationshipType.CALLS)
+        )
+
+        assert first_target_id != second_target_id
+        assert first_target_id in {
+            entity.id for entity in _entities_by_type(first_result, EntityType.REFERENCE)
+        }
+        assert second_target_id in {
+            entity.id for entity in _entities_by_type(second_result, EntityType.REFERENCE)
+        }
+
+    def test_out_of_scope_local_shadow_does_not_hide_namespace_import_resolution(self, parser, tmp_path):
+        source = tmp_path / "block_shadowed_namespace.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "\n"
+            "function run(): number {\n"
+            "  if (true) {\n"
+            "    const utils = { helper(): number { return 1; } };\n"
+            "  }\n"
+            "\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::block_shadowed_namespace.run"
+        helper_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_same_file_instance_receiver_call_resolves_to_class_method(self, parser, tmp_path):
+        source = tmp_path / "instance_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  const worker = new Worker();\n"
+            "  return worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::instance_calls.run"
+        helper_id = f"{REPOSITORY}::instance_calls.Worker.helper"
+        worker_class_id = f"{REPOSITORY}::instance_calls.Worker"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert helper_id in call_targets
+        assert worker_class_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_same_file_static_class_member_call_resolves_to_class_method(self, parser, tmp_path):
+        source = tmp_path / "static_class_calls.ts"
+        source.write_text(
+            "class Worker {\n"
+            "  static helper(): number {\n"
+            "    return 42;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  return Worker.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::static_class_calls.run"
+        helper_id = f"{REPOSITORY}::static_class_calls.Worker.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert helper_id in call_targets
+        assert helper_id not in {
+            entity.id
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+
+    def test_unresolved_reference_includes_enclosing_declaration_context(self, parser, tmp_path):
+        source = tmp_path / "context_metadata.ts"
+        source.write_text(
+            "function run(): void {\n"
+            "  missing();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::context_metadata.run"
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+        reference = reference_entities[target_id]
+        assert reference.properties["symbol"] == "missing"
+        assert reference.properties["enclosing_declaration_id"] == run_id
+        assert reference.properties["enclosing_declaration_name"] == "run"
+
+    def test_namespace_import_shadowed_by_local_object_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "ns_shadow.ts"
+        source.write_text(
+            "import * as utils from \"./utils\";\n"
+            "\n"
+            "function run(): number {\n"
+            "  const utils = { helper() { return 1; } };\n"
+            "  return utils.helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::ns_shadow.run"
+        resolved_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert resolved_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "utils.helper"
+
+    def test_class_name_shadowed_by_local_non_class_binding_stays_unresolved(self, parser, tmp_path):
+        source = tmp_path / "class_shadow.ts"
+        source.write_text(
+            "class Foo {\n"
+            "  static bar(): number {\n"
+            "    return 1;\n"
+            "  }\n"
+            "}\n"
+            "\n"
+            "function run(): number {\n"
+            "  const Foo = 1;\n"
+            "  return Foo.bar();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::class_shadow.run"
+        static_method_id = f"{REPOSITORY}::class_shadow.Foo.bar"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert static_method_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "Foo.bar"
+
+    def test_object_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_obj.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run() {\n"
+            "  const { helper } = someObj;\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_obj.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_array_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_arr.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run() {\n"
+            "  const [helper] = items;\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_arr.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_destructured_parameter_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_param.ts"
+        source.write_text(
+            "import { helper } from \"./utils\";\n"
+            "\n"
+            "function run({ helper }: any) {\n"
+            "  return helper();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_param.run"
+        import_id = f"{REPOSITORY}::utils.helper"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+
+    def test_rest_destructured_binding_shadows_import(self, parser, tmp_path):
+        source = tmp_path / "destruct_rest.ts"
+        source.write_text(
+            "import { rest } from \"./utils\";\n"
+            "\n"
+            "function run(obj: any) {\n"
+            "  const { a, ...rest } = obj;\n"
+            "  return rest();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::destruct_rest.run"
+        import_id = f"{REPOSITORY}::utils.rest"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        assert import_id not in call_targets
+
+    def test_new_expression_emits_calls_edge(self, parser, tmp_path):
+        source = tmp_path / "new_call.ts"
+        source.write_text(
+            "class Foo {\n"
+            "  constructor() {}\n"
+            "}\n"
+            "\n"
+            "function run() {\n"
+            "  const f = new Foo();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::new_call.run"
+        ctor_id = f"{REPOSITORY}::new_call.Foo.constructor"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert ctor_id in call_targets
+
+    def test_new_expression_unresolved_emits_reference(self, parser, tmp_path):
+        source = tmp_path / "new_unresolved.ts"
+        source.write_text(
+            "function run() {\n"
+            "  const f = new UnknownClass();\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        run_id = f"{REPOSITORY}::new_unresolved.run"
+
+        call_targets = {
+            relationship.target_id
+            for relationship in _rels_from(result, run_id, RelationshipType.CALLS)
+        }
+
+        assert len(call_targets) == 1
+        reference_entities = {
+            entity.id: entity
+            for entity in _entities_by_type(result, EntityType.REFERENCE)
+        }
+        target_id = next(iter(call_targets))
+        assert target_id in reference_entities
+        assert reference_entities[target_id].name == "new UnknownClass"
+
+
+# ===========================================================================
 # Entity ID format
 # ===========================================================================
 

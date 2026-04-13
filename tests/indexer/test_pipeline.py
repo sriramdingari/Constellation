@@ -1153,6 +1153,226 @@ class TestScopedEntityNormalization:
             "test-repo::changed.py#UserService",
         }
 
+    @pytest.mark.asyncio
+    async def test_js_unresolved_reference_ids_stable_after_normalize(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """Unresolved JS/TS reference entities should get stable, site-based
+        normalized IDs that include enough call-site detail (line:col) to
+        remain unique even when the called symbol names differ."""
+        mock_parser.language = "javascript"
+        mock_parser.file_extensions = [".ts"]
+        mock_registry.supported_extensions = {".ts"}
+
+        source_file = tmp_path / "app.ts"
+        source_file.write_text("export function run() { foo(); bar(); }")
+
+        def _parse_javascript(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::app"
+            run_id = f"{repository}::app.run"
+            ref_foo_id = f"{repository}::app.run::ref:app.ts:1:24:foo"
+            ref_bar_id = f"{repository}::app.run::ref:app.ts:1:30:bar"
+            return ParseResult(
+                file_path=str(file_path),
+                language="javascript",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=run_id,
+                        name="run",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=ref_foo_id,
+                        name="foo",
+                        entity_type=EntityType.REFERENCE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=ref_bar_id,
+                        name="bar",
+                        entity_type=EntityType.REFERENCE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=run_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=run_id,
+                        target_id=ref_foo_id,
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                    CodeRelationship(
+                        source_id=run_id,
+                        target_id=ref_bar_id,
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_javascript)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        ref_ids = {
+            entity.id
+            for entity in all_entities
+            if entity.entity_type == EntityType.REFERENCE
+        }
+        # Reference IDs must include site detail (line:col) so they are stable
+        # and unique — not just the symbol name.
+        assert ref_ids == {
+            "test-repo::app.ts#ref:1:24:foo",
+            "test-repo::app.ts#ref:1:30:bar",
+        }
+
+        # CALLS edges must point to the normalized reference IDs
+        call_edges = {
+            (rel.source_id, rel.target_id)
+            for rel in _collect_created_relationships(mock_graph_client)
+            if rel.relationship_type == RelationshipType.CALLS
+        }
+        assert call_edges == {
+            ("test-repo::app.ts#run", "test-repo::app.ts#ref:1:24:foo"),
+            ("test-repo::app.ts#run", "test-repo::app.ts#ref:1:30:bar"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_js_same_name_unresolved_references_do_not_collapse(
+        self, pipeline, mock_graph_client, mock_parser, mock_registry, tmp_path
+    ):
+        """Two unresolved call sites with the same called symbol name but at
+        different locations must NOT collapse into a single reference entity."""
+        mock_parser.language = "javascript"
+        mock_parser.file_extensions = [".ts"]
+        mock_registry.supported_extensions = {".ts"}
+
+        source_file = tmp_path / "handler.ts"
+        source_file.write_text(
+            "export function process() { send(); validate(); send(); }"
+        )
+
+        def _parse_javascript(file_path: Path, repository: str) -> ParseResult:
+            parser_file_id = f"{repository}::handler"
+            process_id = f"{repository}::handler.process"
+            ref_send1_id = f"{repository}::handler.process::ref:handler.ts:1:28:send"
+            ref_send2_id = f"{repository}::handler.process::ref:handler.ts:1:50:send"
+            return ParseResult(
+                file_path=str(file_path),
+                language="javascript",
+                entities=[
+                    CodeEntity(
+                        id=parser_file_id,
+                        name=file_path.name,
+                        entity_type=EntityType.FILE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=process_id,
+                        name="process",
+                        entity_type=EntityType.METHOD,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=ref_send1_id,
+                        name="send",
+                        entity_type=EntityType.REFERENCE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                    CodeEntity(
+                        id=ref_send2_id,
+                        name="send",
+                        entity_type=EntityType.REFERENCE,
+                        repository=repository,
+                        file_path=str(file_path),
+                        line_number=1,
+                        language="javascript",
+                    ),
+                ],
+                relationships=[
+                    CodeRelationship(
+                        source_id=parser_file_id,
+                        target_id=process_id,
+                        relationship_type=RelationshipType.CONTAINS,
+                    ),
+                    CodeRelationship(
+                        source_id=process_id,
+                        target_id=ref_send1_id,
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                    CodeRelationship(
+                        source_id=process_id,
+                        target_id=ref_send2_id,
+                        relationship_type=RelationshipType.CALLS,
+                    ),
+                ],
+            )
+
+        mock_parser.parse_file = MagicMock(side_effect=_parse_javascript)
+
+        with patch("constellation.indexer.pipeline.get_commit_sha", return_value=None):
+            await pipeline.run(source=str(tmp_path), name="test-repo")
+
+        all_entities = _collect_upserted_entities(mock_graph_client)
+        ref_entities = [
+            entity
+            for entity in all_entities
+            if entity.entity_type == EntityType.REFERENCE
+        ]
+        # Two distinct reference entities must survive — not collapsed
+        assert len(ref_entities) == 2
+        ref_ids = {entity.id for entity in ref_entities}
+        assert ref_ids == {
+            "test-repo::handler.ts#ref:1:28:send",
+            "test-repo::handler.ts#ref:1:50:send",
+        }
+
+        # Both CALLS edges must point to distinct targets
+        call_edges = [
+            (rel.source_id, rel.target_id)
+            for rel in _collect_created_relationships(mock_graph_client)
+            if rel.relationship_type == RelationshipType.CALLS
+        ]
+        assert len(call_edges) == 2
+        call_targets = {edge[1] for edge in call_edges}
+        assert call_targets == {
+            "test-repo::handler.ts#ref:1:28:send",
+            "test-repo::handler.ts#ref:1:50:send",
+        }
+
 
 # ---------------------------------------------------------------------------
 # Clone cleanup on error
@@ -1367,7 +1587,7 @@ class TestPostgresSpoolPath:
             )
 
     @pytest.mark.asyncio
-    async def test_pipeline_postgres_serial_parse_result_errors_abort_before_replay(
+    async def test_pipeline_postgres_serial_parse_result_errors_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
     ):
         settings = _make_settings(
@@ -1396,13 +1616,12 @@ class TestPostgresSpoolPath:
         )
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Parse error in" in e and "bad.py" in e for e in result.errors)
 
     @pytest.mark.asyncio
-    async def test_pipeline_postgres_serial_parse_exception_aborts_before_replay(
+    async def test_pipeline_postgres_serial_parse_exception_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, mock_registry, mock_parser, tmp_path
     ):
         settings = _make_settings(
@@ -1425,10 +1644,9 @@ class TestPostgresSpoolPath:
         mock_parser.parse_file = MagicMock(side_effect=RuntimeError("parser boom"))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        assert any("Exception parsing" in e and "bad.py" in e for e in result.errors)
 
     @pytest.mark.asyncio
     async def test_pipeline_postgres_serial_embedding_failure_aborts_before_replay(
@@ -1573,7 +1791,7 @@ class TestPostgresSpoolPath:
         chunk2_finished = asyncio.Event()
         embedding_completion_order: list[int] = []
 
-        async def delayed_embed_entities(entities):
+        async def delayed_embed_entities(entities, *, chunk_index=None):
             chunk_index = (
                 1 if any(entity.file_path.endswith("a.py") for entity in entities) else 2
             )
@@ -1794,7 +2012,7 @@ class TestPostgresSpoolPath:
         assert not mock_graph_client.apply_spooled_indexing_changes.called
 
     @pytest.mark.asyncio
-    async def test_postgres_threaded_parse_result_errors_abort_before_replay(
+    async def test_postgres_threaded_parse_result_errors_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
         from constellation.parsers.base import BaseParser
@@ -1830,13 +2048,19 @@ class TestPostgresSpoolPath:
         mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Parse error in .*bad.py"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        # Exact count check — the threaded path previously appended chunk_errors
+        # twice (once at parse-future completion, once at writer finalization).
+        # Regression guard: a single parse error must land in result.errors
+        # exactly once, not twice.
+        parse_errors = [e for e in result.errors if "Parse error in" in e and "bad.py" in e]
+        assert len(parse_errors) == 1, (
+            f"expected exactly 1 parse error, got {len(parse_errors)}: {parse_errors}"
+        )
 
     @pytest.mark.asyncio
-    async def test_postgres_threaded_parse_exception_aborts_before_replay(
+    async def test_postgres_threaded_parse_exception_reported_not_fatal(
         self, mock_graph_client, mock_embedding_provider, tmp_path
     ):
         from constellation.parsers.base import BaseParser
@@ -1868,10 +2092,13 @@ class TestPostgresSpoolPath:
         mock_graph_client.apply_spooled_indexing_changes = AsyncMock(return_value=(0, 0, 0))
 
         with patch("constellation.indexer.pipeline.get_commit_sha", return_value="abc123"):
-            with pytest.raises(RuntimeError, match="Exception parsing .*bad.py: parser boom"):
-                await pipeline.run(source=str(tmp_path))
+            result = await pipeline.run(source=str(tmp_path))
 
-        assert not mock_graph_client.apply_spooled_indexing_changes.called
+        # Exact count — same duplication guard as the parse-result path above.
+        exc_errors = [e for e in result.errors if "Exception parsing" in e and "parser boom" in e]
+        assert len(exc_errors) == 1, (
+            f"expected exactly 1 exception-parsing error, got {len(exc_errors)}: {exc_errors}"
+        )
 
     @pytest.mark.asyncio
     async def test_postgres_thread_count_one_preserves_serial_behavior(

@@ -91,10 +91,10 @@ class PythonParser(BaseParser):
 
         tree = self._parser.parse(code)
 
-        # Check for syntax errors in the tree
+        # Log syntax errors but continue — tree-sitter is error-tolerant
+        # and can still produce a usable partial AST.
         if tree.root_node.has_error:
-            result.add_error(f"Syntax errors detected in {file_path}")
-            return result
+            logger.warning("Syntax errors detected in %s (continuing with partial AST)", file_path)
 
         # Derive module path from file_path
         module_name = self._derive_module_name(file_path)

@@ -72,7 +72,13 @@ class TestSettings:
         s = _settings_without_env_file()
         assert s.files_per_chunk == 100  # default
 
-    def test_default_indexing_worker_threads(self):
+    def test_default_indexing_worker_threads(self, monkeypatch):
+        # The autouse conftest fixture forces INDEXING_WORKER_THREADS=1 to
+        # keep tests deterministic — which means a naive assertion here would
+        # pass regardless of what the code default actually is. Clear the
+        # env var first so we genuinely exercise the code default and catch
+        # any future accidental change to it.
+        monkeypatch.delenv("INDEXING_WORKER_THREADS", raising=False)
         s = _settings_without_env_file()
         assert s.indexing_worker_threads == 1
 

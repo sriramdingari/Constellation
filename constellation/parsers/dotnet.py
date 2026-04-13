@@ -63,9 +63,10 @@ class DotNetParser(BaseParser):
             result.add_error(f"Failed to parse file: {exc}")
             return result
 
-        # Check for syntax errors
+        # Log syntax errors but continue — tree-sitter is error-tolerant
+        # and can still produce a usable partial AST.
         if tree.root_node.has_error:
-            result.add_error(f"Syntax errors detected in {file_path}")
+            logger.warning("Syntax errors detected in %s (continuing with partial AST)", file_path)
 
         # Create File entity
         file_entity = CodeEntity(
