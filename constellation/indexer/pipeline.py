@@ -31,6 +31,8 @@ from constellation.indexer.collector import (
 import re
 
 from constellation.models import CodeEntity, CodeRelationship, EntityType, RelationshipType
+
+_REF_SITE_RE = re.compile(r"::ref:.*?(\d+):(\d+)(?::[^:]+)?$")
 from constellation.indexer.spool import (
     ChunkPreparation,
     RunManifest,
@@ -995,7 +997,6 @@ class IndexingPipeline:
         # (line, col, symbol).  We extract line:col and combine with the
         # entity name to form ``ref:{line}:{col}:{name}`` which is unique
         # per call site even when the called symbol name repeats.
-        _REF_SITE_RE = re.compile(r"::ref:.*?(\d+):(\d+)(?::[^:]+)?$")
         local_paths: dict[str, str] = {}
         used_paths: set[str] = set()
 
