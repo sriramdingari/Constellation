@@ -58,6 +58,9 @@ class _ParsingContext:
     class_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
     class_static_method_ids: dict[str, dict[str, str]] = field(default_factory=dict)
 
+    # Local variable -> class name map for receiver typing (populated per method body)
+    local_instance_types: dict[str, str] = field(default_factory=dict)
+
 
 # =============================================================================
 # DotNet Parser
@@ -266,6 +269,8 @@ class DotNetParser(BaseParser):
             method_ids: dict[str, str] = {}
             static_method_ids: dict[str, str] = {}
 
+            constructor_ids: dict[str, str] = {}
+
             for child in body.children:
                 if child.type == "method_declaration":
                     mname_node = child.child_by_field_name("name")
@@ -281,8 +286,17 @@ class DotNetParser(BaseParser):
                     if "static" in modifiers:
                         static_method_ids[method_name] = method_id
 
-            if method_ids:
-                ctx.class_method_ids[class_id] = method_ids
+                elif child.type == "constructor_declaration":
+                    cname_node = child.child_by_field_name("name")
+                    if not cname_node:
+                        continue
+                    ctor_name = self._get_text(cname_node, ctx.code)
+                    ctor_id = f"{ctx.repository}::{full_qname}.{ctor_name}"
+                    constructor_ids[ctor_name] = ctor_id
+
+            if method_ids or constructor_ids:
+                merged = {**method_ids, **constructor_ids}
+                ctx.class_method_ids[class_id] = merged
             if static_method_ids:
                 ctx.class_static_method_ids[class_id] = static_method_ids
 
@@ -755,7 +769,10 @@ class DotNetParser(BaseParser):
         # Extract calls from method body
         body_node = node.child_by_field_name("body")
         if body_node:
+            saved_locals = ctx.local_instance_types
+            ctx.local_instance_types = self._collect_local_instance_types(body_node, ctx)
             self._extract_calls(body_node, ctx, result, method_entity.id)
+            ctx.local_instance_types = saved_locals
 
     # =========================================================================
     # Constructor Processing
@@ -812,7 +829,10 @@ class DotNetParser(BaseParser):
         # Extract calls from constructor body
         body_node = node.child_by_field_name("body")
         if body_node:
+            saved_locals = ctx.local_instance_types
+            ctx.local_instance_types = self._collect_local_instance_types(body_node, ctx)
             self._extract_calls(body_node, ctx, result, ctor_entity.id)
+            ctx.local_instance_types = saved_locals
 
     # =========================================================================
     # Field Processing
@@ -929,6 +949,86 @@ class DotNetParser(BaseParser):
     # Call Extraction
     # =========================================================================
 
+    def _collect_local_instance_types(self, body: Node, ctx: _ParsingContext) -> dict[str, str]:
+        """Scan a method/constructor body for local variable declarations
+        initialised with ``new ClassName()`` and return a mapping from
+        variable name to class short-name.
+
+        Only considers ``local_declaration_statement`` nodes whose
+        initialiser is an ``object_creation_expression``.
+        """
+        instance_types: dict[str, str] = {}
+        for child in body.children:
+            if child.type != "local_declaration_statement":
+                continue
+            var_decl = self._find_child_by_type(child, "variable_declaration")
+            if var_decl is None:
+                continue
+            for declarator in var_decl.children:
+                if declarator.type != "variable_declarator":
+                    continue
+                name_node = self._find_child_by_type(declarator, "identifier")
+                # Find the object_creation_expression initialiser
+                obj_creation = self._find_child_by_type(declarator, "object_creation_expression")
+                if name_node is None or obj_creation is None:
+                    continue
+                # The type in object_creation_expression is the identifier
+                # child right after the 'new' keyword
+                type_node = None
+                for oc_child in obj_creation.children:
+                    if oc_child.type in ("identifier", "qualified_name", "generic_name"):
+                        type_node = oc_child
+                        break
+                if type_node is None:
+                    continue
+                var_name = self._get_text(name_node, ctx.code)
+                class_name = self._get_text(type_node, ctx.code)
+                # For generic names, strip type args to get the base class name
+                if type_node.type == "generic_name":
+                    id_child = self._find_child_by_type(type_node, "identifier")
+                    if id_child:
+                        class_name = self._get_text(id_child, ctx.code)
+                instance_types[var_name] = class_name
+        return instance_types
+
+    def _resolve_type_name(self, type_name: str, ctx: _ParsingContext) -> str | None:
+        """Attempt to resolve *type_name* to a known class entity ID.
+
+        Resolution order:
+        1. Same-file class (direct short-name match)
+        2. Using alias — check if alias target's short name matches a known class
+        3. Using directives — check if ``{ns}.{type_name}`` matches any known ID
+        4. Same namespace — check if ``{ctx.namespace}.{type_name}`` matches
+        """
+        # 1. Same-file class
+        if type_name in ctx.module_class_ids:
+            return ctx.module_class_ids[type_name]
+
+        # 2. Using alias
+        if type_name in ctx.using_aliases:
+            alias_target = ctx.using_aliases[type_name]
+            short = alias_target.rsplit(".", 1)[-1]
+            if short in ctx.module_class_ids:
+                return ctx.module_class_ids[short]
+            return None
+
+        # 3. Using directives
+        known_ids = set(ctx.module_class_ids.values())
+        for ns in ctx.usings:
+            qualified = f"{ns}.{type_name}"
+            candidate_id = f"{ctx.repository}::{qualified}"
+            if candidate_id in known_ids:
+                return candidate_id
+
+        # 4. Same namespace
+        if ctx.namespace:
+            qualified = f"{ctx.namespace}.{type_name}"
+            candidate_id = f"{ctx.repository}::{qualified}"
+            if candidate_id in known_ids:
+                return candidate_id
+
+        return None
+
     def _extract_calls(
         self,
         body: Node,
@@ -936,8 +1036,9 @@ class DotNetParser(BaseParser):
         result: ParseResult,
         source_id: str,
     ) -> None:
-        """Recursively walk *body* to find invocation_expression nodes
-        and record each as a call from *source_id*.
+        """Recursively walk *body* to find invocation_expression and
+        object_creation_expression nodes and record each as a call
+        from *source_id*.
 
         Lambda bodies and anonymous delegate bodies are walked and calls
         within them are attributed to the enclosing method/constructor.
@@ -956,6 +1057,8 @@ class DotNetParser(BaseParser):
         """Recursive walk helper for call extraction."""
         if node.type == "invocation_expression":
             self._record_call(node, ctx, result, source_id, seen_reference_targets)
+        elif node.type == "object_creation_expression":
+            self._record_new_call(node, ctx, result, source_id, seen_reference_targets)
 
         # Recurse into all children (including lambdas and anonymous delegates)
         for child in node.children:
@@ -991,6 +1094,17 @@ class DotNetParser(BaseParser):
             class_methods = ctx.class_method_ids.get(ctx.current_class_full_id, {})
             target_id = class_methods.get(called_symbol)
 
+            # Tier 5: Static using members — bare identifier that might come
+            # from a 'using static' import
+            if target_id is None:
+                for static_cls in ctx.using_statics:
+                    cls_id = self._resolve_type_name(static_cls.rsplit(".", 1)[-1], ctx)
+                    if cls_id is not None:
+                        static_methods = ctx.class_static_method_ids.get(cls_id, {})
+                        target_id = static_methods.get(called_symbol)
+                        if target_id is not None:
+                            break
+
         elif func_node.type == "generic_name":
             # Generic method call like Method<T>() — extract base name
             name_node = self._find_child_by_type(func_node, "identifier")
@@ -1006,25 +1120,12 @@ class DotNetParser(BaseParser):
                 target_id = class_methods.get(called_symbol)
 
         elif func_node.type == "member_access_expression":
-            # object.Method() — check for this/base
-            object_node = func_node.children[0] if func_node.children else None
-            member_node = None
-            for child in func_node.children:
-                if child.type == "identifier" and child != object_node:
-                    member_node = child
-            # The member name is the rightmost identifier (after the '.')
-            if member_node is None:
-                # Last child that is an identifier
-                for child in reversed(func_node.children):
-                    if child.type == "identifier":
-                        member_node = child
-                        break
+            object_node, member_node, called_symbol, receiver_text = (
+                self._decompose_member_access(func_node, ctx)
+            )
 
             if member_node is None or object_node is None:
                 return
-
-            called_symbol = self._get_text(member_node, ctx.code)
-            receiver_text = self._get_text(object_node, ctx.code)
 
             if object_node.type == "this":
                 # Tier 2: this.Method() — resolve via same-class
@@ -1034,10 +1135,47 @@ class DotNetParser(BaseParser):
                 # Tier 2b: base.Method() — stays unresolved
                 target_id = None
             else:
-                # Tier 7: Other member access — unresolved
-                # Use the full expression text as the called symbol
-                called_symbol = self._get_text(func_node, ctx.code)
-                target_id = None
+                # Tier 3: Local receiver typing
+                local_type = ctx.local_instance_types.get(receiver_text)
+                if local_type is not None:
+                    cls_id = self._resolve_type_name(local_type, ctx)
+                    if cls_id is not None:
+                        target_id = ctx.class_method_ids.get(cls_id, {}).get(called_symbol)
+
+                # Tier 4: Static member calls — receiver is a class name
+                if target_id is None:
+                    cls_id = self._resolve_type_name(receiver_text, ctx)
+                    if cls_id is not None:
+                        target_id = ctx.class_static_method_ids.get(cls_id, {}).get(called_symbol)
+
+                # Tier 6: Using alias — receiver is an alias
+                if target_id is None and receiver_text in ctx.using_aliases:
+                    alias_target = ctx.using_aliases[receiver_text]
+                    short = alias_target.rsplit(".", 1)[-1]
+                    cls_id = self._resolve_type_name(short, ctx)
+                    if cls_id is not None:
+                        # Try static first, then instance
+                        target_id = ctx.class_static_method_ids.get(cls_id, {}).get(called_symbol)
+                        if target_id is None:
+                            target_id = ctx.class_method_ids.get(cls_id, {}).get(called_symbol)
+
+                # Tier 7: Unresolved member access
+                if target_id is None:
+                    called_symbol = self._get_text(func_node, ctx.code)
+
+        elif func_node.type == "conditional_access_expression":
+            # handler?.Invoke()  — unwrap to get receiver and method name
+            receiver_node = func_node.children[0] if func_node.children else None
+            binding = self._find_child_by_type(func_node, "member_binding_expression")
+            if receiver_node is not None and binding is not None:
+                member_node = self._find_child_by_type(binding, "identifier")
+                if member_node is not None:
+                    called_symbol = self._get_text(member_node, ctx.code)
+                    receiver_text = self._get_text(receiver_node, ctx.code)
+                else:
+                    called_symbol = self._get_text(func_node, ctx.code).strip()
+            else:
+                called_symbol = self._get_text(func_node, ctx.code).strip()
 
         else:
             # Fallback: use the full text of the function node
@@ -1071,6 +1209,105 @@ class DotNetParser(BaseParser):
                 line_end=call_node.end_point[0] + 1,
                 language=self.language,
                 properties=self._reference_properties(called_symbol, source_id, receiver_text),
+            ))
+        result.add_relationship(CodeRelationship(
+            source_id=source_id,
+            target_id=target_id,
+            relationship_type=RelationshipType.CALLS,
+        ))
+
+    def _decompose_member_access(
+        self,
+        func_node: Node,
+        ctx: _ParsingContext,
+    ) -> tuple[Node | None, Node | None, str | None, str | None]:
+        """Break a ``member_access_expression`` into its components.
+
+        Returns ``(object_node, member_node, called_symbol, receiver_text)``.
+        """
+        object_node = func_node.children[0] if func_node.children else None
+        member_node = None
+        for child in func_node.children:
+            if child.type == "identifier" and child != object_node:
+                member_node = child
+        # The member name is the rightmost identifier (after the '.')
+        if member_node is None:
+            for child in reversed(func_node.children):
+                if child.type == "identifier":
+                    member_node = child
+                    break
+
+        called_symbol: str | None = None
+        receiver_text: str | None = None
+        if member_node is not None:
+            called_symbol = self._get_text(member_node, ctx.code)
+        if object_node is not None:
+            receiver_text = self._get_text(object_node, ctx.code)
+
+        return object_node, member_node, called_symbol, receiver_text
+
+    def _record_new_call(
+        self,
+        new_node: Node,
+        ctx: _ParsingContext,
+        result: ParseResult,
+        source_id: str,
+        seen_reference_targets: set[str],
+    ) -> None:
+        """Record a ``new ClassName()`` as a CALLS edge.
+
+        If the class is resolvable, target the constructor entity (if one
+        exists) or else the class entity.  Otherwise emit an unresolved
+        Reference entity.
+        """
+        # Find the type being constructed (identifier child after 'new')
+        type_node = None
+        for child in new_node.children:
+            if child.type in ("identifier", "qualified_name", "generic_name"):
+                type_node = child
+                break
+        if type_node is None:
+            return
+
+        type_name = self._get_text(type_node, ctx.code)
+        # For generic names use the base identifier
+        if type_node.type == "generic_name":
+            id_child = self._find_child_by_type(type_node, "identifier")
+            if id_child:
+                type_name = self._get_text(id_child, ctx.code)
+
+        cls_id = self._resolve_type_name(type_name, ctx)
+        if cls_id is not None:
+            # Prefer constructor entity if it exists
+            ctor_methods = ctx.class_method_ids.get(cls_id, {})
+            ctor_id = ctor_methods.get(type_name)  # C# ctors share the class name
+            target_id = ctor_id if ctor_id else cls_id
+            result.add_relationship(CodeRelationship(
+                source_id=source_id,
+                target_id=target_id,
+                relationship_type=RelationshipType.CALLS,
+            ))
+            return
+
+        # Unresolved — emit Reference
+        called_symbol = f"new {type_name}"
+        target_id = self._reference_target_id(ctx, source_id, called_symbol, new_node)
+        if target_id not in seen_reference_targets:
+            seen_reference_targets.add(target_id)
+            result.add_entity(CodeEntity(
+                id=target_id,
+                name=called_symbol,
+                entity_type=EntityType.REFERENCE,
+                repository=ctx.repository,
+                file_path=ctx.file_path,
+                line_number=new_node.start_point[0] + 1,
+                line_end=new_node.end_point[0] + 1,
+                language=self.language,
+                properties={
+                    "symbol": called_symbol,
+                    "enclosing_declaration_id": source_id,
+                    "enclosing_declaration_name": self._enclosing_declaration_name(source_id),
+                },
             ))
         result.add_relationship(CodeRelationship(
             source_id=source_id,

@@ -1396,3 +1396,169 @@ class TestCallsAndReferences:
         edge_result = parser.parse_file(EDGE_CASES_FILE, repository=REPOSITORY)
         assert len(edge_result.entities) > 0
         assert len(edge_result.errors) == 0
+
+    # ----- Task 4: Receiver Typing and Cross-Namespace Resolution -----
+
+    def test_local_receiver_typing_resolves_instance_call(self, parser, tmp_path):
+        """var svc = new TaxService(); svc.Calculate() resolves when
+        TaxService is defined in the same file."""
+        src = tmp_path / "ReceiverType.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class TaxService {\n"
+            "        public decimal Calculate() { return 0m; }\n"
+            "    }\n"
+            "    public class Client {\n"
+            "        public void Run() {\n"
+            "            var svc = new TaxService();\n"
+            "            svc.Calculate();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        calc_method = _find_entity(result, "Calculate", EntityType.METHOD)
+        assert run_method is not None
+        assert calc_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == calc_method.id]
+        assert len(resolved) == 1, f"Expected resolved CALLS edge; got {[r.target_id for r in calls if r.source_id == run_method.id]}"
+
+    def test_static_method_call_resolves(self, parser, tmp_path):
+        """TaxService.StaticMethod() resolves to static method of same-file class."""
+        src = tmp_path / "StaticCall.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class TaxService {\n"
+            "        public static decimal Calculate() { return 0m; }\n"
+            "    }\n"
+            "    public class Client {\n"
+            "        public void Run() {\n"
+            "            TaxService.Calculate();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        calc_method = _find_entity(result, "Calculate", EntityType.METHOD)
+        assert run_method is not None
+        assert calc_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == calc_method.id]
+        assert len(resolved) == 1, f"Expected resolved static CALLS edge; got {[r.target_id for r in calls if r.source_id == run_method.id]}"
+
+    def test_using_alias_resolves_to_same_file_class(self, parser, tmp_path):
+        """using Svc = NS.TaxService; then Svc.Calculate() resolves
+        when the alias target short name matches a same-file class."""
+        src = tmp_path / "AliasCall.cs"
+        src.write_text(
+            "using Svc = NS.TaxService;\n"
+            "\n"
+            "namespace NS {\n"
+            "    public class TaxService {\n"
+            "        public static decimal Calculate() { return 0m; }\n"
+            "    }\n"
+            "    public class Client {\n"
+            "        public void Run() {\n"
+            "            Svc.Calculate();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        calc_method = _find_entity(result, "Calculate", EntityType.METHOD)
+        assert run_method is not None
+        assert calc_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        resolved = [r for r in calls if r.source_id == run_method.id and r.target_id == calc_method.id]
+        assert len(resolved) == 1, f"Expected alias-resolved CALLS edge; got {[r.target_id for r in calls if r.source_id == run_method.id]}"
+
+    def test_new_expression_resolved_emits_calls_edge(self, parser, tmp_path):
+        """new TaxService() constructor call emits CALLS edge to class or constructor."""
+        src = tmp_path / "NewCall.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class TaxService {\n"
+            "        public TaxService() {}\n"
+            "        public decimal Calculate() { return 0m; }\n"
+            "    }\n"
+            "    public class Client {\n"
+            "        public void Run() {\n"
+            "            var svc = new TaxService();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        tax_ctor = _find_entity(result, "TaxService", EntityType.CONSTRUCTOR)
+        tax_cls = _find_entity(result, "TaxService", EntityType.CLASS)
+        assert run_method is not None
+        assert tax_cls is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == run_method.id]
+        # Should resolve to the constructor entity if it exists, otherwise class
+        expected_target = tax_ctor.id if tax_ctor else tax_cls.id
+        resolved = [r for r in run_calls if r.target_id == expected_target]
+        assert len(resolved) == 1, f"Expected new-call CALLS edge to {expected_target}; got {[r.target_id for r in run_calls]}"
+
+    def test_new_expression_unresolved_emits_reference(self, parser, tmp_path):
+        """new ExternalClass() with unknown type emits Reference entity."""
+        src = tmp_path / "NewExternal.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Client {\n"
+            "        public void Run() {\n"
+            "            var obj = new ExternalClass();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        refs = _find_entities(result, EntityType.REFERENCE)
+        new_refs = [r for r in refs if "ExternalClass" in r.name]
+        assert len(new_refs) == 1, f"Expected Reference for new ExternalClass; got {[r.name for r in refs]}"
+
+        # CALLS edge from Run to the reference
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        assert run_method is not None
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        call = [r for r in calls if r.source_id == run_method.id and r.target_id == new_refs[0].id]
+        assert len(call) == 1
+
+    def test_null_conditional_call_does_not_crash(self, parser, tmp_path):
+        """handler?.Invoke() produces a CALLS edge (unresolved) and does not crash."""
+        src = tmp_path / "NullConditional.cs"
+        src.write_text(
+            "namespace NS {\n"
+            "    public class Svc {\n"
+            "        public void Run() {\n"
+            "            handler?.Invoke();\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = parser.parse_file(src, repository=REPOSITORY)
+
+        # Must not crash
+        assert len(result.errors) == 0
+
+        run_method = _find_entity(result, "Run", EntityType.METHOD)
+        assert run_method is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == run_method.id]
+        # Should have at least one CALLS edge (likely unresolved reference)
+        assert len(run_calls) >= 1, "Expected at least one CALLS edge from handler?.Invoke()"
