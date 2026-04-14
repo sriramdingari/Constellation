@@ -1104,7 +1104,8 @@ class DotNetParser(BaseParser):
             elif child.type in (
                 "if_statement", "else_clause", "for_statement", "for_each_statement",
                 "while_statement", "do_statement", "try_statement", "catch_clause",
-                "finally_clause", "using_statement", "lock_statement", "switch_section",
+                "finally_clause", "using_statement", "lock_statement",
+                "switch_statement", "switch_body", "switch_section",
             ):
                 self._collect_local_instances_recursive(child, ctx, instance_types)
 

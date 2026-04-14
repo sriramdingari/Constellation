@@ -1652,6 +1652,65 @@ class TestCallsAndReferences:
             f"Expected 'test' stereotype on Helper, got {helper.stereotypes}"
         )
 
+    def test_switch_block_instance_typing_resolves(self, parser, tmp_path):
+        """Instance typing inside switch blocks should resolve."""
+        source = tmp_path / "SwitchBlock.cs"
+        source.write_text(
+            "public class Worker {\n"
+            "  public void DoWork() {}\n"
+            "}\n"
+            "public class Client {\n"
+            "  public void Run(int x) {\n"
+            "    switch (x) {\n"
+            "      case 1:\n"
+            "        var w = new Worker();\n"
+            "        w.DoWork();\n"
+            "        break;\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        client_run = _find_entity(result, "Run", EntityType.METHOD)
+        assert client_run is not None
+
+        worker_dowork_id = f"{REPOSITORY}::Worker.DoWork"
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == client_run.id]
+        call_targets = {r.target_id for r in run_calls}
+        assert worker_dowork_id in call_targets, (
+            f"Expected Worker.DoWork resolved in switch block, got: {call_targets}"
+        )
+
+    def test_generic_member_call_not_dropped(self, parser, tmp_path):
+        """Generic method calls on receivers must not be silently dropped."""
+        source = tmp_path / "GenericCall.cs"
+        source.write_text(
+            "public class Converter {\n"
+            "  public T Convert<T>(object input) { return default(T); }\n"
+            "}\n"
+            "public class Client {\n"
+            "  public void Run() {\n"
+            "    var c = new Converter();\n"
+            "    c.Convert<int>(42);\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        client_run = _find_entity(result, "Run", EntityType.METHOD)
+        assert client_run is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == client_run.id]
+        # Must have at least a CALLS edge for c.Convert<int>() — either resolved or Reference
+        convert_calls = [r for r in run_calls if "Convert" in r.target_id or "convert" in r.target_id.lower()]
+        assert len(convert_calls) >= 1, (
+            f"Generic member call c.Convert<int>() was dropped. All targets: "
+            f"{[r.target_id for r in run_calls]}"
+        )
+
 
 # ===========================================================================
 # Task 5: Extended Test Stereotype Detection (filename/path-based)
