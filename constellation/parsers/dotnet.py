@@ -37,6 +37,8 @@ TEST_PATH_PATTERNS = frozenset({"/test/", "/tests/", ".Tests/", ".Test/", "/Test
 # Endpoint Detection Constants
 # =============================================================================
 
+TEST_CLASS_ATTRIBUTES = frozenset({"TestFixture", "TestClass"})
+
 CONTROLLER_BASE_CLASSES = frozenset({"Controller", "ControllerBase", "ApiController"})
 CONTROLLER_ATTRIBUTES = frozenset({"ApiController", "Controller"})
 ENDPOINT_ATTRIBUTES = frozenset({
@@ -80,6 +82,7 @@ class _ParsingContext:
 
     # Controller detection (populated per class by _process_class)
     current_class_is_controller: bool = False
+    current_class_is_test_fixture: bool = False
 
 
 # =============================================================================
@@ -280,8 +283,13 @@ class DotNetParser(BaseParser):
 
         class_id = f"{ctx.repository}::{full_qname}"
 
-        # Store class name -> class entity ID
-        ctx.module_class_ids[class_name] = class_id
+        # Store both short name and qualified name for lookup.
+        # Qualified name takes precedence when two classes share a short name.
+        ctx.module_class_ids[full_qname] = class_id
+        # Short name is stored only if not already claimed by another class,
+        # preventing a later class from silently overwriting an earlier one.
+        if class_name not in ctx.module_class_ids:
+            ctx.module_class_ids[class_name] = class_id
 
         # Walk the class body for method_declaration children
         body = self._find_child_by_type(node, "declaration_list")
@@ -385,6 +393,8 @@ class DotNetParser(BaseParser):
         result.add_entity(ns_entity)
 
         # Process declarations inside the namespace body
+        saved_ns = ctx.namespace
+        ctx.namespace = full_ns
         decl_list = self._find_child_by_type(node, "declaration_list")
         if decl_list:
             for child in decl_list.children:
@@ -392,6 +402,7 @@ class DotNetParser(BaseParser):
                     self._process_namespace(child, ctx, file_entity, result, parent_namespace=full_ns)
                 else:
                     self._process_type_node(child, ctx, file_entity, result, namespace=full_ns)
+        ctx.namespace = saved_ns
 
     def _process_file_scoped_namespace(
         self,
@@ -419,6 +430,7 @@ class DotNetParser(BaseParser):
 
         # File-scoped: all types declared after the namespace directive are in this namespace
         # They appear as children of the file_scoped_namespace_declaration node
+        ctx.namespace = ns_name
         for child in node.children:
             self._process_type_node(child, ctx, file_entity, result, namespace=ns_name)
 
@@ -536,19 +548,26 @@ class DotNetParser(BaseParser):
         # Detect whether this class is a controller (for endpoint detection)
         is_controller = self._is_controller_class(node, ctx.code)
 
+        # Detect whether this class is a test fixture (class-level test attributes)
+        class_attrs = self._extract_attributes(node, ctx.code)
+        is_test_fixture = bool({a["name"] for a in class_attrs} & TEST_CLASS_ATTRIBUTES)
+
         # Process class body — set current_class context for call resolution
         body_node = self._find_child_by_type(node, "declaration_list")
         if body_node:
             saved_class = ctx.current_class
             saved_class_full_id = ctx.current_class_full_id
             saved_is_controller = ctx.current_class_is_controller
+            saved_is_test_fixture = ctx.current_class_is_test_fixture
             ctx.current_class = class_name
             ctx.current_class_full_id = class_entity.id
             ctx.current_class_is_controller = is_controller
+            ctx.current_class_is_test_fixture = is_test_fixture
             self._process_class_body(body_node, ctx, file_entity, class_entity, result, namespace)
             ctx.current_class = saved_class
             ctx.current_class_full_id = saved_class_full_id
             ctx.current_class_is_controller = saved_is_controller
+            ctx.current_class_is_test_fixture = saved_is_test_fixture
 
     # =========================================================================
     # Interface Processing
@@ -810,11 +829,15 @@ class DotNetParser(BaseParser):
         ctx: _ParsingContext,
         attributes: list[dict[str, str | None]],
     ) -> list[str]:
-        """Detect 'test' stereotype from method attributes, file name, or file path."""
+        """Detect 'test' stereotype from method attributes, class attributes, file name, or file path."""
         attr_names = {a["name"] for a in attributes}
 
         # Check method-level test attributes
         if attr_names & TEST_METHOD_ATTRIBUTES:
+            return ["test"]
+
+        # Check class-level test fixture attributes ([TestClass], [TestFixture])
+        if ctx.current_class_is_test_fixture:
             return ["test"]
 
         # Check filename patterns (e.g. FooTest.cs, FooTests.cs, FooSpec.cs)
@@ -1066,38 +1089,53 @@ class DotNetParser(BaseParser):
         initialiser is an ``object_creation_expression``.
         """
         instance_types: dict[str, str] = {}
-        for child in body.children:
-            if child.type != "local_declaration_statement":
-                continue
-            var_decl = self._find_child_by_type(child, "variable_declaration")
-            if var_decl is None:
-                continue
-            for declarator in var_decl.children:
-                if declarator.type != "variable_declarator":
-                    continue
-                name_node = self._find_child_by_type(declarator, "identifier")
-                # Find the object_creation_expression initialiser
-                obj_creation = self._find_child_by_type(declarator, "object_creation_expression")
-                if name_node is None or obj_creation is None:
-                    continue
-                # The type in object_creation_expression is the identifier
-                # child right after the 'new' keyword
-                type_node = None
-                for oc_child in obj_creation.children:
-                    if oc_child.type in ("identifier", "qualified_name", "generic_name"):
-                        type_node = oc_child
-                        break
-                if type_node is None:
-                    continue
-                var_name = self._get_text(name_node, ctx.code)
-                class_name = self._get_text(type_node, ctx.code)
-                # For generic names, strip type args to get the base class name
-                if type_node.type == "generic_name":
-                    id_child = self._find_child_by_type(type_node, "identifier")
-                    if id_child:
-                        class_name = self._get_text(id_child, ctx.code)
-                instance_types[var_name] = class_name
+        self._collect_local_instances_recursive(body, ctx, instance_types)
         return instance_types
+
+    def _collect_local_instances_recursive(
+        self, node: Node, ctx: _ParsingContext, instance_types: dict[str, str],
+    ) -> None:
+        """Recursively scan for local_declaration_statement with new expressions."""
+        for child in node.children:
+            if child.type == "local_declaration_statement":
+                self._process_local_declaration(child, ctx, instance_types)
+            elif child.type == "block":
+                self._collect_local_instances_recursive(child, ctx, instance_types)
+            elif child.type in (
+                "if_statement", "else_clause", "for_statement", "for_each_statement",
+                "while_statement", "do_statement", "try_statement", "catch_clause",
+                "finally_clause", "using_statement", "lock_statement", "switch_section",
+            ):
+                self._collect_local_instances_recursive(child, ctx, instance_types)
+
+    def _process_local_declaration(
+        self, child: Node, ctx: _ParsingContext, instance_types: dict[str, str],
+    ) -> None:
+        """Extract variable name and type from a local_declaration_statement with new."""
+        var_decl = self._find_child_by_type(child, "variable_declaration")
+        if var_decl is None:
+            return
+        for declarator in var_decl.children:
+            if declarator.type != "variable_declarator":
+                continue
+            name_node = self._find_child_by_type(declarator, "identifier")
+            obj_creation = self._find_child_by_type(declarator, "object_creation_expression")
+            if name_node is None or obj_creation is None:
+                continue
+            type_node = None
+            for oc_child in obj_creation.children:
+                if oc_child.type in ("identifier", "qualified_name", "generic_name"):
+                    type_node = oc_child
+                    break
+            if type_node is None:
+                continue
+            var_name = self._get_text(name_node, ctx.code)
+            class_name = self._get_text(type_node, ctx.code)
+            if type_node.type == "generic_name":
+                id_child = self._find_child_by_type(type_node, "identifier")
+                if id_child:
+                    class_name = self._get_text(id_child, ctx.code)
+            instance_types[var_name] = class_name
 
     def _resolve_type_name(self, type_name: str, ctx: _ParsingContext) -> str | None:
         """Attempt to resolve *type_name* to a known class entity ID.
@@ -1108,7 +1146,13 @@ class DotNetParser(BaseParser):
         3. Using directives — check if ``{ns}.{type_name}`` matches any known ID
         4. Same namespace — check if ``{ctx.namespace}.{type_name}`` matches
         """
-        # 1. Same-file class
+        # 1a. Current namespace qualified lookup (most specific)
+        if ctx.namespace:
+            qualified = f"{ctx.namespace}.{type_name}"
+            if qualified in ctx.module_class_ids:
+                return ctx.module_class_ids[qualified]
+
+        # 1b. Same-file class by short name
         if type_name in ctx.module_class_ids:
             return ctx.module_class_ids[type_name]
 
@@ -1124,13 +1168,6 @@ class DotNetParser(BaseParser):
         known_ids = set(ctx.module_class_ids.values())
         for ns in ctx.usings:
             qualified = f"{ns}.{type_name}"
-            candidate_id = f"{ctx.repository}::{qualified}"
-            if candidate_id in known_ids:
-                return candidate_id
-
-        # 4. Same namespace
-        if ctx.namespace:
-            qualified = f"{ctx.namespace}.{type_name}"
             candidate_id = f"{ctx.repository}::{qualified}"
             if candidate_id in known_ids:
                 return candidate_id

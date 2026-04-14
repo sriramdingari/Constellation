@@ -1563,6 +1563,95 @@ class TestCallsAndReferences:
         # Should have at least one CALLS edge (likely unresolved reference)
         assert len(run_calls) >= 1, "Expected at least one CALLS edge from handler?.Invoke()"
 
+    def test_same_name_classes_different_namespaces_resolve_correctly(self, parser, tmp_path):
+        """Bug #1: When two classes share a short name in different namespaces,
+        calls in the first class should NOT resolve to the second class."""
+        source = tmp_path / "DualService.cs"
+        source.write_text(
+            "namespace A {\n"
+            "  public class TaxService {\n"
+            "    public void Calculate() {}\n"
+            "  }\n"
+            "  public class Client {\n"
+            "    public void Run() {\n"
+            "      var svc = new TaxService();\n"
+            "      svc.Calculate();\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "namespace B {\n"
+            "  public class TaxService {\n"
+            "    public void Calculate() {}\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        client_run = _find_entity(result, "Run", EntityType.METHOD)
+        assert client_run is not None
+
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == client_run.id]
+
+        # svc.Calculate() should resolve to A.TaxService.Calculate, NOT B.TaxService.Calculate
+        a_calc_id = f"{REPOSITORY}::A.TaxService.Calculate"
+        b_calc_id = f"{REPOSITORY}::B.TaxService.Calculate"
+        call_targets = {r.target_id for r in run_calls}
+        assert a_calc_id in call_targets, f"Expected A.TaxService.Calculate in {call_targets}"
+        assert b_calc_id not in call_targets, f"B.TaxService.Calculate should not be in {call_targets}"
+
+    def test_nested_block_instance_typing_resolves(self, parser, tmp_path):
+        """Bug #2: Variable declarations inside if/for/while blocks should
+        still be available for receiver typing within that block."""
+        source = tmp_path / "NestedBlock.cs"
+        source.write_text(
+            "public class Worker {\n"
+            "  public void DoWork() {}\n"
+            "}\n"
+            "public class Client {\n"
+            "  public void Run() {\n"
+            "    if (true) {\n"
+            "      var w = new Worker();\n"
+            "      w.DoWork();\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        client_run = _find_entity(result, "Run", EntityType.METHOD)
+        assert client_run is not None
+
+        worker_dowork_id = f"{REPOSITORY}::Worker.DoWork"
+        calls = _find_relationships(result, RelationshipType.CALLS)
+        run_calls = [r for r in calls if r.source_id == client_run.id]
+        call_targets = {r.target_id for r in run_calls}
+        assert worker_dowork_id in call_targets, (
+            f"Expected Worker.DoWork resolved, got targets: {call_targets}"
+        )
+
+    def test_class_level_test_attribute_propagates_to_methods(self, parser, tmp_path):
+        """Bug #3: [TestClass] or [TestFixture] on a class should make ALL
+        methods in that class get stereotypes=['test']."""
+        source = tmp_path / "Verification.cs"
+        source.write_text(
+            "using Microsoft.VisualStudio.TestTools.UnitTesting;\n"
+            "\n"
+            "[TestClass]\n"
+            "public class MyTests {\n"
+            "  public void Helper() {}\n"
+            "  [TestMethod]\n"
+            "  public void TestSomething() {}\n"
+            "}\n"
+        )
+
+        result = parser.parse_file(source, repository=REPOSITORY)
+        helper = _find_entity(result, "Helper", EntityType.METHOD)
+        assert helper is not None
+        assert "test" in (helper.stereotypes or []), (
+            f"Expected 'test' stereotype on Helper, got {helper.stereotypes}"
+        )
+
 
 # ===========================================================================
 # Task 5: Extended Test Stereotype Detection (filename/path-based)
