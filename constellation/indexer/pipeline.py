@@ -915,7 +915,7 @@ class IndexingPipeline:
         id_map: dict[str, str] = {}
         call_aliases: dict[str, str] = {}
 
-        if language in {"python", "javascript"}:
+        if language in {"python", "javascript", "csharp"}:
             id_map, call_aliases = IndexingPipeline._build_scoped_entity_maps(
                 parse_result=parse_result,
                 parser_file_ids=parser_file_ids,
